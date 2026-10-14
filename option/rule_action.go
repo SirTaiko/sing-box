@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/sagernet/sing-box/common/tlsdesync"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -192,6 +193,7 @@ type RawRouteOptionsActionOptions struct {
 	TLSRecordFragment        bool               `json:"tls_record_fragment,omitempty"`
 	TLSSpoof                 string             `json:"tls_spoof,omitempty"`
 	TLSSpoofMethod           string             `json:"tls_spoof_method,omitempty" enum:"wrong-sequence,wrong-checksum,wrong-ack,wrong-md5,wrong-timestamp"`
+	TLSDesync                *tlsdesync.Options `json:"tls_desync,omitempty"`
 }
 
 type RouteOptionsActionOptions RawRouteOptionsActionOptions

@@ -1,0 +1,35 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "dns": {
+    "servers": [{ "type": "local", "tag": "local" }]
+  },
+  "inbounds": [{
+    "type": "mixed",
+    "tag": "test-local",
+    "listen": "127.0.0.1",
+    "listen_port": 18443
+  }],
+  "outbounds": [{
+    "type": "direct",
+    "tag": "direct",
+    "bind_interface": "eth0"
+  }],
+  "route": {
+    "default_domain_resolver": { "server": "local", "strategy": "ipv4_only" },
+    "rules": [
+      { "action": "sniff" },
+      {
+        "network": "tcp",
+        "domain_suffix": [
+          "youtube.com", "youtube-nocookie.com", "youtubei.googleapis.com",
+          "googlevideo.com", "ytimg.com", "ggpht.com", "discord.com",
+          "discord.gg", "discordapp.com", "discordapp.net", "discord.media"
+        ],
+        "action": "route",
+        "outbound": "direct",
+        "tls_desync": { "mode": "multidisorder", "split": "1,midsld" }
+      }
+    ],
+    "final": "direct"
+  }
+}

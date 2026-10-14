@@ -666,6 +666,9 @@ match:
 				metadata.TLSSpoof = routeOptions.TLSSpoof
 				metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
 			}
+			if routeOptions.TLSDesync != nil {
+				metadata.TLSDesync = routeOptions.TLSDesync
+			}
 		}
 		switch action := currentRule.Action().(type) {
 		case *R.RuleActionSniff:

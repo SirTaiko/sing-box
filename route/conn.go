@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/sniff"
+	"github.com/sagernet/sing-box/common/tlsdesync"
 	"github.com/sagernet/sing-box/common/tlsfragment"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
@@ -128,6 +129,21 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
+	}
+	if metadata.TLSDesync != nil {
+		if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSSpoof != "" {
+			remoteConn.Close()
+			N.CloseOnHandshakeFailure(conn, onClose, E.New("tls_desync conflicts with upstream TLS wrappers"))
+			return
+		}
+		desyncConn, desyncErr := tlsdesync.NewConn(remoteConn, *metadata.TLSDesync)
+		if desyncErr != nil {
+			remoteConn.Close()
+			N.CloseOnHandshakeFailure(conn, onClose, desyncErr)
+			m.logger.ErrorContext(ctx, desyncErr)
+			return
+		}
+		remoteConn = desyncConn
 	}
 	if metadata.TLSFragment || metadata.TLSRecordFragment {
 		remoteConn = tf.NewConn(remoteConn, ctx, metadata.TLSFragment, metadata.TLSRecordFragment, metadata.TLSFragmentFallbackDelay)

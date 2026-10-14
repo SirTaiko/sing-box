@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/sniff"
+	"github.com/sagernet/sing-box/common/tlsdesync"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -25,6 +26,14 @@ import (
 )
 
 func newRuleActionRouteOptions(options option.RawRouteOptionsActionOptions) (RuleActionRouteOptions, error) {
+	if options.TLSDesync != nil {
+		if err := options.TLSDesync.Validate(); err != nil {
+			return RuleActionRouteOptions{}, err
+		}
+		if options.TLSFragment || options.TLSRecordFragment || options.TLSSpoof != "" {
+			return RuleActionRouteOptions{}, E.New("tls_desync must not be combined with upstream TLS wrappers")
+		}
+	}
 	spoof, spoofMethod, err := tlsspoof.ParseOptions(options.TLSSpoof, options.TLSSpoofMethod)
 	if err != nil {
 		return RuleActionRouteOptions{}, err
@@ -42,6 +51,7 @@ func newRuleActionRouteOptions(options option.RawRouteOptionsActionOptions) (Rul
 		TLSRecordFragment:         options.TLSRecordFragment,
 		TLSSpoof:                  spoof,
 		TLSSpoofMethod:            spoofMethod,
+		TLSDesync:                 options.TLSDesync,
 	}, nil
 }
 
@@ -237,6 +247,7 @@ type RuleActionRouteOptions struct {
 	TLSRecordFragment         bool
 	TLSSpoof                  string
 	TLSSpoofMethod            tlsspoof.Method
+	TLSDesync                 *tlsdesync.Options
 }
 
 func (r *RuleActionRouteOptions) Type() string {

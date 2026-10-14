@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"time"
 
+	"github.com/sagernet/sing-box/common/tlsdesync"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -82,6 +83,7 @@ type InboundContext struct {
 	TLSRecordFragment         bool
 	TLSSpoof                  string
 	TLSSpoofMethod            tlsspoof.Method
+	TLSDesync                 *tlsdesync.Options
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType
