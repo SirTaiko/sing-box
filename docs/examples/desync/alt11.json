@@ -1,0 +1,186 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "rules": [
+          {
+            "name": "quic-general",
+            "network": ["udp"],
+            "port": [443],
+            "domain_file": ["lists/list-general.txt", "lists/list-general-user.txt"],
+            "domain_exclude_file": ["lists/list-exclude.txt", "lists/list-exclude-user.txt"],
+            "ip_cidr_exclude_file": ["lists/ipset-exclude.txt", "lists/ipset-exclude-user.txt"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 11,
+              "payloads": [{ "protocol": "quic", "file": "bin/quic_initial_www_google_com.bin" }]
+            }
+          },
+          {
+            "name": "discord-stun",
+            "network": ["udp"],
+            "port_range": ["19294-19344", "50000-50100"],
+            "protocol": ["discord", "stun"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                { "protocol": "discord", "file": "bin/ACTIVE_DISCORD_UDP.bin" },
+                { "protocol": "stun", "file": "bin/ACTIVE_DISCORD_UDP.bin" }
+              ]
+            }
+          },
+          {
+            "name": "discord-media-alt-ports",
+            "network": ["tcp"],
+            "port": [2053, 2083, 2087, 2096, 8443],
+            "domain": ["discord.media"],
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [{ "protocol": "tls", "file": "bin/tls_clienthello_www_google_com.bin" }]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 681,
+              "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin"
+            }
+          },
+          {
+            "name": "google-zero-ip-id",
+            "network": ["tcp"],
+            "port": [443],
+            "domain_file": ["lists/list-google.txt"],
+            "ip_id": "zero",
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [{ "protocol": "tls", "file": "bin/tls_clienthello_www_google_com.bin" }]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 681,
+              "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin"
+            }
+          },
+          {
+            "name": "general-tcp",
+            "network": ["tcp"],
+            "port": [80, 443],
+            "domain_file": ["lists/list-general.txt", "lists/list-general-user.txt"],
+            "domain_exclude_file": ["lists/list-exclude.txt", "lists/list-exclude-user.txt"],
+            "ip_cidr_exclude_file": ["lists/ipset-exclude.txt", "lists/ipset-exclude-user.txt"],
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [
+                { "protocol": "tls", "file": "bin/stun2.bin" },
+                { "protocol": "tls", "file": "bin/tls_clienthello_www_sferum_ru.bin" },
+                { "protocol": "http", "file": "bin/tls_clienthello_www_sferum_ru.bin" }
+              ]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 664,
+              "seqovl_pattern": "bin/tls_clienthello_www_sferum_ru.bin"
+            }
+          },
+          {
+            "name": "quic-ipset-fallback",
+            "network": ["udp"],
+            "port": [443],
+            "domain_exclude_file": ["lists/list-exclude.txt", "lists/list-exclude-user.txt"],
+            "ip_cidr_exclude_file": ["lists/ipset-exclude.txt", "lists/ipset-exclude-user.txt"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 11,
+              "payloads": [{ "protocol": "quic", "file": "bin/quic_initial_www_google_com.bin" }]
+            }
+          },
+          {
+            "name": "tcp-ipset-fallback",
+            "network": ["tcp"],
+            "port": [80, 443, 8443],
+            "domain_exclude_file": ["lists/list-exclude.txt", "lists/list-exclude-user.txt"],
+            "ip_cidr_exclude_file": ["lists/ipset-exclude.txt", "lists/ipset-exclude-user.txt"],
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [
+                { "protocol": "tls", "file": "bin/stun2.bin" },
+                { "protocol": "tls", "file": "bin/tls_clienthello_www_sferum_ru.bin" },
+                { "protocol": "http", "file": "bin/tls_clienthello_www_sferum_ru.bin" }
+              ]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 664,
+              "seqovl_pattern": "bin/tls_clienthello_www_sferum_ru.bin"
+            }
+          },
+          {
+            "name": "game-tcp",
+            "network": ["tcp"],
+            "port_range": ["1024-65535"],
+            "any_protocol": true,
+            "cutoff": "n4",
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [
+                { "protocol": "tls", "file": "bin/stun2.bin" },
+                { "protocol": "tls", "file": "bin/tls_clienthello_www_sferum_ru.bin" },
+                { "protocol": "http", "file": "bin/tls_clienthello_www_sferum_ru.bin" },
+                { "protocol": "unknown", "file": "bin/stun2.bin" },
+                { "protocol": "unknown", "file": "bin/tls_clienthello_www_sferum_ru.bin" }
+              ]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 664,
+              "seqovl_pattern": "bin/tls_clienthello_www_sferum_ru.bin"
+            }
+          },
+          {
+            "name": "game-udp",
+            "network": ["udp"],
+            "port_range": ["1024-65535"],
+            "any_protocol": true,
+            "cutoff": "n4",
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 10,
+              "payloads": [{ "protocol": "unknown", "file": "bin/ACTIVE_GAME_UDP.bin" }]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "final": "zapret"
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "learning": {
+          "max_hosts": 4096
+        },
+        "stream_rules": [
+          {
+            "name": "http-tamper-and-split",
+            "network": ["tcp"],
+            "port": [80],
+            "protocol": ["http"],
+            "methods": ["http_tamper", "split"],
+            "http_tamper": {
+              "hostcase": true,
+              "hostdot": true,
+              "unixeol": true
+            },
+            "split": {
+              "split_pos": ["method+1", "host+3"]
+            },
+            "learning": {
+              "fail_threshold": 3,
+              "fail_time": "60s",
+              "retrans_threshold": 3
+            }
+          },
+          {
+            "name": "tls-record-and-disorder",
+            "network": ["tcp"],
+            "port": [443],
+            "protocol": ["tls"],
+            "methods": ["tls_record", "split"],
+            "tls_record": {
+              "pos": "sniext"
+            },
+            "split": {
+              "split_pos": ["1"],
+              "disorder": "tls",
+              "oob": "tls",
+              "oob_data": "0x00",
+              "split_any_protocol": false
+            },
+            "skip_nodelay": false
+          }
+        ]
+      }
+    }
+  ]
+}

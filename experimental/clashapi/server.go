@@ -125,6 +125,13 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		// The desync diagnostics/reload routes attach to this existing
+		// authenticated controller only when it is a numeric-loopback listener
+		// with a nonempty Secret. An ineligible controller simply has no
+		// /desync routes; no other endpoint changes and no listener is added.
+		if desyncRouterEligible(options.Secret, options.ExternalController) == nil {
+			r.Mount("/desync", desyncRouter(s.outbound))
+		}
 
 		s.setupMetaAPI(r)
 	})

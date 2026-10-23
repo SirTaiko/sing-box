@@ -68,42 +68,111 @@ type filterInst struct {
 	arg     [4]uint32
 }
 
-type Filter struct {
-	insts    []filterInst
-	anyInsts []filterInst
-	flags    uint64
-}
-
-func reject() *Filter {
-	return &Filter{}
-}
-
 func OutboundTCP(src, dst netip.AddrPort) (*Filter, error) {
+	return outboundTransport(src, dst, true)
+}
+
+// OutboundUDP matches one owned outbound UDP flow.
+func OutboundUDP(src, dst netip.AddrPort) (*Filter, error) {
+	return outboundTransport(src, dst, false)
+}
+
+// OutboundTCPLocalPort matches outbound TCP from one exclusively bound local
+// endpoint to any destination. It is used for owned listener leases.
+func OutboundTCPLocalPort(src netip.AddrPort) (*Filter, error) {
+	return outboundLocal(src, true)
+}
+
+// OutboundUDPLocalPort matches outbound UDP from one exclusively bound local
+// endpoint to any destination.
+func OutboundUDPLocalPort(src netip.AddrPort) (*Filter, error) {
+	return outboundLocal(src, false)
+}
+
+func outboundTransport(src, dst netip.AddrPort, tcp bool) (*Filter, error) {
+	return transportFlow(src, dst, tcp, true)
+}
+
+// InboundTCPFlow matches the replies of one owned TCP flow: the peer is the
+// source and the owned local endpoint is the destination. Direction is part of
+// the filter, not an inference, so a reply can never be treated as outbound.
+func InboundTCPFlow(peer, local netip.AddrPort) (*Filter, error) {
+	return transportFlow(peer, local, true, false)
+}
+
+// InboundUDPFlow matches the replies of one owned UDP flow.
+func InboundUDPFlow(peer, local netip.AddrPort) (*Filter, error) {
+	return transportFlow(peer, local, false, false)
+}
+
+func transportFlow(src, dst netip.AddrPort, tcp bool, outbound bool) (*Filter, error) {
 	if !src.IsValid() || !dst.IsValid() {
 		return nil, E.New("windivert: filter: invalid address port")
 	}
 	if src.Addr().Is4() != dst.Addr().Is4() {
 		return nil, E.New("windivert: filter: mixed IPv4/IPv6")
 	}
-	f := &Filter{
-		flags: filterFlagOutbound,
+	f := newFilterNode(0)
+	if outbound {
+		f.flags = filterFlagOutbound
+		f.add(fieldOutbound, testEQ, argUint32(1))
+	} else {
+		f.flags = filterFlagInbound
+		f.add(fieldInbound, testEQ, argUint32(1))
 	}
-	f.add(fieldOutbound, testEQ, argUint32(1))
 	if src.Addr().Is4() {
 		f.flags |= filterFlagIP
 		f.add(fieldIP, testEQ, argUint32(1))
-		f.add(fieldTCP, testEQ, argUint32(1))
+		if tcp {
+			f.add(fieldTCP, testEQ, argUint32(1))
+		} else {
+			f.add(fieldUDP, testEQ, argUint32(1))
+		}
 		f.add(fieldIPSrcAddr, testEQ, argIPv4(src.Addr()))
 		f.add(fieldIPDstAddr, testEQ, argIPv4(dst.Addr()))
 	} else {
 		f.flags |= filterFlagIPv6
 		f.add(fieldIPv6, testEQ, argUint32(1))
-		f.add(fieldTCP, testEQ, argUint32(1))
+		if tcp {
+			f.add(fieldTCP, testEQ, argUint32(1))
+		} else {
+			f.add(fieldUDP, testEQ, argUint32(1))
+		}
 		f.add(fieldIPv6SrcAddr, testEQ, argIPv6(src.Addr()))
 		f.add(fieldIPv6DstAddr, testEQ, argIPv6(dst.Addr()))
 	}
-	f.add(fieldTCPSrcPort, testEQ, argUint32(uint32(src.Port())))
-	f.add(fieldTCPDstPort, testEQ, argUint32(uint32(dst.Port())))
+	if tcp {
+		f.add(fieldTCPSrcPort, testEQ, argUint32(uint32(src.Port())))
+		f.add(fieldTCPDstPort, testEQ, argUint32(uint32(dst.Port())))
+	} else {
+		f.add(fieldUDPSrcPort, testEQ, argUint32(uint32(src.Port())))
+		f.add(fieldUDPDstPort, testEQ, argUint32(uint32(dst.Port())))
+	}
+	return f, nil
+}
+
+func outboundLocal(src netip.AddrPort, tcp bool) (*Filter, error) {
+	if !src.IsValid() || src.Port() == 0 {
+		return nil, E.New("windivert: filter: invalid local address port")
+	}
+	f := newFilterNode(filterFlagOutbound)
+	f.add(fieldOutbound, testEQ, argUint32(1))
+	if src.Addr().Is4() {
+		f.flags |= filterFlagIP
+		f.add(fieldIP, testEQ, argUint32(1))
+		f.add(fieldIPSrcAddr, testEQ, argIPv4(src.Addr()))
+	} else {
+		f.flags |= filterFlagIPv6
+		f.add(fieldIPv6, testEQ, argUint32(1))
+		f.add(fieldIPv6SrcAddr, testEQ, argIPv6(src.Addr()))
+	}
+	if tcp {
+		f.add(fieldTCP, testEQ, argUint32(1))
+		f.add(fieldTCPSrcPort, testEQ, argUint32(uint32(src.Port())))
+	} else {
+		f.add(fieldUDP, testEQ, argUint32(1))
+		f.add(fieldUDPSrcPort, testEQ, argUint32(uint32(src.Port())))
+	}
 	return f, nil
 }
 
@@ -120,9 +189,7 @@ func inboundTo(destinations []netip.Addr) (*Filter, error) {
 			return nil, E.New("windivert: filter: mixed IPv4/IPv6")
 		}
 	}
-	f := &Filter{
-		flags: filterFlagInbound,
-	}
+	f := newFilterNode(filterFlagInbound)
 	f.add(fieldInbound, testEQ, argUint32(1))
 	if !isV6 {
 		f.flags |= filterFlagIP
@@ -194,12 +261,53 @@ func InboundICMPError(destinations []netip.Addr) (*Filter, error) {
 	return f, nil
 }
 
+// InboundICMPTimeExceeded matches inbound ICMP/ICMPv6 time-exceeded errors
+// addressed to the given local addresses. Parameter-problem/PMTU messages are
+// deliberately not matched: capture.filter_ttl_expired_icmp never suppresses
+// them. The caller still validates the quoted inner tuple before any drop.
+func InboundICMPTimeExceeded(destinations []netip.Addr) (*Filter, error) {
+	f, err := inboundTo(destinations)
+	if err != nil {
+		return nil, err
+	}
+	addTimeExceeded(f, destinations[0].Is6())
+	return f, nil
+}
+
+// InboundICMPTimeExceededFamily is the address-less variant used when the owned
+// attempt's local address is still unspecified (a wildcard bind before the
+// first outbound packet). The caller must AND at least the owned interface
+// index, so the kernel filter is never broader than the owned device scope.
+func InboundICMPTimeExceededFamily(ipv6 bool) (*Filter, error) {
+	f := newFilterNode(filterFlagInbound)
+	f.add(fieldInbound, testEQ, argUint32(1))
+	if ipv6 {
+		f.flags |= filterFlagIPv6
+		f.add(fieldIPv6, testEQ, argUint32(1))
+	} else {
+		f.flags |= filterFlagIP
+		f.add(fieldIP, testEQ, argUint32(1))
+	}
+	addTimeExceeded(f, ipv6)
+	return f, nil
+}
+
+func addTimeExceeded(f *Filter, ipv6 bool) {
+	if ipv6 {
+		f.add(fieldICMPv6, testEQ, argUint32(1))
+		f.add(fieldICMPv6Type, testEQ, argUint32(3))
+		return
+	}
+	f.add(fieldICMP, testEQ, argUint32(1))
+	f.add(fieldICMPType, testEQ, argUint32(11))
+}
+
 func (f *Filter) add(field uint16, test uint8, arg [4]uint32) {
-	f.insts = append(f.insts, filterInst{field: field, test: test, arg: arg})
+	f.root = andNode(f.root, testNode(field, test, arg))
 }
 
 func (f *Filter) addAny(field uint16, test uint8, arg [4]uint32) {
-	f.anyInsts = append(f.anyInsts, filterInst{field: field, test: test, arg: arg})
+	f.anyNodes = append(f.anyNodes, testNode(field, test, arg))
 }
 
 func argUint32(v uint32) [4]uint32 { return [4]uint32{v, 0, 0, 0} }
@@ -223,41 +331,6 @@ func argIPv6(addr netip.Addr) [4]uint32 {
 		binary.BigEndian.Uint32(b[4:8]),
 		binary.BigEndian.Uint32(b[0:4]),
 	}
-}
-
-func (f *Filter) encode() ([]byte, uint64, error) {
-	total := len(f.insts) + len(f.anyInsts)
-	if total == 0 {
-		return encodeInst(filterInst{
-			field:   fieldZero,
-			test:    testEQ,
-			success: resultReject,
-			failure: resultReject,
-		}), 0, nil
-	}
-	if total > filterMaxInsts-1 {
-		return nil, 0, E.New("windivert: filter too long")
-	}
-	buf := make([]byte, 0, filterInstBytes*total)
-	for i, inst := range f.insts {
-		if i == total-1 {
-			inst.success = resultAccept
-		} else {
-			inst.success = uint16(i + 1)
-		}
-		inst.failure = resultReject
-		buf = append(buf, encodeInst(inst)...)
-	}
-	for i, inst := range f.anyInsts {
-		inst.success = resultAccept
-		if len(f.insts)+i == total-1 {
-			inst.failure = resultReject
-		} else {
-			inst.failure = uint16(len(f.insts) + i + 1)
-		}
-		buf = append(buf, encodeInst(inst)...)
-	}
-	return buf, f.flags, nil
 }
 
 func encodeInst(inst filterInst) []byte {

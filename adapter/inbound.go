@@ -44,6 +44,32 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// TCPRelayOptions is the relay policy of the original accepting inbound. It
+// is a plain value copied into every InboundContext, so an inbound detour
+// keeps the origin policy and the origin admission count instead of deriving
+// a new one from the detour target.
+type TCPRelayOptions struct {
+	// DisableSplice selects an ordinary read/write copy in both directions:
+	// the connection pair is not unwrapped into a syscall splice, ReaderFrom
+	// or WriterTo fast path. Deadlines, half-close, counters and errors of
+	// the underlying connection stay in effect.
+	DisableSplice bool
+	// MaxOrphanTime bounds how long the connection pair keeps a pending
+	// remote attempt after the local leg terminally closed while the remote
+	// was unavailable and queued data was unsent.
+	MaxOrphanTime time.Duration
+	// HasMaxOrphanTime reports that the orphan policy was configured.
+	// An explicit zero disables only the orphan timer: the configured connect
+	// deadline, caller cancellation and shutdown still apply.
+	HasMaxOrphanTime bool
+}
+
+// Empty reports that no relay policy was configured, so the connection-pair
+// owner keeps its previous fast path.
+func (o TCPRelayOptions) Empty() bool {
+	return !o.DisableSplice && !o.HasMaxOrphanTime
+}
+
 type InboundContext struct {
 	Inbound     string
 	InboundType string
@@ -53,6 +79,11 @@ type InboundContext struct {
 	Destination M.Socksaddr
 	User        string
 	Outbound    string
+
+	// TCPRelayOptions is transport policy supplied by the original accepting
+	// inbound. Detours must carry the value unchanged and must not take a
+	// second admission token for the same connection.
+	TCPRelayOptions TCPRelayOptions
 
 	// power report
 

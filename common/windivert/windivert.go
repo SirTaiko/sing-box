@@ -62,6 +62,8 @@ func setFlagBit(bits uint32, pos uint, v bool) uint32 {
 
 func (a *Address) IPv6() bool { return getFlagBit(a.bits, addrBitIPv6) }
 
+func (a *Address) Outbound() bool { return getFlagBit(a.bits, addrBitOutbound) }
+
 func (a *Address) SetIPv6(v bool) {
 	a.bits = setFlagBit(a.bits, addrBitIPv6, v)
 }

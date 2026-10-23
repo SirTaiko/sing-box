@@ -30,6 +30,46 @@ func TestRejectFilter(t *testing.T) {
 	}
 }
 
+// TestInboundFlowFilters pins that reply observation uses an explicitly inbound
+// filter for the reversed tuple: direction is part of the filter identity, so a
+// reply can never be captured as outbound and re-injected as a replacement.
+func TestInboundFlowFilters(t *testing.T) {
+	peer := netip.MustParseAddrPort("198.51.100.20:443")
+	local := netip.MustParseAddrPort("192.0.2.10:40000")
+	tcpFilter, err := InboundTCPFlow(peer, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tcpFilter.flags&filterFlagInbound == 0 || tcpFilter.flags&filterFlagOutbound != 0 {
+		t.Fatalf("inbound tcp flags = %#x", tcpFilter.flags)
+	}
+	if _, _, err = tcpFilter.encode(); err != nil {
+		t.Fatal(err)
+	}
+	udpFilter, err := InboundUDPFlow(peer, local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if udpFilter.flags&filterFlagInbound == 0 || udpFilter.flags&filterFlagOutbound != 0 {
+		t.Fatalf("inbound udp flags = %#x", udpFilter.flags)
+	}
+	if _, _, err = udpFilter.encode(); err != nil {
+		t.Fatal(err)
+	}
+	// Mixed families are rejected rather than silently widened.
+	if _, err = InboundTCPFlow(netip.MustParseAddrPort("[2001:db8::20]:443"), local); err == nil {
+		t.Fatal("mixed IPv4/IPv6 inbound flow must be rejected")
+	}
+	// The outbound constructor keeps its own direction.
+	outbound, err := OutboundTCP(netip.MustParseAddrPort("192.0.2.10:40000"), netip.MustParseAddrPort("198.51.100.20:443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if outbound.flags&filterFlagOutbound == 0 || outbound.flags&filterFlagInbound != 0 {
+		t.Fatalf("outbound flags = %#x", outbound.flags)
+	}
+}
+
 func TestOutboundTCPFilterIPv4(t *testing.T) {
 	t.Parallel()
 	src := netip.MustParseAddrPort("10.1.2.3:54321")
@@ -136,5 +176,72 @@ func checkInst(t *testing.T, raw []byte, idx int, field uint16, test uint8, succ
 	}
 	if a0 != arg0 {
 		t.Errorf("inst %d arg[0]: got %08x, want %08x", idx, a0, arg0)
+	}
+}
+
+// TestInboundICMPTimeExceededFilterSemantics pins the owned quoted-ICMP capture
+// filter: inbound time-exceeded errors of the owned local address only. PMTU /
+// parameter-problem messages, foreign destinations and outbound packets never
+// match, so the filter can never widen into a global ICMP capture.
+func TestInboundICMPTimeExceededFilterSemantics(t *testing.T) {
+	local := netip.MustParseAddr("192.0.2.10")
+	filter, err := InboundICMPTimeExceeded([]netip.Addr{local})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filter.flags&filterFlagInbound == 0 || filter.flags&filterFlagIP == 0 {
+		t.Fatalf("filter flags = %#x", filter.flags)
+	}
+	addressOf := func(addr netip.Addr) uint32 {
+		bytes := addr.As4()
+		return binary.BigEndian.Uint32(bytes[:])
+	}
+	address := addressOf(local)
+	owned := filterFacts{fieldInbound: 1, fieldIP: 1, fieldICMP: 1, fieldICMPType: 11, fieldIPDstAddr: address}
+	if !evaluateFilter(t, filter, owned) {
+		t.Fatal("owned inbound time-exceeded must match")
+	}
+	pmtu := filterFacts{fieldInbound: 1, fieldIP: 1, fieldICMP: 1, fieldICMPType: 3, fieldIPDstAddr: address}
+	if evaluateFilter(t, filter, pmtu) {
+		t.Fatal("PMTU/parameter-problem message matched the time-exceeded filter")
+	}
+	unreachable := filterFacts{fieldInbound: 1, fieldIP: 1, fieldICMP: 1, fieldICMPType: 11,
+		fieldIPDstAddr: addressOf(netip.MustParseAddr("192.0.2.11"))}
+	if evaluateFilter(t, filter, unreachable) {
+		t.Fatal("foreign destination matched the owned filter")
+	}
+	outbound := filterFacts{fieldOutbound: 1, fieldIP: 1, fieldICMP: 1, fieldICMPType: 11, fieldIPDstAddr: address}
+	if evaluateFilter(t, filter, outbound) {
+		t.Fatal("outbound packet matched the inbound ICMP filter")
+	}
+
+	ipv6Filter, err := InboundICMPTimeExceededFamily(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned6 := filterFacts{fieldInbound: 1, fieldIPv6: 1, fieldICMPv6: 1, fieldICMPv6Type: 3}
+	if !evaluateFilter(t, ipv6Filter, owned6) {
+		t.Fatal("owned ICMPv6 time-exceeded must match")
+	}
+	parameterProblem6 := filterFacts{fieldInbound: 1, fieldIPv6: 1, fieldICMPv6: 1, fieldICMPv6Type: 4}
+	if evaluateFilter(t, ipv6Filter, parameterProblem6) {
+		t.Fatal("ICMPv6 parameter problem matched the time-exceeded filter")
+	}
+	// The interface narrowing composes with the family variant.
+	interfaceFilter, err := InterfaceIndex(7, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped, err := And(ipv6Filter, interfaceFilter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	onInterface := filterFacts{fieldInbound: 1, fieldIPv6: 1, fieldICMPv6: 1, fieldICMPv6Type: 3, fieldIfIdx: 7}
+	if !evaluateFilter(t, scoped, onInterface) {
+		t.Fatal("owned interface time-exceeded must match")
+	}
+	otherInterface := filterFacts{fieldInbound: 1, fieldIPv6: 1, fieldICMPv6: 1, fieldICMPv6Type: 3, fieldIfIdx: 8}
+	if evaluateFilter(t, scoped, otherInterface) {
+		t.Fatal("foreign interface matched the owned ICMP filter")
 	}
 }

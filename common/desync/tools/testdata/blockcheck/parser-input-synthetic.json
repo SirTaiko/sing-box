@@ -1,0 +1,36 @@
+{
+  "format": "desync.blockcheck/v1",
+  "reference": {
+    "zapret_revision": "c849e55ef0f1c244206f5a05ff7b1ab41a3824ee",
+    "flowseal_revision": "1.10.4"
+  },
+  "cases": [
+    {
+      "id": "parser-windows-multisplit",
+      "platform": "windows",
+      "strategy": "multisplit",
+      "status": "SKIP",
+      "evidence": null,
+      "reason": "pending disposable VM; no captured result"
+    },
+    {
+      "id": "parser-linux-fake",
+      "platform": "linux",
+      "strategy": "fake",
+      "status": "PASS",
+      "evidence": {
+        "artifact": "testdata/blockcheck/parser-input-synthetic.json",
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "reason": ""
+    },
+    {
+      "id": "parser-linux-multidisorder",
+      "platform": "linux",
+      "strategy": "multidisorder",
+      "status": "FAIL",
+      "evidence": null,
+      "reason": "parser test input only; not an executed check"
+    }
+  ]
+}

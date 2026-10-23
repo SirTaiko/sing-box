@@ -214,6 +214,14 @@ nav:
           - Hysteria Realm: configuration/service/hysteria-realm.md
           - USB/IP Server: configuration/service/usbip-server.md
           - USB/IP Client: configuration/service/usbip-client.md
+      - Direct Desync:
+          - Overview: configuration/direct-desync.md
+          - Transport controls: configuration/direct-desync-transport.md
+          - Stream rules: configuration/direct-desync-stream.md
+          - Provider bundles: configuration/direct-desync-providers.md
+          - Support tools: configuration/direct-desync-tools.md
+          - SOCKS destination policy: configuration/direct-desync-socks.md
+          - SOCKS dependency build: configuration/direct-desync-socks-build.md
 markdown_extensions:
   - toc:
       slugify: !!python/object/apply:pymdownx.slugs.slugify

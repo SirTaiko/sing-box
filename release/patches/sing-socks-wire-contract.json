@@ -1,0 +1,90 @@
+{
+  "contract": "direct-desync/socks-wire-contract/v1.1",
+  "kind": "hash-locked downstream dependency patch bundle",
+  "module": {
+    "path": "github.com/sagernet/sing",
+    "version": "v0.9.7-0.20260929150544-0ad23b637bd4",
+    "go_mod_version": "go 1.25.0",
+    "module_sum": "h1:d4WT3KO4zhp9qzPHUZCKqCP+ZmP1GXBsAmReqlnE4zA=",
+    "go_mod_sum": "h1:K3Owt3xPhHugvlnlPPxZJ/exXdaJfEPOTNorGk4AXjo=",
+    "cache_zip_sha256": "f644691dc57dc01fdc1d6b8e28fcacc9dae2648fe8d8a7d8d846105256579da4",
+    "cache_zip_name": "github.com/sagernet/sing/@v/v0.9.7-0.20260929150544-0ad23b637bd4.zip"
+  },
+  "patch": {
+    "path": "release/patches/sing-socks-wire-contract.patch",
+    "sha256": "2b6ac3cd1b78c849abf1cd46287da930fc329db42b4922a7fdf536ba329a6624",
+    "bytes": 39742,
+    "apply_command": "git apply --check -p1 <patch> && git apply -p1 <patch>",
+    "applies_to": "clean extracted copy of the pinned module"
+  },
+  "files": [
+    {
+      "path": "common/bufio/cache.go",
+      "role": "production",
+      "base_sha256": "0ecef13bca92ca3c5b6688471e3562e1010a5596193859537cdea517cdb1c3fb",
+      "patched_sha256": "63ebab47ad8ebd00f7e78e12e9a59e49642c67f7950b375ab59aaf26b372c588"
+    },
+    {
+      "path": "protocol/socks/handshake.go",
+      "role": "production",
+      "base_sha256": "519634a01cba3041477aac4c5a767424b9167708a96af90bdf746a970aad3be3",
+      "patched_sha256": "03cc2c5c0b34835de9900c7225823261b890ca257e0eec999549783cc899b216"
+    },
+    {
+      "path": "protocol/socks/lazy.go",
+      "role": "production",
+      "base_sha256": "be8ea771bc5fd95764dadca8baf90d9958b403d1acb8c1a4b28ba054f91189ab",
+      "patched_sha256": "ca871ea9e4d368fb457bbee292692b89b17edbddfc81c26776e10e4bcb28a7d9"
+    },
+    {
+      "path": "common/bufio/cache_conn_test.go",
+      "role": "test",
+      "base_sha256": null,
+      "patched_sha256": "384b9c42986e0c188862d4da57ea38cd953d1c6515a97b99f9ea64a77699b2bd"
+    },
+    {
+      "path": "protocol/socks/handshake_test.go",
+      "role": "test",
+      "base_sha256": null,
+      "patched_sha256": "1ccaba491578706ab21cbb26248ea32a3ae384f55bb605b1f0b45efdc43c7f94"
+    },
+    {
+      "path": "protocol/socks/handshake_tail_test.go",
+      "role": "test",
+      "base_sha256": null,
+      "patched_sha256": "dd77edcd2604c091de7069407a5cd91c73cb8ab77076cf0df6a3a8d861921be3"
+    },
+    {
+      "path": "protocol/socks/lazy_test.go",
+      "role": "test",
+      "base_sha256": null,
+      "patched_sha256": "f2944c5664fd93e27925515f48c29e33e81c9fae00bd5739f9b83ac5eb3ef529"
+    }
+  ],
+  "toolchain": {
+    "required_go": "1.25.5",
+    "note": "The pinned module declares go 1.25.0; the product go.mod requires Go 1.25.5. Both are satisfied by the cached Go 1.25.5 toolchain."
+  },
+  "preparation": {
+    "helper": "release/patches/prepare-sing-socks-wire.py",
+    "usage": "python3 release/patches/prepare-sing-socks-wire.py --product-dir <sing-box checkout> --output-dir <new empty directory>",
+    "outputs": [
+      "sing-socks-wire/ (source tree derived only from the verified pinned archive with the patch applied)",
+      "go.sing-socks-wire.mod (product go.mod plus a single replace for github.com/sagernet/sing)",
+      "go.sing-socks-wire.sum (copy of the product go.sum)",
+      "sing-socks-wire-manifest.json (verified identities of this preparation, including tree_sha256 and file_count)"
+    ],
+    "verification": "The helper verifies the pinned module archive hash, reads the complete source tree from that verified archive only (bounded entry/total size, no absolute paths, no parent traversal, no symbolic links), verifies the patch hash, writes that tree, verifies the base hashes, applies the patch, verifies every patched file hash and finally compares the whole resulting tree membership and content against the archive bytes plus the approved patched files. An expanded module copy in the module cache is never copied or trusted.",
+    "rejection": "Missing or hash-mismatched archive, unreadable archive, oversized or path-escaping archive entries, patch hash mismatch, patch application failure, unexpected or modified files in the prepared tree, and a non-empty output directory are all rejected."
+  },
+  "build": {
+    "linux_amd64": "CGO_ENABLED=0 go build -modfile=<output-dir>/go.sing-socks-wire.mod -tags \"$(cat release/DEFAULT_BUILD_TAGS_OTHERS)\" -o <output-dir>/sing-box-linux-amd64 ./cmd/sing-box",
+    "windows_amd64": "CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -modfile=<output-dir>/go.sing-socks-wire.mod -tags \"$(cat release/DEFAULT_BUILD_TAGS_OTHERS)\" -o <output-dir>/sing-box-windows-amd64.exe ./cmd/sing-box",
+    "test": "go test -modfile=<output-dir>/go.sing-socks-wire.mod ./protocol/socks/... ./option/..."
+  },
+  "limitations": [
+    "The ordinary repository build (go build without -modfile) still uses the unmodified cached module and therefore does not contain the wire-provenance contract.",
+    "The upstream module remains unmodified; this is a maintained narrow downstream patch, not an upstream release.",
+    "Module checksums do not authenticate the patched source; the bundle records base archive, patch and patched source hashes together and the helper re-verifies the complete prepared tree against the archive."
+  ]
+}

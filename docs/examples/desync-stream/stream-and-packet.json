@@ -1,0 +1,76 @@
+{
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "stream_rules": [
+          {
+            "name": "stream-http",
+            "network": ["tcp"],
+            "port": [80],
+            "protocol": ["http"],
+            "domain": ["example.com"],
+            "methods": ["http_tamper"],
+            "http_tamper": {
+              "hostcase": true,
+              "hostspell": "HoSt",
+              "hostnospace": true
+            }
+          },
+          {
+            "name": "stream-tls",
+            "network": ["tcp"],
+            "port": [443],
+            "protocol": ["tls"],
+            "methods": ["tls_record"],
+            "tls_record": {
+              "pos": "host+2"
+            }
+          }
+        ],
+        "rules": [
+          {
+            "name": "tcp-packet-multisplit",
+            "network": ["tcp"],
+            "port": [443],
+            "protocol": ["tls"],
+            "methods": ["multisplit"],
+            "multisplit": {
+              "split_pos": ["1", "sniext"]
+            },
+            "start": "n1",
+            "cutoff": "n4"
+          },
+          {
+            "name": "quic-fake",
+            "network": ["udp"],
+            "port": [443],
+            "protocol": ["quic"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                {
+                  "protocol": "quic",
+                  "file": "bin/quic_initial_www_google_com.bin"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

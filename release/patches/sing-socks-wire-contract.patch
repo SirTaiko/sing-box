@@ -1,0 +1,1350 @@
+diff --git a/common/bufio/cache.go b/common/bufio/cache.go
+index 9442388..5ca3834 100644
+--- a/common/bufio/cache.go
++++ b/common/bufio/cache.go
+@@ -3,6 +3,7 @@ package bufio
+ import (
+ 	"io"
+ 	"net"
++	"sync"
+ 	"sync/atomic"
+ 
+ 	"github.com/sagernet/sing/common/buf"
+@@ -10,9 +11,14 @@ import (
+ 	N "github.com/sagernet/sing/common/network"
+ )
+ 
++// CachedConn is a connection with a buffered payload that belongs to it once
++// the handshake that produced it has finished. The cached buffer is protected
++// by access so that Read, ReadCached, WriteTo, ReaderReplaceable and Close can
++// run concurrently: exactly one of them claims the buffer and exactly one of
++// them releases it. access is never held across a blocking socket operation.
+ type CachedConn struct {
+ 	net.Conn
+-	taken  atomic.Bool
++	access sync.Mutex
+ 	buffer *buf.Buffer
+ }
+ 
+@@ -24,40 +30,72 @@ func NewCachedConn(conn net.Conn, buffer *buf.Buffer) *CachedConn {
+ 	}
+ }
+ 
++// detachCachedLocked removes the cached buffer so that at most one caller owns
++// it. It must be called with access held.
++func (c *CachedConn) detachCachedLocked() *buf.Buffer {
++	buffer := c.buffer
++	c.buffer = nil
++	return buffer
++}
++
+ func (c *CachedConn) ReadCached() *buf.Buffer {
+-	if !c.taken.CompareAndSwap(false, true) {
++	c.access.Lock()
++	buffer := c.detachCachedLocked()
++	empty := buffer != nil && buffer.IsEmpty()
++	c.access.Unlock()
++	if buffer == nil {
+ 		return nil
+ 	}
+-	buffer := c.buffer
+-	c.buffer = nil
+-	if buffer != nil {
+-		buffer.DecRef()
++	buffer.DecRef()
++	if empty {
++		buffer.Release()
++		return nil
+ 	}
+ 	return buffer
+ }
+ 
+ func (c *CachedConn) Read(p []byte) (n int, err error) {
+-	if c.buffer != nil {
+-		n, err = c.buffer.Read(p)
++	c.access.Lock()
++	buffer := c.buffer
++	if buffer != nil {
++		n, err = buffer.Read(p)
+ 		if err == nil {
++			if buffer.IsEmpty() {
++				// The last cached byte was just delivered: detach the buffer
++				// before releasing it so a concurrent reader, copier or Close
++				// can neither observe nor release the same pooled buffer.
++				c.buffer = nil
++				c.access.Unlock()
++				buffer.DecRef()
++				buffer.Release()
++				return n, nil
++			}
++			c.access.Unlock()
+ 			return
+ 		}
+-		c.buffer.DecRef()
+-		c.buffer.Release()
++		// The cached payload was already exhausted.
+ 		c.buffer = nil
+ 	}
++	c.access.Unlock()
++	if buffer != nil {
++		buffer.DecRef()
++		buffer.Release()
++	}
+ 	return c.Conn.Read(p)
+ }
+ 
+ func (c *CachedConn) WriteTo(w io.Writer) (n int64, err error) {
+-	if c.buffer != nil {
+-		wn, wErr := w.Write(c.buffer.Bytes())
++	c.access.Lock()
++	buffer := c.detachCachedLocked()
++	c.access.Unlock()
++	if buffer != nil {
++		wn, wErr := w.Write(buffer.Bytes())
++		buffer.DecRef()
++		buffer.Release()
++		n += int64(wn)
+ 		if wErr != nil {
+-			c.buffer.DecRef()
+-			c.buffer.Release()
+-			c.buffer = nil
++			return n, wErr
+ 		}
+-		n += int64(wn)
+ 	}
+ 	cn, err := Copy(w, c.Conn)
+ 	n += cn
+@@ -73,7 +111,9 @@ func (c *CachedConn) Upstream() any {
+ }
+ 
+ func (c *CachedConn) ReaderReplaceable() bool {
+-	return c.buffer == nil
++	c.access.Lock()
++	defer c.access.Unlock()
++	return c.buffer == nil || c.buffer.IsEmpty()
+ }
+ 
+ func (c *CachedConn) WriterReplaceable() bool {
+@@ -81,12 +121,12 @@ func (c *CachedConn) WriterReplaceable() bool {
+ }
+ 
+ func (c *CachedConn) Close() error {
+-	if c.taken.CompareAndSwap(false, true) {
+-		if buffer := c.buffer; buffer != nil {
+-			c.buffer = nil
+-			buffer.DecRef()
+-			buffer.Release()
+-		}
++	c.access.Lock()
++	buffer := c.detachCachedLocked()
++	c.access.Unlock()
++	if buffer != nil {
++		buffer.DecRef()
++		buffer.Release()
+ 	}
+ 	return c.Conn.Close()
+ }
+diff --git a/common/bufio/cache_conn_test.go b/common/bufio/cache_conn_test.go
+new file mode 100644
+index 0000000..809252d
+--- /dev/null
++++ b/common/bufio/cache_conn_test.go
+@@ -0,0 +1,240 @@
++package bufio
++
++import (
++	"bytes"
++	"io"
++	"net"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing/common/buf"
++)
++
++// These tests pin the ownership contract of the cached tail installed by
++// NewCachedConn: the buffered bytes are delivered exactly once, every release
++// path releases the pooled buffer exactly once, and concurrent Read,
++// ReadCached, WriteTo, ReaderReplaceable and Close are safe.
++
++func newCachedTailConn(t *testing.T, tail []byte) (*CachedConn, net.Conn) {
++	t.Helper()
++	buffer := buf.NewSize(len(tail))
++	if _, err := buffer.WriteString(string(tail)); err != nil {
++		t.Fatal(err)
++	}
++	upstream, peer := net.Pipe()
++	conn := NewCachedConn(upstream, buffer)
++	t.Cleanup(func() {
++		_ = conn.Close()
++		_ = peer.Close()
++	})
++	return conn, peer
++}
++
++func testTail(size int) []byte {
++	tail := make([]byte, size)
++	for index := range tail {
++		tail[index] = byte(index*7 + 3)
++	}
++	return tail
++}
++
++func TestCachedTailDeliveredExactlyOnce(t *testing.T) {
++	tail := testTail(2048)
++	conn, _ := newCachedTailConn(t, tail)
++	received := make([]byte, len(tail))
++	if _, err := io.ReadFull(conn, received); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(received, tail) {
++		t.Fatal("cached tail changed")
++	}
++	if !conn.ReaderReplaceable() {
++		t.Fatal("consumed cached tail still reported as unreplaced")
++	}
++	// The consumed tail must not be delivered twice: the next read reaches the
++	// empty upstream pipe and blocks.
++	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
++		t.Fatalf("read after cached tail: n=%d err=%v", n, err)
++	}
++	if err := conn.SetReadDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestCachedTailReadCachedTakenOnce(t *testing.T) {
++	tail := testTail(11)
++	conn, _ := newCachedTailConn(t, tail)
++	taken := conn.ReadCached()
++	if taken == nil {
++		t.Fatal("cached tail was not returned")
++	}
++	if !bytes.Equal(taken.Bytes(), tail) {
++		t.Fatal("taken cached tail changed")
++	}
++	taken.Release()
++	if again := conn.ReadCached(); again != nil {
++		t.Fatal("cached tail was claimed twice")
++	}
++	if !conn.ReaderReplaceable() {
++		t.Fatal("connection with a consumed tail is not replaceable")
++	}
++}
++
++func TestCachedTailWriteToDeliveredOnce(t *testing.T) {
++	tail := testTail(4096)
++	conn, peer := newCachedTailConn(t, tail)
++	go func() {
++		time.Sleep(50 * time.Millisecond)
++		_ = peer.Close()
++	}()
++	var destination bytes.Buffer
++	n, _ := conn.WriteTo(&destination)
++	if n != int64(len(tail)) {
++		t.Fatalf("WriteTo delivered %d cached bytes, want %d", n, len(tail))
++	}
++	if !bytes.Equal(destination.Bytes(), tail) {
++		t.Fatal("WriteTo delivered changed cached bytes")
++	}
++	var second bytes.Buffer
++	n, _ = conn.WriteTo(&second)
++	if n != 0 || second.Len() != 0 {
++		t.Fatalf("cached tail delivered twice: %d bytes", n)
++	}
++}
++
++func TestCachedTailConcurrentReadClose(t *testing.T) {
++	tail := testTail(2048)
++	for iteration := 0; iteration < 32; iteration++ {
++		conn, _ := newCachedTailConn(t, tail)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		received := make([]byte, 0, len(tail))
++		go func() {
++			defer group.Done()
++			<-start
++			one := make([]byte, 1)
++			for {
++				n, err := conn.Read(one)
++				if n > 0 {
++					received = append(received, one[0])
++				}
++				if err != nil {
++					return
++				}
++			}
++		}()
++		go func() {
++			defer group.Done()
++			<-start
++			_ = conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		if len(received) > len(tail) {
++			t.Fatalf("read %d bytes from a %d byte cached tail", len(received), len(tail))
++		}
++		if !bytes.Equal(received, tail[:len(received)]) {
++			t.Fatal("cached tail bytes changed during concurrent read/close")
++		}
++	}
++}
++
++func TestCachedTailConcurrentReaderReplaceableClose(t *testing.T) {
++	tail := testTail(2048)
++	for iteration := 0; iteration < 64; iteration++ {
++		conn, _ := newCachedTailConn(t, tail)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		var replaceable bool
++		go func() {
++			defer group.Done()
++			<-start
++			replaceable = conn.ReaderReplaceable()
++		}()
++		go func() {
++			defer group.Done()
++			<-start
++			_ = conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		if replaceable {
++			if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
++				t.Fatalf("replaceable connection still holds cached bytes: n=%d err=%v", n, err)
++			}
++		}
++		if !conn.ReaderReplaceable() {
++			t.Fatal("closed connection still reports an unreplaced tail")
++		}
++	}
++}
++
++func TestCachedTailConcurrentReadCachedClose(t *testing.T) {
++	tail := testTail(4096)
++	for iteration := 0; iteration < 64; iteration++ {
++		conn, _ := newCachedTailConn(t, tail)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		var taken *buf.Buffer
++		go func() {
++			defer group.Done()
++			<-start
++			taken = conn.ReadCached()
++		}()
++		go func() {
++			defer group.Done()
++			<-start
++			_ = conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		if taken != nil {
++			if !bytes.Equal(taken.Bytes(), tail) {
++				t.Fatal("taken cached tail changed during concurrent close")
++			}
++			taken.Release()
++		}
++	}
++}
++
++func TestCachedTailCloseUnblocksUpstreamRead(t *testing.T) {
++	tail := testTail(2048)
++	conn, _ := newCachedTailConn(t, tail)
++	if _, err := io.ReadFull(conn, tail); err != nil {
++		t.Fatal(err)
++	}
++	done := make(chan error, 1)
++	go func() {
++		_, err := conn.Read(make([]byte, 1))
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		t.Fatalf("read returned before close: %v", err)
++	case <-time.After(100 * time.Millisecond):
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	select {
++	case err := <-done:
++		if err == nil {
++			t.Fatal("expected a cancelled read error after close")
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("close did not unblock the underlying read")
++	}
++}
+diff --git a/protocol/socks/handshake.go b/protocol/socks/handshake.go
+index c6970ea..ea52077 100644
+--- a/protocol/socks/handshake.go
++++ b/protocol/socks/handshake.go
+@@ -139,6 +139,7 @@ func HandleConnectionEx(
+ 	}
+ 	switch version {
+ 	case socks4.Version:
++		destinationFamily, metadataKnown := peekSOCKS4DestinationFamily(reader)
+ 		var request socks4.Request
+ 		request, err = socks4.ReadRequest0(reader)
+ 		if err != nil {
+@@ -155,7 +156,15 @@ func HandleConnectionEx(
+ 				}
+ 				return E.New("socks4: authentication failed, username=", request.Username)
+ 			}
+-			handler.NewConnectionEx(auth.ContextWithUser(ctx, request.Username), NewLazyConn(conn, version), source, request.Destination, onClose)
++			requestConn, err := newRequestConn(conn, reader)
++			if err != nil {
++				return err
++			}
++			handler.NewConnectionEx(
++				auth.ContextWithUser(ctx, request.Username),
++				newRequestLazyConn(requestConn, version, destinationFamily, metadataKnown),
++				source, request.Destination, onClose,
++			)
+ 			return nil
+ 		/*case CommandTorResolve, CommandTorResolvePTR:
+ 		if resolver == nil {
+@@ -219,13 +228,18 @@ func HandleConnectionEx(
+ 			}
+ 		}
+ 		var request socks5.Request
++		destinationFamily, metadataKnown := peekSOCKS5DestinationFamily(reader)
+ 		request, err = socks5.ReadRequest(reader)
+ 		if err != nil {
+ 			return err
+ 		}
+ 		switch request.Command {
+ 		case socks5.CommandConnect:
+-			handler.NewConnectionEx(ctx, NewLazyConn(conn, version), source, request.Destination, onClose)
++			requestConn, err := newRequestConn(conn, reader)
++			if err != nil {
++				return err
++			}
++			handler.NewConnectionEx(ctx, newRequestLazyConn(requestConn, version, destinationFamily, metadataKnown), source, request.Destination, onClose)
+ 			return nil
+ 		case socks5.CommandUDPAssociate:
+ 			var (
+@@ -291,3 +305,70 @@ func HandleConnectionEx(
+ 	}
+ 	return os.ErrInvalid
+ }
++
++// peekSOCKS4DestinationFamily observes the fixed SOCKS4 request header
++// (CMD, PORT, DSTIP) without consuming it. The 0.0.0.x marker with a non-zero
++// x selects the SOCKS4a hostname form; this is a classification of the
++// original request form, not an invented byte from the request.
++func peekSOCKS4DestinationFamily(reader *std_bufio.Reader) (M.Family, bool) {
++	header, err := reader.Peek(7)
++	if err != nil {
++		return M.AddressFamilyEmpty, false
++	}
++	if header[3] == 0 && header[4] == 0 && header[5] == 0 && header[6] != 0 {
++		return M.AddressFamilyFqdn, true
++	}
++	return M.AddressFamilyIPv4, true
++}
++
++// peekSOCKS5DestinationFamily observes VER/CMD/RSV/ATYP of the CONNECT request
++// without consuming it. It runs only after the method and authentication
++// exchange has succeeded, so credential bytes are never interpreted here.
++func peekSOCKS5DestinationFamily(reader *std_bufio.Reader) (M.Family, bool) {
++	header, err := reader.Peek(4)
++	if err != nil {
++		return M.AddressFamilyEmpty, false
++	}
++	switch header[3] {
++	case M.AddressFamilyIPv4:
++		return M.AddressFamilyIPv4, true
++	case M.AddressFamilyIPv6:
++		return M.AddressFamilyIPv6, true
++	case M.AddressFamilyFqdn:
++		return M.AddressFamilyFqdn, true
++	default:
++		return M.AddressFamilyEmpty, false
++	}
++}
++
++// newRequestConn transfers exactly the bytes already buffered by the shared
++// handshake reader into one owned buffer and composes the existing cached
++// connection under the accepted connection. It performs no additional socket
++// read, does not wait for further early payload and destroys no parser state.
++func newRequestConn(conn net.Conn, reader *std_bufio.Reader) (net.Conn, error) {
++	buffered := reader.Buffered()
++	if buffered == 0 {
++		return conn, nil
++	}
++	buffer := buf.NewSize(buffered)
++	n, err := buffer.ReadFullFrom(reader, buffered)
++	if err != nil {
++		buffer.Release()
++		return nil, E.Cause(err, "socks: transfer buffered request payload")
++	}
++	if n != buffered {
++		buffer.Release()
++		return nil, E.New("socks: transfer buffered request payload: short read")
++	}
++	return bufio.NewCachedConn(conn, buffer), nil
++}
++
++func newRequestLazyConn(conn net.Conn, version byte, destinationFamily M.Family, metadataKnown bool) *LazyConn {
++	if !metadataKnown {
++		return NewLazyConn(conn, version)
++	}
++	return newLazyConnWithRequestMetadata(conn, version, RequestMetadata{
++		Version:           version,
++		DestinationFamily: destinationFamily,
++	})
++}
+diff --git a/protocol/socks/handshake_tail_test.go b/protocol/socks/handshake_tail_test.go
+new file mode 100644
+index 0000000..c4c153c
+--- /dev/null
++++ b/protocol/socks/handshake_tail_test.go
+@@ -0,0 +1,232 @@
++package socks
++
++import (
++	"bytes"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++	"testing"
++	"time"
++
++	singBufio "github.com/sagernet/sing/common/bufio"
++)
++
++// These tests pin the ownership of the early payload that the shared handshake
++// transfers into the returned connection. The success reply is always completed
++// before the returned connection is used concurrently, so a failure here is a
++// cached-tail ownership defect and not the older lazy-reply race.
++
++func openEarlyTailConnection(t *testing.T, tail []byte) net.Conn {
++	t.Helper()
++	clientConn, handler := startHandshake(t, nil)
++	negotiateSOCKS5(t, clientConn)
++	writeAll(t, clientConn, append(request5ATYP1(netip.MustParseAddr("203.0.113.9"), 443), tail...))
++	connection := handler.wait(t)
++	conn := connection.conn
++	replyRead := make(chan error, 1)
++	go func() {
++		_, err := io.ReadFull(clientConn, make([]byte, 10))
++		replyRead <- err
++	}()
++	if err := conn.(*LazyConn).ConnHandshakeSuccess(conn); err != nil {
++		t.Fatal(err)
++	}
++	if err := <-replyRead; err != nil {
++		t.Fatal(err)
++	}
++	return conn
++}
++
++func earlyTail(size int) []byte {
++	tail := make([]byte, size)
++	for index := range tail {
++		tail[index] = byte(index*7 + 3)
++	}
++	return tail
++}
++
++func TestHandshakeEarlyTailDeliveredExactlyOnce(t *testing.T) {
++	tail := earlyTail(2048)
++	conn := openEarlyTailConnection(t, tail)
++	received := make([]byte, len(tail))
++	if _, err := io.ReadFull(conn, received); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(received, tail) {
++		t.Fatal("early payload changed")
++	}
++	if !conn.(*LazyConn).ReaderReplaceable() {
++		t.Fatal("consumed early payload still reported as unreplaced")
++	}
++	// Reading again must reach the empty pipe: no duplicated early payload.
++	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
++		t.Fatal(err)
++	}
++	if n, err := conn.Read(make([]byte, 1)); n != 0 || err == nil {
++		t.Fatalf("read after early payload: n=%d err=%v", n, err)
++	}
++	if err := conn.SetReadDeadline(time.Time{}); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestHandshakeEarlyTailConcurrentReadClose(t *testing.T) {
++	tail := earlyTail(2048)
++	for iteration := 0; iteration < 32; iteration++ {
++		conn := openEarlyTailConnection(t, tail)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		received := make([]byte, 0, len(tail))
++		panics := make(chan any, 1)
++		go func() {
++			defer group.Done()
++			defer func() {
++				if recovered := recover(); recovered != nil {
++					panics <- recovered
++				}
++			}()
++			<-start
++			one := make([]byte, 1)
++			for {
++				n, err := conn.Read(one)
++				if n > 0 {
++					received = append(received, one[0])
++				}
++				if err != nil {
++					return
++				}
++			}
++		}()
++		closeDone := make(chan error, 1)
++		go func() {
++			defer group.Done()
++			<-start
++			closeDone <- conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		select {
++		case recovered := <-panics:
++			t.Fatalf("returned handshake connection panicked during concurrent read/close: %v", recovered)
++		default:
++		}
++		if err := <-closeDone; err != nil {
++			t.Fatal(err)
++		}
++		if len(received) > len(tail) {
++			t.Fatalf("read %d bytes from a %d byte early payload", len(received), len(tail))
++		}
++		if !bytes.Equal(received, tail[:len(received)]) {
++			t.Fatal("early payload changed during concurrent read/close")
++		}
++	}
++}
++
++type tallyWriter struct {
++	received []byte
++}
++
++func (w *tallyWriter) Write(p []byte) (int, error) {
++	w.received = append(w.received, p...)
++	return len(p), nil
++}
++
++func TestHandshakeEarlyTailConcurrentCopyClose(t *testing.T) {
++	tail := earlyTail(2048)
++	for iteration := 0; iteration < 32; iteration++ {
++		conn := openEarlyTailConnection(t, tail)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		destination := &tallyWriter{}
++		copyDone := make(chan struct{})
++		go func() {
++			defer group.Done()
++			defer close(copyDone)
++			<-start
++			_, _ = singBufio.CopyWithIncreateBuffer(destination, conn, 512*1000, 8)
++		}()
++		go func() {
++			defer group.Done()
++			<-start
++			_ = conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		select {
++		case <-copyDone:
++		case <-time.After(30 * time.Second):
++			t.Fatal("copy did not finish after close")
++		}
++		if len(destination.received) > len(tail) {
++			t.Fatalf("copied %d bytes from a %d byte early payload", len(destination.received), len(tail))
++		}
++		if !bytes.Equal(destination.received, tail[:len(destination.received)]) {
++			t.Fatal("early payload changed during concurrent copy/close")
++		}
++	}
++}
++
++func TestHandshakeNoTailConcurrentReadClose(t *testing.T) {
++	for iteration := 0; iteration < 32; iteration++ {
++		conn := openEarlyTailConnection(t, nil)
++		start := make(chan struct{})
++		var group sync.WaitGroup
++		group.Add(2)
++		readDone := make(chan error, 1)
++		go func() {
++			defer group.Done()
++			<-start
++			_, err := conn.Read(make([]byte, 1))
++			readDone <- err
++		}()
++		go func() {
++			defer group.Done()
++			<-start
++			_ = conn.Close()
++		}()
++		close(start)
++		group.Wait()
++		if err := <-readDone; err == nil {
++			t.Fatal("expected a cancelled read error after close")
++		}
++	}
++}
++
++func TestHandshakeEarlyTailBlockedReadCancelledByClose(t *testing.T) {
++	tail := earlyTail(2048)
++	conn := openEarlyTailConnection(t, tail)
++	if _, err := io.ReadFull(conn, tail); err != nil {
++		t.Fatal(err)
++	}
++	readDone := make(chan error, 1)
++	go func() {
++		_, err := conn.Read(make([]byte, 1))
++		readDone <- err
++	}()
++	select {
++	case err := <-readDone:
++		t.Fatalf("read returned before close: %v", err)
++	case <-time.After(100 * time.Millisecond):
++	}
++	closeDone := make(chan error, 1)
++	go func() {
++		closeDone <- conn.Close()
++	}()
++	select {
++	case err := <-readDone:
++		if err == nil {
++			t.Fatal("expected a cancelled read error after close")
++		}
++	case <-time.After(5 * time.Second):
++		t.Fatal("close did not unblock the underlying read")
++	}
++	if err := <-closeDone; err != nil {
++		t.Fatal(err)
++	}
++}
+diff --git a/protocol/socks/handshake_test.go b/protocol/socks/handshake_test.go
+new file mode 100644
+index 0000000..579c7f4
+--- /dev/null
++++ b/protocol/socks/handshake_test.go
+@@ -0,0 +1,455 @@
++package socks
++
++import (
++	"bufio"
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing/common/auth"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++)
++
++type capturedConnection struct {
++	conn        net.Conn
++	source      M.Socksaddr
++	destination M.Socksaddr
++	onClose     N.CloseHandlerFunc
++}
++
++type captureHandler struct {
++	connections chan capturedConnection
++	packets     chan struct{}
++}
++
++func newCaptureHandler() *captureHandler {
++	return &captureHandler{
++		connections: make(chan capturedConnection, 4),
++		packets:     make(chan struct{}, 4),
++	}
++}
++
++func (h *captureHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	h.connections <- capturedConnection{conn: conn, source: source, destination: destination, onClose: onClose}
++}
++
++func (h *captureHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++	h.packets <- struct{}{}
++}
++
++func (h *captureHandler) wait(t *testing.T) capturedConnection {
++	t.Helper()
++	select {
++	case connection := <-h.connections:
++		return connection
++	case <-time.After(5 * time.Second):
++		t.Fatal("connection was not dispatched")
++		return capturedConnection{}
++	}
++}
++
++func (h *captureHandler) expectNoConnection(t *testing.T) {
++	t.Helper()
++	select {
++	case connection := <-h.connections:
++		t.Fatalf("unexpected connection dispatch: %+v", connection.destination)
++	case <-time.After(100 * time.Millisecond):
++	}
++}
++
++// addressConn gives the memory pipe a TCP-like local address so the shared
++// SOCKS4 response writer produces its ordinary eight-byte bind frame.
++type addressConn struct {
++	net.Conn
++}
++
++func (c *addressConn) LocalAddr() net.Addr {
++	return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 1080}
++}
++
++// startHandshake starts the real shared handshake on a memory pipe and returns
++// the client side.
++func startHandshake(t *testing.T, authenticator *auth.Authenticator) (net.Conn, *captureHandler) {
++	t.Helper()
++	clientConn, serverConn := net.Pipe()
++	handler := newCaptureHandler()
++	wrappedConn := &addressConn{Conn: serverConn}
++	go func() {
++		_ = HandleConnectionEx(
++			context.Background(), wrappedConn, bufio.NewReader(wrappedConn),
++			authenticator, handler, nil, 0,
++			M.ParseSocksaddr("127.0.0.1:1234"), nil,
++		)
++	}()
++	t.Cleanup(func() {
++		_ = clientConn.Close()
++		_ = serverConn.Close()
++	})
++	return clientConn, handler
++}
++
++func writeAll(t *testing.T, conn net.Conn, payload []byte) {
++	t.Helper()
++	if _, err := conn.Write(payload); err != nil {
++		t.Fatalf("write handshake: %v", err)
++	}
++}
++
++func readN(t *testing.T, conn net.Conn, length int) []byte {
++	t.Helper()
++	buffer := make([]byte, length)
++	if _, err := io.ReadFull(conn, buffer); err != nil {
++		t.Fatalf("read %d bytes: %v", length, err)
++	}
++	return buffer
++}
++
++func negotiateSOCKS5(t *testing.T, conn net.Conn) {
++	t.Helper()
++	writeAll(t, conn, []byte{0x05, 0x01, 0x00})
++	if reply := readN(t, conn, 2); !bytes.Equal(reply, []byte{0x05, 0x00}) {
++		t.Fatalf("unexpected method selection: %x", reply)
++	}
++}
++
++func request5ATYP1(addr netip.Addr, port uint16) []byte {
++	ip := addr.As4()
++	return []byte{0x05, 0x01, 0x00, 0x01, ip[0], ip[1], ip[2], ip[3], byte(port >> 8), byte(port)}
++}
++
++func request5ATYP6(addr netip.Addr, port uint16) []byte {
++	ip := addr.As16()
++	request := []byte{0x05, 0x01, 0x00, 0x04}
++	request = append(request, ip[:]...)
++	return append(request, byte(port>>8), byte(port))
++}
++
++func request5ATYP3(domain string, port uint16) []byte {
++	request := []byte{0x05, 0x01, 0x00, 0x03, byte(len(domain))}
++	request = append(request, domain...)
++	return append(request, byte(port>>8), byte(port))
++}
++
++func request4(addr netip.Addr, port uint16) []byte {
++	ip := addr.As4()
++	return []byte{0x04, 0x01, byte(port >> 8), byte(port), ip[0], ip[1], ip[2], ip[3], 0x00}
++}
++
++func request4a(domain string, port uint16) []byte {
++	request := []byte{0x04, 0x01, byte(port >> 8), byte(port), 0x00, 0x00, 0x00, 0x01, 0x00}
++	request = append(request, domain...)
++	return append(request, 0x00)
++}
++
++func requestMetadataOf(t *testing.T, conn net.Conn) RequestMetadata {
++	t.Helper()
++	provider, loaded := conn.(RequestMetadataProvider)
++	if !loaded {
++		t.Fatalf("dispatched connection %T does not implement RequestMetadataProvider", conn)
++	}
++	requestMetadata, known := provider.RequestMetadata()
++	if !known {
++		t.Fatal("dispatched connection carries no request provenance")
++	}
++	return requestMetadata
++}
++
++func TestHandleConnectionExCapturesOriginalDestinationFamily(t *testing.T) {
++	fixtures := []struct {
++		name    string
++		request func(t *testing.T, conn net.Conn)
++		family  M.Family
++		version byte
++	}{
++		{
++			name: "socks5-atyp-ipv4",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP1(netip.MustParseAddr("203.0.113.9"), 443))
++			},
++			family: M.AddressFamilyIPv4, version: 5,
++		},
++		{
++			name: "socks5-atyp-ipv6",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP6(netip.MustParseAddr("2001:db8::9"), 443))
++			},
++			family: M.AddressFamilyIPv6, version: 5,
++		},
++		{
++			name: "socks5-atyp-domain",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP3("example.com", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 5,
++		},
++		{
++			name: "socks5-atyp-domain-numeric-ipv4",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP3("192.0.2.9", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 5,
++		},
++		{
++			name: "socks5-atyp-domain-numeric-ipv6",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP3("2001:db8::9", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 5,
++		},
++		{
++			name: "socks5-atyp-domain-numeric-ipv4-mapped",
++			request: func(t *testing.T, conn net.Conn) {
++				negotiateSOCKS5(t, conn)
++				writeAll(t, conn, request5ATYP3("::ffff:192.0.2.9", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 5,
++		},
++		{
++			name: "socks4-literal",
++			request: func(t *testing.T, conn net.Conn) {
++				writeAll(t, conn, request4(netip.MustParseAddr("192.0.2.9"), 443))
++			},
++			family: M.AddressFamilyIPv4, version: 4,
++		},
++		{
++			name: "socks4a-hostname",
++			request: func(t *testing.T, conn net.Conn) {
++				writeAll(t, conn, request4a("example.com", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 4,
++		},
++		{
++			name: "socks4a-numeric-hostname",
++			request: func(t *testing.T, conn net.Conn) {
++				writeAll(t, conn, request4a("192.0.2.9", 443))
++			},
++			family: M.AddressFamilyFqdn, version: 4,
++		},
++		{
++			name: "socks4a-non-one-marker",
++			request: func(t *testing.T, conn net.Conn) {
++				request := request4a("marker.example", 443)
++				request[7] = 0x02
++				writeAll(t, conn, request)
++			},
++			family: M.AddressFamilyFqdn, version: 4,
++		},
++	}
++	for _, fixture := range fixtures {
++		t.Run(fixture.name, func(t *testing.T) {
++			clientConn, handler := startHandshake(t, nil)
++			fixture.request(t, clientConn)
++			connection := handler.wait(t)
++			requestMetadata := requestMetadataOf(t, connection.conn)
++			if requestMetadata.Version != fixture.version {
++				t.Fatalf("metadata version = %d, want %d", requestMetadata.Version, fixture.version)
++			}
++			if requestMetadata.DestinationFamily != fixture.family {
++				t.Fatalf("metadata family = %d, want %d", requestMetadata.DestinationFamily, fixture.family)
++			}
++			_ = connection.conn.Close()
++		})
++	}
++}
++
++func readSOCKS5Reply(t *testing.T, conn net.Conn) []byte {
++	t.Helper()
++	header := readN(t, conn, 4)
++	switch header[3] {
++	case 0x01:
++		return append(header, readN(t, conn, 6)...)
++	case 0x04:
++		return append(header, readN(t, conn, 18)...)
++	case 0x03:
++		length := readN(t, conn, 1)
++		return append(append(header, length...), readN(t, conn, int(length[0])+2)...)
++	default:
++		t.Fatalf("unexpected SOCKS5 reply address type: %x", header[3])
++		return nil
++	}
++}
++
++func readPayloadThroughLazyConn(t *testing.T, clientConn net.Conn, conn net.Conn, length int) []byte {
++	t.Helper()
++	received := make([]byte, length)
++	readDone := make(chan error, 1)
++	go func() {
++		_, err := io.ReadFull(conn, received)
++		readDone <- err
++	}()
++	// The success reply is written lazily on the first read.
++	reply := readSOCKS5Reply(t, clientConn)
++	if reply[1] != 0x00 {
++		t.Fatalf("unexpected success reply: %x", reply)
++	}
++	if err := <-readDone; err != nil {
++		t.Fatalf("read transferred payload: %v", err)
++	}
++	return received
++}
++
++func TestHandleConnectionExTransfersBufferedPayloadOnce(t *testing.T) {
++	for _, size := range []int{1, 11, 4095, 4096, 8192} {
++		size := size
++		t.Run(fmt.Sprintf("payload-%d", size), func(t *testing.T) {
++			clientConn, handler := startHandshake(t, nil)
++			payload := make([]byte, size)
++			for index := range payload {
++				payload[index] = byte(index*7 + 3)
++			}
++			negotiateSOCKS5(t, clientConn)
++			go func() {
++				_, _ = clientConn.Write(append(request5ATYP3("example.com", 443), payload...))
++			}()
++			connection := handler.wait(t)
++			received := readPayloadThroughLazyConn(t, clientConn, connection.conn, size)
++			if !bytes.Equal(received, payload) {
++				t.Fatal("transferred payload differs from the written payload")
++			}
++			_ = connection.conn.Close()
++		})
++	}
++}
++
++func TestHandleConnectionExTransfersPayloadForSOCKS4Forms(t *testing.T) {
++	fixtures := []struct {
++		name    string
++		request func() []byte
++	}{
++		{name: "socks4-literal", request: func() []byte {
++			return request4(netip.MustParseAddr("192.0.2.9"), 443)
++		}},
++		{name: "socks4a-hostname", request: func() []byte {
++			return request4a("example.com", 443)
++		}},
++	}
++	for _, fixture := range fixtures {
++		t.Run(fixture.name, func(t *testing.T) {
++			clientConn, handler := startHandshake(t, nil)
++			payload := []byte("early-bytes")
++			go func() {
++				_, _ = clientConn.Write(append(fixture.request(), payload...))
++			}()
++			connection := handler.wait(t)
++			received := make([]byte, len(payload))
++			readDone := make(chan error, 1)
++			go func() {
++				_, err := io.ReadFull(connection.conn, received)
++				readDone <- err
++			}()
++			reply := readN(t, clientConn, 8)
++			if reply[1] != 0x5A {
++				t.Fatalf("unexpected SOCKS4 success reply: %x", reply)
++			}
++			if err := <-readDone; err != nil {
++				t.Fatalf("read transferred payload: %v", err)
++			}
++			if !bytes.Equal(received, payload) {
++				t.Fatalf("payload = %q, want %q", received, payload)
++			}
++			_ = connection.conn.Close()
++		})
++	}
++}
++
++func TestHandleConnectionExDoesNotReadAhead(t *testing.T) {
++	clientConn, handler := startHandshake(t, nil)
++	negotiateSOCKS5(t, clientConn)
++	writeAll(t, clientConn, request5ATYP1(netip.MustParseAddr("203.0.113.9"), 443))
++	connection := handler.wait(t)
++	readErr := make(chan error, 1)
++	go func() {
++		buffer := make([]byte, 1)
++		_, err := connection.conn.Read(buffer)
++		readErr <- err
++	}()
++	if reply := readSOCKS5Reply(t, clientConn); reply[1] != 0x00 {
++		t.Fatalf("unexpected success reply: %x", reply)
++	}
++	select {
++	case err := <-readErr:
++		t.Fatalf("handshake read returned without client payload: %v", err)
++	case <-time.After(150 * time.Millisecond):
++	}
++	_ = connection.conn.Close()
++}
++
++func TestHandleConnectionExAuthFailureDispatchesNothing(t *testing.T) {
++	authenticator := auth.NewAuthenticator([]auth.User{{Username: "user", Password: "pass"}})
++	clientConn, handler := startHandshake(t, authenticator)
++	writeAll(t, clientConn, []byte{0x05, 0x01, 0x02})
++	if reply := readN(t, clientConn, 2); !bytes.Equal(reply, []byte{0x05, 0x02}) {
++		t.Fatalf("unexpected method selection: %x", reply)
++	}
++	writeAll(t, clientConn, []byte{0x01, 0x04, 'u', 's', 'e', 'r', 0x03, 'b', 'a', 'd'})
++	if reply := readN(t, clientConn, 2); !bytes.Equal(reply, []byte{0x01, 0x01}) {
++		t.Fatalf("unexpected authentication status: %x", reply)
++	}
++	handler.expectNoConnection(t)
++}
++
++func TestHandleConnectionExFailureBeforeSuccessIsTerminal(t *testing.T) {
++	clientConn, handler := startHandshake(t, nil)
++	negotiateSOCKS5(t, clientConn)
++	writeAll(t, clientConn, request5ATYP1(netip.MustParseAddr("203.0.113.9"), 443))
++	connection := handler.wait(t)
++	lazyConn := connection.conn.(*LazyConn)
++	failureDone := make(chan error, 1)
++	go func() {
++		failureDone <- lazyConn.HandshakeFailure(syscall.EPERM)
++	}()
++	reply := readN(t, clientConn, 10)
++	if reply[1] != 0x02 {
++		t.Fatalf("failure reply code = %d, want 2", reply[1])
++	}
++	if err := <-failureDone; err != nil {
++		t.Fatalf("write failure reply: %v", err)
++	}
++	if err := lazyConn.ConnHandshakeSuccess(lazyConn); err != nil {
++		t.Fatalf("late success must be a no-op: %v", err)
++	}
++	if err := clientConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
++		t.Fatalf("set read deadline: %v", err)
++	}
++	extra := make([]byte, 1)
++	if _, err := clientConn.Read(extra); err == nil {
++		t.Fatal("a second SOCKS5 reply was written after the terminal failure")
++	}
++	_ = connection.conn.Close()
++}
++
++func TestHandleConnectionExDenialDoesNotDeliverBufferedPayload(t *testing.T) {
++	clientConn, handler := startHandshake(t, nil)
++	negotiateSOCKS5(t, clientConn)
++	payload := []byte("must-not-be-forwarded")
++	writeAll(t, clientConn, append(request5ATYP3("example.com", 443), payload...))
++	connection := handler.wait(t)
++	lazyConn := connection.conn.(*LazyConn)
++	failureDone := make(chan error, 1)
++	go func() {
++		failureDone <- lazyConn.HandshakeFailure(syscall.EPERM)
++	}()
++	if reply := readN(t, clientConn, 10); reply[1] != 0x02 {
++		t.Fatalf("denial reply code = %d, want 2", reply[1])
++	}
++	if err := <-failureDone; err != nil {
++		t.Fatalf("write denial: %v", err)
++	}
++	if err := connection.conn.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
++		t.Fatalf("close denied connection: %v", err)
++	}
++}
+diff --git a/protocol/socks/lazy.go b/protocol/socks/lazy.go
+index 1a1d61c..dc3395e 100644
+--- a/protocol/socks/lazy.go
++++ b/protocol/socks/lazy.go
+@@ -11,9 +11,30 @@ import (
+ 	"github.com/sagernet/sing/protocol/socks/socks5"
+ )
+ 
++// RequestMetadata describes the original wire form of a parsed SOCKS request.
++// It is copied by value and never derived from the normalized destination.
++type RequestMetadata struct {
++	// Version is the SOCKS protocol version of the request.
++	Version byte
++	// DestinationFamily is the address family used on the wire:
++	// metadata.AddressFamilyIPv4, metadata.AddressFamilyIPv6 or
++	// metadata.AddressFamilyFqdn (SOCKS5 ATYP=3 or the SOCKS4a 0.0.0.x
++	// hostname form).
++	DestinationFamily M.Family
++}
++
++// RequestMetadataProvider is an optional capability. The boolean reports
++// whether a successfully parsed and authenticated request supplied wire
++// provenance; a connection constructed by NewLazyConn itself carries none.
++type RequestMetadataProvider interface {
++	RequestMetadata() (RequestMetadata, bool)
++}
++
+ type LazyConn struct {
+ 	net.Conn
+ 	socksVersion    byte
++	requestMetadata RequestMetadata
++	metadataKnown   bool
+ 	responseWritten bool
+ }
+ 
+@@ -24,6 +45,19 @@ func NewLazyConn(conn net.Conn, socksVersion byte) *LazyConn {
+ 	}
+ }
+ 
++// newLazyConnWithRequestMetadata is used by the shared handshake for a parsed
++// CONNECT request. Callers outside this package keep using NewLazyConn.
++func newLazyConnWithRequestMetadata(conn net.Conn, socksVersion byte, requestMetadata RequestMetadata) *LazyConn {
++	lazyConn := NewLazyConn(conn, socksVersion)
++	lazyConn.requestMetadata = requestMetadata
++	lazyConn.metadataKnown = true
++	return lazyConn
++}
++
++func (c *LazyConn) RequestMetadata() (RequestMetadata, bool) {
++	return c.requestMetadata, c.metadataKnown
++}
++
+ func (c *LazyConn) ConnHandshakeSuccess(conn net.Conn) error {
+ 	if c.responseWritten {
+ 		return nil
+diff --git a/protocol/socks/lazy_test.go b/protocol/socks/lazy_test.go
+new file mode 100644
+index 0000000..a02e78c
+--- /dev/null
++++ b/protocol/socks/lazy_test.go
+@@ -0,0 +1,78 @@
++package socks
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++var _ RequestMetadataProvider = (*LazyConn)(nil)
++
++func TestNewLazyConnHasNoRequestMetadata(t *testing.T) {
++	clientConn, serverConn := net.Pipe()
++	defer clientConn.Close()
++	defer serverConn.Close()
++	lazyConn := NewLazyConn(serverConn, 5)
++	if _, known := lazyConn.RequestMetadata(); known {
++		t.Fatal("NewLazyConn reported request provenance it never observed")
++	}
++}
++
++func TestLazyConnRequestMetadataIsAnImmutableValue(t *testing.T) {
++	clientConn, serverConn := net.Pipe()
++	defer clientConn.Close()
++	defer serverConn.Close()
++	lazyConn := newLazyConnWithRequestMetadata(serverConn, 4, RequestMetadata{
++		Version:           4,
++		DestinationFamily: M.AddressFamilyFqdn,
++	})
++	requestMetadata, known := lazyConn.RequestMetadata()
++	if !known {
++		t.Fatal("constructed request metadata was not reported")
++	}
++	if requestMetadata.Version != 4 || requestMetadata.DestinationFamily != M.AddressFamilyFqdn {
++		t.Fatalf("unexpected request metadata: %+v", requestMetadata)
++	}
++	requestMetadata.DestinationFamily = M.AddressFamilyIPv4
++	again, known := lazyConn.RequestMetadata()
++	if !known {
++		t.Fatal("request metadata disappeared")
++	}
++	if again.DestinationFamily != M.AddressFamilyFqdn {
++		t.Fatalf("caller mutation changed stored provenance: %+v", again)
++	}
++	replyDone := make(chan error, 1)
++	go func() {
++		replyDone <- lazyConn.ConnHandshakeSuccess(lazyConn)
++	}()
++	reply := make([]byte, 4)
++	if _, err := io.ReadFull(clientConn, reply); err != nil {
++		t.Fatalf("read success reply: %v", err)
++	}
++	if reply[1] != 0x5A {
++		t.Fatalf("unexpected SOCKS4 reply: %x", reply)
++	}
++	if err := <-replyDone; err != nil {
++		t.Fatalf("write success reply: %v", err)
++	}
++	afterReply, known := lazyConn.RequestMetadata()
++	if !known || afterReply != again {
++		t.Fatalf("provenance changed after the handshake reply: %+v", afterReply)
++	}
++}
++
++func TestLazyConnRequestMetadataSurvivesContextUse(t *testing.T) {
++	// The capability is per connection state, not context global state.
++	connectionA := newLazyConnWithRequestMetadata(nil, 5, RequestMetadata{Version: 5, DestinationFamily: M.AddressFamilyIPv4})
++	connectionB := newLazyConnWithRequestMetadata(nil, 5, RequestMetadata{Version: 5, DestinationFamily: M.AddressFamilyFqdn})
++	ctx := context.Background()
++	_ = ctx
++	metadataA, _ := connectionA.RequestMetadata()
++	metadataB, _ := connectionB.RequestMetadata()
++	if metadataA.DestinationFamily == metadataB.DestinationFamily {
++		t.Fatal("two connections shared request provenance")
++	}
++}

@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/listener"
+	boxlistener "github.com/sagernet/sing-box/common/listener"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/service/powerreport"
@@ -39,6 +39,7 @@ type DefaultDialer struct {
 	udpAddr4               string
 	udpAddr6               string
 	netns                  string
+	bindInterface          string
 	autoDetectBindFunc     control.Func
 	connectionManager      adapter.ConnectionManager
 	networkManager         adapter.NetworkManager
@@ -51,12 +52,49 @@ type DefaultDialer struct {
 	fallbackNetworkType    []C.InterfaceType
 	networkFallbackDelay   time.Duration
 	networkLastFallback    common.TypedValue[time.Time]
+	attemptHook            AttemptHook
+	pendingHook            PendingTCPHook
+	firstPayload           FirstPayloadAttempt
+	tcpFastOpen            bool
+	tcpSocketOptions       option.TCPOptions
+	tcpSocketControl       control.Func
+}
+
+// SetAttemptHook installs the optional per-attempt native hook. It must be
+// called before the dialer is published and is never mutated per connection.
+func (d *DefaultDialer) SetAttemptHook(hook AttemptHook) {
+	d.attemptHook = hook
+}
+
+// SetPendingTCPHook installs the optional deferred-TFO wrapper hook. With an
+// attempt hook and `tcp_fast_open` enabled, TCP dials become lazy: the native
+// socket is created on the first transformed write (or an explicit empty /
+// server-first connect) so one prepared owned attempt carries the TFO data.
+func (d *DefaultDialer) SetPendingTCPHook(hook PendingTCPHook) {
+	d.pendingHook = hook
+}
+
+// SetFirstPayloadAttempt installs the platform first-payload attempt of the
+// owned deferred TFO path. It must be called before the dialer is published and
+// is never mutated per connection. Production leaves it unset, which selects the
+// platform implementation; the cross-package deferred bridge contract test uses
+// it to drive the real pending facade without an OS socket.
+func (d *DefaultDialer) SetFirstPayloadAttempt(attempt FirstPayloadAttempt) {
+	d.firstPayload = attempt
+}
+
+func (d *DefaultDialer) AttemptHook() AttemptHook {
+	return d.attemptHook
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
 	connectionManager := service.FromContext[adapter.ConnectionManager](ctx)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
+	tcpOptions, err := buildTCPOptions(options.AbstractDialerOptions)
+	if err != nil {
+		return nil, err
+	}
 
 	var (
 		dialer                 net.Dialer
@@ -68,6 +106,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		fallbackNetworkType    []C.InterfaceType
 		networkFallbackDelay   time.Duration
 		autoDetectBindFunc     control.Func
+		tcpSocketControl       control.Func
 	)
 	if networkManager != nil {
 		interfaceFinder = networkManager.InterfaceFinder()
@@ -90,6 +129,10 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		listener.Control = control.Append(listener.Control, setMarkWrapper(networkManager, uint32(options.RoutingMark), false))
 	}
 	disableDefaultBind := options.BindInterface != "" || options.Inet4BindAddress != nil || options.Inet6BindAddress != nil
+	// effectiveBindInterface is the device this dialer actually binds every
+	// attempt to. It is reported to the attempt hook so per-attempt caches can
+	// be scoped to the real interface instead of falling back across devices.
+	effectiveBindInterface := options.BindInterface
 	if disableDefaultBind || options.TCPFastOpen {
 		if options.NetworkStrategy != nil || len(options.NetworkType) > 0 && options.FallbackNetworkType == nil && options.FallbackDelay == 0 {
 			return nil, E.New("`network_strategy` is conflict with `bind_interface`, `inet4_bind_address`, `inet6_bind_address` and `tcp_fast_open`")
@@ -99,6 +142,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if networkManager != nil {
 		defaultOptions := networkManager.DefaultOptions()
 		if defaultOptions.BindInterface != "" && !disableDefaultBind {
+			// This is the actual device every attempt of this dialer is bound
+			// to; it is exposed to the per-attempt hook as an attempt fact.
+			effectiveBindInterface = defaultOptions.BindInterface
 			bindFunc := control.BindToInterface(networkManager.InterfaceFinder(), defaultOptions.BindInterface, -1)
 			dialer.Control = control.Append(dialer.Control, bindFunc)
 			listener.Control = control.Append(listener.Control, bindFunc)
@@ -200,6 +246,15 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpDialer4 = dialer
 		udpAddr4   string
 	)
+	// Remote TCP socket options belong to every actual TCP socket this dialer
+	// creates, so they are prepended to the shared base control list before
+	// the family-specific copies are made. The control itself skips UDP; both
+	// standard dialing, deferred TFO, parallel-interface copies, fallback
+	// copies and the Windows ConnectEx helper inherit it.
+	if !tcpOptions.Empty() {
+		tcpSocketControl = boxlistener.TCPControl(tcpOptions)
+		dialer.Control = control.Append(tcpSocketControl, dialer.Control)
+	}
 	if options.Inet4BindAddress != nil {
 		bindAddr := options.Inet4BindAddress.Build(netip.IPv4Unspecified())
 		dialer4.LocalAddr = &net.TCPAddr{IP: bindAddr.AsSlice()}
@@ -216,8 +271,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	)
 	if options.Inet6BindAddress != nil {
 		bindAddr := options.Inet6BindAddress.Build(netip.IPv6Unspecified())
-		dialer6.LocalAddr = &net.TCPAddr{IP: bindAddr.AsSlice()}
-		udpDialer6.LocalAddr = &net.UDPAddr{IP: bindAddr.AsSlice(), Port: int(options.UDPBindPort)}
+		bindAddr, err = resolveBindZone(bindAddr, effectiveBindInterface)
+		if err != nil {
+			return nil, err
+		}
+		dialer6.LocalAddr = &net.TCPAddr{IP: bindAddr.AsSlice(), Zone: bindAddr.Zone()}
+		udpDialer6.LocalAddr = &net.UDPAddr{IP: bindAddr.AsSlice(), Zone: bindAddr.Zone(), Port: int(options.UDPBindPort)}
 		udpAddr6 = M.SocksaddrFrom(bindAddr, options.UDPBindPort).String()
 	} else if options.UDPBindPort != 0 {
 		udpDialer6.LocalAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: int(options.UDPBindPort)}
@@ -237,6 +296,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpAddr4:               udpAddr4,
 		udpAddr6:               udpAddr6,
 		netns:                  options.NetNs,
+		bindInterface:          effectiveBindInterface,
 		autoDetectBindFunc:     autoDetectBindFunc,
 		connectionManager:      connectionManager,
 		networkManager:         networkManager,
@@ -248,6 +308,9 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		networkType:            networkType,
 		fallbackNetworkType:    fallbackNetworkType,
 		networkFallbackDelay:   networkFallbackDelay,
+		tcpFastOpen:            options.TCPFastOpen,
+		tcpSocketOptions:       tcpOptions,
+		tcpSocketControl:       tcpSocketControl,
 	}, nil
 }
 
@@ -274,19 +337,48 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 		return nil, E.New("domain not resolved")
 	}
 	if d.networkStrategy == nil {
-		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
+		if d.deferTCP(network) {
+			var base net.Dialer
+			if !address.IsIPv6() {
+				base = d.dialer4.Dialer
+			} else {
+				base = d.dialer6.Dialer
+			}
+			conn, pending, err := d.dialPendingTCP(ctx, base, network, address.String())
+			if err != nil {
+				return nil, err
+			}
+			tracked, trackErr := d.trackConn(ctx, address, conn, nil)
+			if trackErr != nil {
+				_ = conn.Close()
+				return nil, trackErr
+			}
+			// Counting and connection-manager wrappers do not forward the
+			// deprecated handshake interface, so the deferred contract is
+			// re-asserted outside them. All bytes still pass through the
+			// transformation wrappers inside, and the counting wrappers keep
+			// observing every byte of the connection.
+			return &pendingHandshakeConn{Conn: tracked, pending: pending}, nil
+		}
+		conn, err := boxlistener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
-					return d.udpDialer4.DialContext(ctx, network, address.String())
+					return d.dialAttempt(ctx, d.udpDialer4, network, address.String())
 				} else {
-					return d.udpDialer6.DialContext(ctx, network, address.String())
+					return d.dialAttempt(ctx, d.udpDialer6, network, address.String())
 				}
 			}
 			if !address.IsIPv6() {
-				return DialSlowContext(&d.dialer4, ctx, network, address)
+				if d.attemptHook == nil {
+					return DialSlowContext(&d.dialer4, ctx, network, address)
+				}
+				return d.dialAttempt(ctx, d.dialer4.Dialer, network, address.String())
 			} else {
-				return DialSlowContext(&d.dialer6, ctx, network, address)
+				if d.attemptHook == nil {
+					return DialSlowContext(&d.dialer6, ctx, network, address)
+				}
+				return d.dialAttempt(ctx, d.dialer6.Dialer, network, address.String())
 			}
 		})
 		return d.trackConn(ctx, address, conn, err)
@@ -345,7 +437,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if d.networkStrategy == nil {
-		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
+		packetConn, err := boxlistener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
 			if d.autoDetectBindFunc != nil {
 				listenConfig.Control = control.Append(listenConfig.Control, func(network, address string, conn syscall.RawConn) error {
@@ -363,6 +455,7 @@ func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksadd
 				return listenConfig.ListenPacket(ctx, N.NetworkUDP, d.udpAddr4)
 			}
 		})
+		packetConn, err = d.attachListener(ctx, packetConn, err)
 		return d.trackPacketConn(ctx, destination, packetConn, err)
 	} else {
 		return d.ListenSerialInterfacePacket(ctx, destination, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
@@ -406,6 +499,10 @@ func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destina
 		} else {
 			return nil, err
 		}
+	}
+	packetConn, err = d.attachListener(ctx, packetConn, nil)
+	if err != nil {
+		return nil, err
 	}
 	return d.trackPacketConn(ctx, destination, packetConn, nil)
 }

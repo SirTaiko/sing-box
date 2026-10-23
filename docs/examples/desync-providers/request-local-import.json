@@ -1,0 +1,27 @@
+{
+  "format": "desync.list-refresh/v1",
+  "provider": "reestr-preresolved",
+  "acquisition": "local",
+  "families": [4, 6],
+  "snapshots": [
+    {"dataset": "ip4", "path": "/srv/desync/snapshots/reestr_resolved4.txt"},
+    {"dataset": "ip6", "path": "/srv/desync/snapshots/reestr_resolved6.txt"}
+  ],
+  "inputs": {
+    "user_hosts": ["/etc/sing-box/desync/zapret-hosts-user.txt"],
+    "exclude_hosts": ["/etc/sing-box/desync/zapret-hosts-user-exclude.txt"]
+  },
+  "compression": "gzip",
+  "resolve": {"threads": 8, "eagain": 3, "eagain_delay_ms": 250},
+  "aggregate": {
+    "ipv4": {"prefix_length": "22-30", "threshold": "3/4"},
+    "ipv6": {"prefix_length": "56-64", "threshold": 5}
+  },
+  "limits": {
+    "max_entries": 262144,
+    "max_exclude_entries": 65536,
+    "max_decoded_bytes": 67108864,
+    "max_total_bytes": 268435456,
+    "timeout_seconds": 300
+  }
+}

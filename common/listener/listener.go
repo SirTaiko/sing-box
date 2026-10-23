@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/settings"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -35,7 +36,16 @@ type Listener struct {
 	systemProxySOCKS         bool
 	tproxy                   bool
 
+	// bindSource and bindClock are the injectable seams of the TCP binding
+	// resolver; nil selects the production interface enumeration and clock.
+	bindSource TCPBindInterfaceSource
+	bindClock  TCPBindClock
+	// listenFunc is the injectable listener constructor used by the
+	// multi-bind startup rollback tests; nil selects the real one.
+	listenFunc tcpListenFunc
+
 	tcpListener          net.Listener
+	tcpRelayOptions      adapter.TCPRelayOptions
 	systemProxy          settings.SystemProxy
 	udpConn              *net.UDPConn
 	udpAddr              M.Socksaddr
@@ -145,6 +155,28 @@ func (l *Listener) UDPConn() *net.UDPConn {
 
 func (l *Listener) ListenOptions() option.ListenOptions {
 	return l.listenOptions
+}
+
+// tcpBindInterfaceSource resolves the interface snapshot source. The network
+// manager finder is preferred; it observes the interfaces of the running
+// core. The listener tests inject l.bindSource directly.
+func (l *Listener) tcpBindInterfaceSource() TCPBindInterfaceSource {
+	if l.bindSource != nil {
+		return l.bindSource
+	}
+	var finder control.InterfaceFinder
+	networkManager := service.FromContext[adapter.NetworkManager](l.ctx)
+	if networkManager != nil {
+		finder = networkManager.InterfaceFinder()
+	}
+	return NewTCPBindInterfaceSource(finder)
+}
+
+func (l *Listener) tcpBindClock() TCPBindClock {
+	if l.bindClock != nil {
+		return l.bindClock
+	}
+	return DefaultTCPBindClock()
 }
 
 func ListenNetworkNamespace[T any](ctx context.Context, nameOrPath string, block func() (T, error)) (T, error) {

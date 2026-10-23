@@ -26,6 +26,13 @@ type Options struct {
 	DisableEmptyDirectCheck bool
 	DirectOutbound          bool
 	DefaultOutbound         bool
+	// AttemptHook installs an optional per-native-attempt desync lease. A nil
+	// hook keeps the exact existing direct path.
+	AttemptHook AttemptHook
+	// PendingTCPHook installs the deferred-TFO stream wrapper. It is used only
+	// together with AttemptHook and `tcp_fast_open`; a nil hook keeps the
+	// existing eager TFO path.
+	PendingTCPHook PendingTCPHook
 }
 
 // TODO: merge with NewWithOptions
@@ -60,6 +67,16 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 		dialer, err = NewDefault(options.Context, dialOptions)
 		if err != nil {
 			return nil, err
+		}
+		if options.AttemptHook != nil {
+			if defaultDialer, isDefault := dialer.(*DefaultDialer); isDefault {
+				defaultDialer.SetAttemptHook(options.AttemptHook)
+			}
+		}
+		if options.PendingTCPHook != nil {
+			if defaultDialer, isDefault := dialer.(*DefaultDialer); isDefault {
+				defaultDialer.SetPendingTCPHook(options.PendingTCPHook)
+			}
 		}
 	}
 	if options.RemoteIsDomain && (!hasDetour || options.ResolverOnDetour || dialOptions.DomainResolver != nil && dialOptions.DomainResolver.Server != "") {

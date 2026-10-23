@@ -1,0 +1,85 @@
+{
+  "format": "direct-desync.d5-mapping/v1",
+  "version": "direct-desync/d5-contract/v1.0",
+  "task": "t_3646bfed",
+  "recipient": "t_f53ab56b",
+  "decision_status": "PROPOSED",
+  "stage_result": "DECISION_READY",
+  "verification_status": "OWNERSHIP_COVERAGE_ONLY_NOT_IMPLEMENTATION_OR_PARITY_PASS",
+  "document": {
+    "path": "/home/taiko/code/singbox-worktrees/desync-artifacts/t_3646bfed-d5-contract.md",
+    "sha256": "08d8a78ad7a62129e1e2e0de60ae9abbdfac21f7506e46d754608e6c46cf61db",
+    "bytes": 55462
+  },
+  "base": "d7a2091c66ea732cb5fdc040cb9cbafcfac9909d",
+  "input_tree": "e77dda43f31e2eb0e8bb3c88635522551105c7bc",
+  "offline_v3_tree": "09499e10a97de89b8327526545cea5a55c196455",
+  "canonical_input_patch": {
+    "path": "/home/taiko/code/singbox-worktrees/desync-artifacts/t_1d998646-canonical.patch",
+    "sha256": "4e10ed8eb205b4004ddb84e1a9de2644032a280676be0e2e0290a515e2f6a374",
+    "bytes": 1200276
+  },
+  "reference_revision": "c849e55ef0f1c244206f5a05ff7b1ab41a3824ee",
+  "reference_root": "/home/taiko/code/singbox-worktrees/desync-artifacts/reference/zapret-c849e55ef0f1c244206f5a05ff7b1ab41a3824ee",
+  "inventory": "/home/taiko/code/singbox-worktrees/desync-artifacts/parity-inventory.json",
+  "inherited_config_ownership": "/home/taiko/code/singbox-worktrees/desync-artifacts/t_3234c807-u4-mapping.json",
+  "coverage_scope": "Every pinned ipset/ file and only the D5-related config.default variables. Runtime rows below map the D5 attachment, not D3/U4 behavior. Source hashes remain in parity-inventory.json. No claim that upstream scripts are executed or that existing local normalization implements provider acquisition.",
+  "owners": {
+    "helper": "D5 helper lane: new provider/listbundle, command, adapter DTO/interface and HTTP handler files only; contract section 8",
+    "core": "One coder-max integration owner: existing Engine/direct/stream/options/server registration and native snapshot attachment; contract section 8",
+    "external_deployment": "Operator-owned deployment procedure, never an in-process shell hook or firewall manager",
+    "tester": "Explicit authorized disposable-lab harness and independent evidence; no runtime strategy selector"
+  },
+  "ipset_files": [
+    {"path":"ipset/antifilter.helper","section":"4","recipe":null,"mapping":"Shared bounded AntiFilter fetch, exact cut_local and existing IPv4 IP2Net pipeline; no shell execution.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/clear_lists.sh","section":"4,5,7","recipe":"empty","mapping":"Explicit complete empty generation or operator removes bundle references; never wildcard-delete legacy/user lists.","owner":"helper","tests":["P1","P4"]},
+    {"path":"ipset/create_ipset.sh","section":"5,7","recipe":null,"mapping":"Existing compiler/matcher materializes bounded immutable list selection. Kernel ipset/nft/pf mutations remain external deployment, not copied into runtime.","owner":"core","tests":["P3","R3"]},
+    {"path":"ipset/def.sh","section":"3,4,5,7","recipe":null,"mapping":"Translate bounded compression, family filenames, user/exclude/ipban resolution and local-cut semantics. Do not port DNS probes/cache flush, process controls, firewall reload or shell hooks.","owner":"helper","tests":["P1","P2","P3","P4"]},
+    {"path":"ipset/get_antifilter_allyouneed.sh","section":"4","recipe":"antifilter-allyouneed","mapping":"Fixed allyouneed.lst HTTPS acquisition, IPv4 cut/aggregation plus U phase; exact URL and guards in contract.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_antifilter_ip.sh","section":"4","recipe":"antifilter-ip","mapping":"Fixed ip.lst HTTPS acquisition, IPv4 cut/aggregation plus U phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_antifilter_ipresolve.sh","section":"4","recipe":"antifilter-ipresolve","mapping":"Fixed ipresolve.lst acquisition, IPv4 cut/aggregation plus U; provider label does not trigger provider DNS resolution.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_antifilter_ipsmart.sh","section":"4","recipe":"antifilter-ipsmart","mapping":"Fixed antifilter.network/download/ipsmart.lst acquisition, IPv4 cut/aggregation plus U; preserve distinct host.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_antifilter_ipsum.sh","section":"4","recipe":"antifilter-ipsum","mapping":"Fixed ipsum.lst acquisition, IPv4 cut/aggregation plus U even for summarized source.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_antizapret_domains.sh","section":"4","recipe":"antizapret-domains","mapping":"Fixed HTTPS port8443 source, required gzip and decoded size guard, domain normalize plus B phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_config.sh","section":"3,4,7","recipe":null,"mapping":"Strict provider enum and explicit list-refresh invocation, not sourcing config or default acquisition at load.","owner":"helper","tests":["P1","P2"]},
+    {"path":"ipset/get_exclude.sh","section":"4","recipe":"exclude","mapping":"X phase only, explicit exclude inputs and strict local acquisition; retain negative datasets.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_ipban.sh","section":"4","recipe":"ipban","mapping":"B phase only, explicit exclude/ipban inputs; no invented remote ipban feed.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_reestr_preresolved.sh","section":"4","recipe":"reestr-preresolved","mapping":"Family-specific reestr_resolved4/6 fixed feeds, no provider DNS or aggregation, U phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_reestr_preresolved_smart.sh","section":"4","recipe":"reestr-preresolved-smart","mapping":"Family-specific reestr_smart4/6 fixed feeds, no substitute local aggregation, U phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_reestr_resolvable_domains.sh","section":"4","recipe":"reestr-resolvable-domains","mapping":"Fixed reestr_hostname_resolvable domain feed, no provider DNS implied by label, B phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_refilter_domains.sh","section":"4","recipe":"refilter-domains","mapping":"Fixed GitHub latest domains_all.lst acquisition with bounded allowed redirects, domains plus B phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_refilter_ipsum.sh","section":"4","recipe":"refilter-ipsum","mapping":"Fixed GitHub latest ipsum.lst IPv4 acquisition with bounded allowed redirects, no extra aggregation, U phase.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/get_user.sh","section":"4","recipe":"user","mapping":"Explicit local user/exclude/ipban inputs, U phase; DNS only on explicit operator invocation.","owner":"helper","tests":["P1","P2","P3"]},
+    {"path":"ipset/zapret-hosts-user-exclude.txt.default","section":"4,5","recipe":null,"mapping":"Optional explicit exclude_hosts input, recorded hash/path provenance; never implicitly copied or loaded.","owner":"helper","tests":["P1","P3","P4"]}
+  ],
+  "additional_recipe": {"id":"local","section":"3,4","owner":"helper","mapping":"Typed operator import extension, no upstream script equivalence claimed; no HTTP/DNS/aggregation.","tests":["P1","P3","P4"]},
+  "config_default_rows": [
+    {"variable":"SET_MAXELEM","source":"config.default:18","owner":"helper","core_attachment":true,"mapping":"limits.max_entries default522288, hard bounded datasets and last-good failure; never max_leases.","section":"3,5,7","tests":["P3","R3"]},
+    {"variable":"IPSET_OPT","source":"config.default:21","owner":"core","mapping":"maxelem becomes typed list capacity; kernel hashsize has no runtime JSON equivalent and no opaque shell string.","section":"5,7","tests":["P3","R3"]},
+    {"variable":"IPSET_HOOK","source":"config.default:23","owner":"external_deployment","mapping":"Explicit external producer may supply typed local input/provenance; core/tools never execute hook.","section":"3,4,7","tests":["P1","P2"]},
+    {"variable":"IP2NET_OPT4","source":"config.default:26","owner":"helper","mapping":"Existing typed IPv4 ip2net options; request.aggregate.ipv4 only on aggregating recipes; preserve v3 pre-output threshold validation.","section":"3,4,7","tests":["P1","P3","P4"]},
+    {"variable":"IP2NET_OPT6","source":"config.default:27","owner":"helper","mapping":"Existing explicit IPv6 ip2net family options; aggregate schema does not invent aggregation for nonaggregating provider recipes.","section":"3,4,7","tests":["P1","P3","P4"]},
+    {"variable":"MDIG_THREADS","source":"config.default:36","owner":"helper","mapping":"resolve.threads default30 and existing mdig --threads; not SOCKS resolver_concurrency.","section":"3,4,7","tests":["P1","P2","P3"]},
+    {"variable":"GZIP_LISTS","source":"config.default:39","owner":"helper","core_attachment":true,"mapping":"Explicit compression, bounded deterministic shards and existing loader; no background compressor.","section":"3,5,7","tests":["P2","P3","P4","R3"]},
+    {"variable":"LISTS_RELOAD","source":"config.default:44","owner":"core","mapping":"Explicit tools desync reload through optional adapter and gated existing controller to Engine transaction; no pfctl/shell/HUP and retain last-good.","section":"6,7","tests":["R1","R3"]},
+    {"variable":"GETLIST","source":"config.default:146","owner":"helper","mapping":"Strict recipe enum and explicit list-refresh, no scheduling/download on config/load; normalization alone is not acquisition parity.","section":"3,4,7","tests":["P1","P2","P4"]}
+  ],
+  "runtime_and_procedure_rows": [
+    {"reference":"SIGHUP list reload","mapping":"reload via existing Engine.ReloadLists; atomic packet/stream/learned staging remains core integration dependency","owner":"core","section":"6,7","tests":["R1","R3"]},
+    {"reference":"nfq SIGUSR1","mapping":"Bounded conntrack diagnostics of existing state, no process signal","owner":"core","section":"6,7","tests":["R1","R2"]},
+    {"reference":"nfq SIGUSR2 / tpws SIGUSR2","mapping":"Bounded failure-pool and ipcache diagnostics; no duplicate learner/cache","owner":"core","section":"6,7","tests":["R1","R2"]},
+    {"reference":"--nlm-list[=all]","mapping":"Explicit windows-network query with connected/all scope; native extension belongs existing owner","owner":"core","section":"6,7","tests":["R2","R4"]},
+    {"reference":"--wf-save","mapping":"Bounded filter dump of actual owned endpoints, no capture expansion; D3 filter_save remains separately owned","owner":"core","section":"6,7","tests":["R2","R4"]},
+    {"reference":"blockcheck support","mapping":"Preserve offline metadata format; correct documented lab procedure and retain actual packet/application verification with tester","owner":"tester","section":"7","tests":["B1"]}
+  ],
+  "unchanged_ownership": "All other U4 config rows, D3 kernel capture/quoted ICMP, U4 socket/inbound semantics and the two unapproved U4 compatibility choices remain with their existing owners. This mapping does not change their acceptance state.",
+  "outstanding": [
+    "Root acceptance of this exact PROPOSED document and mapping before D5 writer",
+    "Freeze D4/core foundation and confirm disjoint leases",
+    "All D5 production implementation and single-owner core attachment",
+    "Hermetic acquisition/publication/route/redaction/reload tests and platform builds/race checks",
+    "Native Windows query/atomic-filesystem and authorized disposable-lab evidence",
+    "Independent security and final combined QA/review; overall parity remains OPEN"
+  ],
+  "recovery_note": "The preceding attempts produced the unchanged v1.0 contract but timed out before this companion ledger existed. This recovery adds the promised bounded ownership mapping and consistency checks only. It does not repeat the source audit, certify prior test claims or implement production code."
+}

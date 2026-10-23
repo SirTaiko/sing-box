@@ -22,6 +22,8 @@ type _DirectOutboundOptions struct {
 	OverridePort uint16 `json:"override_port,omitempty" schema:"omit"`
 	// Deprecated: removed
 	ProxyProtocol uint8 `json:"proxy_protocol,omitempty" schema:"omit"`
+	// Desync is an optional native packet desync engine for this outbound.
+	Desync *DirectDesyncOptions `json:"desync,omitempty"`
 }
 
 type DirectOutboundOptions _DirectOutboundOptions

@@ -9,6 +9,16 @@ type SocksInboundOptions struct {
 	ListenOptions
 	Users          []auth.User           `json:"users,omitempty"`
 	DomainResolver *DomainResolveOptions `json:"domain_resolver,omitempty"`
+	// NoResolve refuses every CONNECT request whose original wire form is a
+	// domain name before route rules, sniffing or DNS are consulted. Literal
+	// IPv4/IPv6 destinations keep working. The SOCKS5 reply is the existing
+	// ruleset-denied code 2.
+	NoResolve bool `json:"no_resolve,omitempty"`
+	// ResolverConcurrency bounds how many SOCKS destination lookups may run
+	// at the same time through the existing DNS router. Additional lookups
+	// wait in a queue bounded by tcp_max_connections (10000 when absent).
+	// Absent keeps the previous behavior: the inbound performs no lookup.
+	ResolverConcurrency *uint16 `json:"resolver_concurrency,omitempty"`
 }
 
 type HTTPMixedInboundOptions struct {

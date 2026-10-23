@@ -1,0 +1,86 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "rules": [
+          {
+            "name": "quic-443",
+            "network": ["udp"],
+            "port": [443],
+            "methods": ["fake"],
+            "fake": { "repeats": 6, "payloads": [{ "protocol": "quic", "file": "bin/quic_initial_www_google_com.bin" }] }
+          },
+          {
+            "name": "discord-stun",
+            "network": ["udp"],
+            "port_range": ["19294-19344", "50000-50100"],
+            "protocol": ["discord", "stun"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                { "protocol": "discord", "file": "bin/ACTIVE_DISCORD_UDP.bin" },
+                { "protocol": "stun", "file": "bin/ACTIVE_DISCORD_UDP.bin" }
+              ]
+            }
+          },
+          {
+            "name": "tls-alt-ports",
+            "network": ["tcp"],
+            "port": [2053, 2083, 2087, 2096, 8443],
+            "methods": ["multisplit"],
+            "multisplit": { "split_pos": ["1"], "seqovl": 681, "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin" }
+          },
+          {
+            "name": "tls-443-zero-ip-id",
+            "network": ["tcp"],
+            "port": [443],
+            "ip_id": "zero",
+            "methods": ["multisplit"],
+            "multisplit": { "split_pos": ["1"], "seqovl": 681, "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin" }
+          },
+          {
+            "name": "http-tls-80-443",
+            "network": ["tcp"],
+            "port": [80, 443],
+            "methods": ["multisplit"],
+            "multisplit": { "split_pos": ["1"], "seqovl": 568, "seqovl_pattern": "bin/tls_clienthello_4pda_to.bin" }
+          },
+          {
+            "name": "tcp-80-443-8443",
+            "network": ["tcp"],
+            "port": [80, 443, 8443],
+            "methods": ["multisplit"],
+            "multisplit": { "split_pos": ["1"], "seqovl": 568, "seqovl_pattern": "bin/tls_clienthello_4pda_to.bin" }
+          },
+          {
+            "name": "game-tcp",
+            "network": ["tcp"],
+            "port_range": ["1024-65535"],
+            "any_protocol": true,
+            "cutoff": "n3",
+            "methods": ["multisplit"],
+            "multisplit": { "split_pos": ["1"], "seqovl": 568, "seqovl_pattern": "bin/tls_clienthello_4pda_to.bin" }
+          },
+          {
+            "name": "game-udp",
+            "network": ["udp"],
+            "port_range": ["1024-65535"],
+            "any_protocol": true,
+            "cutoff": "n2",
+            "methods": ["fake"],
+            "fake": { "repeats": 12, "payloads": [{ "protocol": "unknown", "file": "bin/ACTIVE_GAME_UDP.bin" }] }
+          }
+        ]
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": { "final": "zapret" }
+}

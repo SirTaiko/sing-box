@@ -1,0 +1,2 @@
+# Synthetic exclusion fixture for parser tests, not captured from any network.
+duplicate.example.net

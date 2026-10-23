@@ -92,6 +92,26 @@ type ListenOptions struct {
 	UDPFragmentDefault   bool               `json:"-"`
 	UDPTimeout           UDPTimeoutCompat   `json:"udp_timeout,omitempty"`
 	Detour               string             `json:"detour,omitempty" reference:"inbound"`
+	// TCPSocketOptions applies typed local TCP socket controls to the
+	// listening socket before bind and, where required, to each accepted
+	// socket. It does not affect UDP listening sockets.
+	TCPSocketOptions *TCPSocketOptions `json:"tcp_socket_options,omitempty"`
+	// TCPListenBindings selects one or more TCP listen endpoints for this
+	// inbound. A non-empty list replaces the legacy `listen` field; the
+	// inbound keeps one connection handler and one admission budget.
+	TCPListenBindings *TCPListenBindingList `json:"tcp_listen_bindings,omitempty"`
+	// TCPMaxConnections bounds concurrently accepted TCP connections across
+	// every bind socket of this inbound. Absent keeps the previous behavior.
+	TCPMaxConnections *uint16 `json:"tcp_max_connections,omitempty"`
+	// TCPDisableSplice selects an ordinary read/write relay copy in both
+	// directions and prevents syscall/ReaderFrom/WriterTo fast paths from
+	// unwrapping the connection pair. Absent keeps the previous behavior.
+	TCPDisableSplice bool `json:"tcp_disable_splice,omitempty"`
+	// TCPMaxOrphanTime bounds how long a pending remote attempt is kept alive
+	// after the local leg terminally closed while the remote was still
+	// unavailable and queued data was unsent. Absent keeps the previous
+	// behavior; an explicit zero disables only the orphan timer.
+	TCPMaxOrphanTime *badoption.Duration `json:"tcp_max_orphan_time,omitempty"`
 
 	// Deprecated: removed
 	ProxyProtocol bool `json:"proxy_protocol,omitempty" schema:"omit"`

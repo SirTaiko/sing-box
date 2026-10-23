@@ -1,0 +1,67 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "rules": [
+          {
+            "name": "tls-443",
+            "network": ["tcp"],
+            "port": [443],
+            "protocol": ["tls"],
+            "domain": ["youtube.com", "discord.com"],
+            "methods": ["fake", "multisplit"],
+            "fake": {
+              "repeats": 8,
+              "fooling": ["ts"],
+              "payloads": [{ "protocol": "tls", "file": "bin/stun2.bin" }]
+            },
+            "multisplit": {
+              "split_pos": ["1"],
+              "seqovl": 664,
+              "seqovl_pattern": "bin/tls_clienthello_www_sferum_ru.bin"
+            }
+          },
+          {
+            "name": "quic-443",
+            "network": ["udp"],
+            "port": [443],
+            "protocol": ["quic"],
+            "methods": ["fake"],
+            "fake": {
+              "repeats": 11,
+              "payloads": [{ "protocol": "quic", "file": "bin/quic_initial_www_google_com.bin" }]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "socks",
+      "tag": "vpn",
+      "server": "127.0.0.1",
+      "server_port": 1080
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      {
+        "domain_suffix": ["youtube.com", "googlevideo.com", "discord.com", "discord.media"],
+        "action": "route",
+        "outbound": "zapret"
+      },
+      {
+        "domain_suffix": ["internal.example"],
+        "action": "route",
+        "outbound": "vpn"
+      }
+    ],
+    "final": "direct"
+  }
+}

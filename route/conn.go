@@ -35,12 +35,21 @@ type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
 	connections list.List[io.Closer]
+	// relayClock is the orphan timer seam; nil selects the system clock.
+	relayClock tcpRelayClock
 }
 
 func NewConnectionManager(logger logger.ContextLogger) *ConnectionManager {
 	return &ConnectionManager{
 		logger: logger,
 	}
+}
+
+func (m *ConnectionManager) tcpRelayClock() tcpRelayClock {
+	if m.relayClock != nil {
+		return m.relayClock
+	}
+	return systemTCPRelayClock{}
 }
 
 func (m *ConnectionManager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
@@ -97,14 +106,43 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 
 func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = adapter.WithContext(ctx, &metadata)
+	relayOptions := metadata.TCPRelayOptions
+	var done atomic.Bool
+	localConn := conn
+	if relayOptions.DisableSplice {
+		localConn = newNonSpliceConn(conn)
+	}
+	var pair *tcpRelayPair
+	dialContext := ctx
+	if relayOptions.HasMaxOrphanTime {
+		// The close of one accepted connection pair is reported exactly once,
+		// no matter which owner (pending relay pair, upload copy, download
+		// copy or a handshake failure) observes it first. This guard exists
+		// only for a pair that configured the orphan policy: an absent field
+		// keeps the previous path and allocations.
+		var reportOnce sync.Once
+		closeHandler := onClose
+		onClose = func(err error) {
+			reportOnce.Do(func() {
+				if closeHandler != nil {
+					closeHandler(err)
+				}
+			})
+		}
+		// The accepting inbound configured the orphan policy: this existing
+		// connection pair owns the pending-connect state, the single upload
+		// reader and the bounded pending buffer.
+		pair = newTCPRelayPair(ctx, localConn, relayOptions, m.tcpRelayClock(), m.logger, &done, onClose)
+		dialContext = pair.context()
+	}
 	var (
 		remoteConn net.Conn
 		err        error
 	)
 	if len(metadata.DestinationAddresses) > 0 || metadata.Destination.IsIP() {
-		remoteConn, err = dialer.DialSerialNetwork(ctx, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
+		remoteConn, err = dialer.DialSerialNetwork(dialContext, this, N.NetworkTCP, metadata.Destination, metadata.DestinationAddresses, metadata.NetworkStrategy, metadata.NetworkType, metadata.FallbackNetworkType, metadata.FallbackDelay)
 	} else {
-		remoteConn, err = this.DialContext(ctx, N.NetworkTCP, metadata.Destination)
+		remoteConn, err = this.DialContext(dialContext, N.NetworkTCP, metadata.Destination)
 	}
 	if err != nil {
 		var remoteString string
@@ -118,14 +156,36 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 			dialerString = " using outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
 		}
 		err = E.Cause(err, "open connection to ", remoteString, dialerString)
+		if pair != nil {
+			pair.abort(err)
+			return
+		}
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
+	}
+	if pair != nil && !pair.bind() {
+		// The pair cancelled while this attempt was in flight (orphan expiry,
+		// terminal local close without unsent data or shutdown): a late
+		// resolve/connect result must be closed instead of resurrecting it.
+		remoteConn.Close()
+		pair.abort(nil)
+		return
+	}
+	abortPair := func(pairErr error) bool {
+		if pair == nil {
+			return false
+		}
+		pair.abort(pairErr)
+		return true
 	}
 	err = N.ReportConnHandshakeSuccess(conn, remoteConn)
 	if err != nil {
 		err = E.Cause(err, "report handshake success")
 		remoteConn.Close()
+		if abortPair(err) {
+			return
+		}
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		m.logger.ErrorContext(ctx, err)
 		return
@@ -133,12 +193,19 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if metadata.TLSDesync != nil {
 		if metadata.TLSFragment || metadata.TLSRecordFragment || metadata.TLSSpoof != "" {
 			remoteConn.Close()
-			N.CloseOnHandshakeFailure(conn, onClose, E.New("tls_desync conflicts with upstream TLS wrappers"))
+			conflictErr := E.New("tls_desync conflicts with upstream TLS wrappers")
+			if abortPair(conflictErr) {
+				return
+			}
+			N.CloseOnHandshakeFailure(conn, onClose, conflictErr)
 			return
 		}
 		desyncConn, desyncErr := tlsdesync.NewConn(remoteConn, *metadata.TLSDesync)
 		if desyncErr != nil {
 			remoteConn.Close()
+			if abortPair(desyncErr) {
+				return
+			}
 			N.CloseOnHandshakeFailure(conn, onClose, desyncErr)
 			m.logger.ErrorContext(ctx, desyncErr)
 			return
@@ -153,6 +220,9 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		if spoofErr != nil {
 			spoofErr = E.Cause(spoofErr, "tls_spoof setup")
 			remoteConn.Close()
+			if abortPair(spoofErr) {
+				return
+			}
 			N.CloseOnHandshakeFailure(conn, onClose, spoofErr)
 			m.logger.ErrorContext(ctx, spoofErr)
 			return
@@ -160,15 +230,36 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 		remoteConn = spoofConn
 	}
 	serverFirst := sniff.Skip(&metadata)
-	var done atomic.Bool
+	remoteCopy := remoteConn
+	if relayOptions.DisableSplice {
+		remoteCopy = newNonSpliceConn(remoteConn)
+	}
+	if pair != nil {
+		// The upload direction is owned by the single pending reader; the
+		// existing handshake kick still runs before any queued byte.
+		if m.kickWriteHandshake(ctx, conn, remoteCopy, serverFirst, false, &done, onClose) {
+			pair.terminate()
+			return
+		}
+		if m.kickWriteHandshake(ctx, remoteCopy, localConn, serverFirst, true, &done, onClose) {
+			pair.terminate()
+			return
+		}
+		if err = pair.activate(remoteCopy); err != nil {
+			pair.abort(err)
+			return
+		}
+		go m.connectionCopy(ctx, remoteCopy, localConn, true, &done, onClose)
+		return
+	}
 	if m.kickWriteHandshake(ctx, conn, remoteConn, serverFirst, false, &done, onClose) {
 		return
 	}
 	if m.kickWriteHandshake(ctx, remoteConn, conn, serverFirst, true, &done, onClose) {
 		return
 	}
-	go m.connectionCopy(ctx, conn, remoteConn, false, &done, onClose)
-	go m.connectionCopy(ctx, remoteConn, conn, true, &done, onClose)
+	go m.connectionCopy(ctx, localConn, remoteCopy, false, &done, onClose)
+	go m.connectionCopy(ctx, remoteCopy, localConn, true, &done, onClose)
 }
 
 func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dialer, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {

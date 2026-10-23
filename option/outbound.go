@@ -106,6 +106,10 @@ type AbstractDialerOptions struct {
 	NetworkType                badoption.Listable[InterfaceType] `json:"network_type,omitempty"`
 	FallbackNetworkType        badoption.Listable[InterfaceType] `json:"fallback_network_type,omitempty"`
 	FallbackDelay              badoption.Duration                `json:"fallback_delay,omitempty"`
+	// TCPSocketOptions applies typed remote TCP socket controls to every
+	// actual native TCP socket of this dialer before connect. It never
+	// applies to UDP sockets.
+	TCPSocketOptions *TCPSocketOptions `json:"tcp_socket_options,omitempty"`
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`

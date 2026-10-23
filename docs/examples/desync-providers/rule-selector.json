@@ -1,0 +1,28 @@
+{
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "rules": [
+          {
+            "network": ["tcp"],
+            "list_bundle": {
+              "manifest": "/var/lib/sing-box/desync/lists/current.json",
+              "domain": ["hosts", "user_hosts"],
+              "domain_exclude": ["exclude_hosts"],
+              "ip_cidr": ["ip4", "ip6", "user_ip4", "user_ip6"],
+              "ip_cidr_exclude": ["exclude_ip4", "exclude_ip6"]
+            },
+            "methods": ["fake"],
+            "fake": {
+              "payloads": [{"file": "/etc/sing-box/desync/payload/ACTIVE_GENERAL.bin"}],
+              "repeats": 8,
+              "fooling": ["ts"]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

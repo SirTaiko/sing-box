@@ -1,0 +1,9 @@
+# Synthetic provider snapshot for parser tests, not captured from any network.
+Example.COM.
+example.com
+sub.example.org
+  duplicate.example.net  
+*.wildcard.example
+bad entry.example
+exa_mple..org
+.only-subdomains.example

@@ -1,0 +1,54 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    { "type": "mixed", "tag": "mixed-in", "listen": "127.0.0.1", "listen_port": 2080 }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret-stages",
+      "desync": {
+        "rules": [
+          {
+            "name": "tls-staged",
+            "network": ["tcp"],
+            "port": [443],
+            "methods": ["synack", "fake", "fakeddisorder"],
+            "fake": {
+              "payloads": [
+                { "protocol": "unknown", "hex": "00000000" }
+              ],
+              "repeats": 2,
+              "fooling": ["ts"]
+            },
+            "fakeddisorder": {
+              "split_pos": ["1"],
+              "fake_pattern": "0x00000000",
+              "fake_mod": "altorder=0"
+            },
+            "ttl": 4,
+            "autottl": "-1:3-20",
+            "tcp_flags_set": "PSH",
+            "ip_id": "rnd",
+            "start": "d1",
+            "cutoff": "d8"
+          },
+          {
+            "name": "udp-length",
+            "network": ["udp"],
+            "port": [443],
+            "methods": ["fake", "udplen"],
+            "fake": {
+              "payloads": [
+                { "protocol": "quic", "file": "bin/quic_initial_www_google_com.bin" }
+              ],
+              "repeats": 4
+            },
+            "udplen": { "increment": 2, "pattern": "0x00" }
+          }
+        ],
+        "limits": { "hold_timeout": "250ms" }
+      }
+    }
+  ]
+}

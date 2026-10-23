@@ -1,0 +1,21 @@
+{
+  "format": "desync.list-refresh/v1",
+  "provider": "empty",
+  "acquisition": "local",
+  "families": [4, 6],
+  "snapshots": [],
+  "inputs": {},
+  "compression": "gzip",
+  "resolve": {"threads": 30, "eagain": 10, "eagain_delay_ms": 500},
+  "aggregate": {
+    "ipv4": {"prefix_length": "22-30", "threshold": "3/4"},
+    "ipv6": {"prefix_length": "56-64", "threshold": 5}
+  },
+  "limits": {
+    "max_entries": 522288,
+    "max_exclude_entries": 65536,
+    "max_decoded_bytes": 134217728,
+    "max_total_bytes": 536870912,
+    "timeout_seconds": 60
+  }
+}

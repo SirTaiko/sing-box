@@ -1,0 +1,41 @@
+{
+  "format": "desync.blockcheck/v1",
+  "reference": {
+    "zapret_revision": "c849e55ef0f1c244206f5a05ff7b1ab41a3824ee",
+    "flowseal_revision": "1.10.4"
+  },
+  "cases": [
+    {
+      "id": "linux-tls-fake",
+      "platform": "linux",
+      "strategy": "--dpi-desync=fake --dpi-desync-fooling=ts --dpi-desync-fake-tls=bin/tls_clienthello_www_google_com.bin",
+      "status": "SKIP",
+      "evidence": null,
+      "reason": "pending disposable Linux VM; no capture executed"
+    },
+    {
+      "id": "linux-tls-multisplit",
+      "platform": "linux",
+      "strategy": "--dpi-desync=multisplit --dpi-desync-split-pos=1",
+      "status": "SKIP",
+      "evidence": null,
+      "reason": "pending disposable Linux VM; no capture executed"
+    },
+    {
+      "id": "windows-tls-fake",
+      "platform": "windows",
+      "strategy": "--dpi-desync=fake --dpi-desync-fooling=ts --dpi-desync-fake-tls=bin/tls_clienthello_www_google_com.bin",
+      "status": "SKIP",
+      "evidence": null,
+      "reason": "pending disposable Windows VM; no capture executed"
+    },
+    {
+      "id": "windows-tls-multisplit",
+      "platform": "windows",
+      "strategy": "--dpi-desync=multisplit --dpi-desync-split-pos=1",
+      "status": "SKIP",
+      "evidence": null,
+      "reason": "pending disposable Windows VM; no capture executed"
+    }
+  ]
+}

@@ -5,10 +5,12 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/desync"
 	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -22,6 +24,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
@@ -47,6 +50,137 @@ type Outbound struct {
 	isEmpty        bool
 	myAddresses    common.TypedValue[[]netip.Prefix]
 	icmpPort       *ping.Port
+	// desync is nil for absent/disabled packet configurations: no engine,
+	// capture, reassembly or extra goroutines are allocated in that case.
+	desync *desync.Engine
+	// stream is nil for absent/disabled stream configurations. Non-nil only
+	// means the immutable compiled snapshot exists; no socket work happens
+	// until an owned TCP attempt is created.
+	stream *desync.StreamConfig
+	// desyncStarted records that the outbound reached its lifecycle start.
+	// Diagnostics reports not_started before that; it never forces activation.
+	desyncStarted atomic.Bool
+}
+
+func anyEnabledPacketRule(rules []option.DirectDesyncRule) bool {
+	for index := range rules {
+		if !rules[index].Disabled {
+			return true
+		}
+	}
+	return false
+}
+
+func anyEnabledStreamRule(rules []option.DirectDesyncStreamRule) bool {
+	for index := range rules {
+		if !rules[index].Disabled {
+			return true
+		}
+	}
+	return false
+}
+
+// compileDirectDesync compiles the packet and stream halves of one
+// direct.desync object independently. The two rule lists are never merged:
+// packet rules are compiled into a capture engine, stream rules into an
+// immutable StreamConfig. A stream-only configuration is valid: it creates the
+// existing state-only engine (admission, ip cache, learner) and needs no packet
+// backend, capture privileges or packet socket preparation.
+func compileDirectDesync(options *option.DirectDesyncOptions, basePath string) (*desync.Engine, *desync.StreamConfig, error) {
+	if options == nil {
+		return nil, nil, nil
+	}
+	if options.Enabled != nil && !*options.Enabled {
+		return nil, nil, nil
+	}
+	packetEnabled := anyEnabledPacketRule(options.Rules)
+	streamEnabled := anyEnabledStreamRule(options.StreamRules)
+	if !packetEnabled && !streamEnabled {
+		if len(options.Rules) == 0 && len(options.StreamRules) == 0 {
+			return nil, nil, E.New("desync: enabled without rules")
+		}
+		return nil, nil, E.New("desync: enabled without enabled rules")
+	}
+	if !packetEnabled {
+		// capture/limits bound the packet engine only. They are rejected for
+		// a stream-only object instead of being accepted as silent no-ops.
+		if options.Capture != nil {
+			return nil, nil, E.New("desync: capture requires packet rules")
+		}
+		if options.Limits != nil {
+			return nil, nil, E.New("desync: limits require packet rules")
+		}
+	}
+	var (
+		engine       *desync.Engine
+		streamConfig *desync.StreamConfig
+	)
+	// One state for both halves: current.json is read once per canonical
+	// bundle root and packet/stream rules share the pinned generation and the
+	// per-outbound selection budget.
+	listState := desync.NewListBuildState()
+	if packetEnabled {
+		desyncConfig, err := desync.CompileWithState(options, basePath, listState)
+		if err != nil {
+			return nil, nil, err
+		}
+		if desyncConfig != nil {
+			engine, err = desync.NewEngine(desyncConfig, desync.NewNativeBackend())
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if streamEnabled {
+		var err error
+		streamConfig, err = desync.CompileStreamWithState(options.StreamRules, basePath, listState)
+		if err != nil {
+			return nil, nil, err
+		}
+		if streamConfig != nil {
+			if engine == nil {
+				// A stream-only object still needs the single per-outbound
+				// state owner for the ip cache and hostlist-auto learner.
+				// The state backend owns no capture and opens no native handle.
+				engine, err = desync.NewStateEngine(options, options.StreamRules)
+				if err != nil {
+					return nil, nil, err
+				}
+			}
+			if err = streamConfig.AttachEngine(engine); err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if engine == nil && streamConfig == nil {
+		return nil, nil, E.New("desync: enabled without enabled rules")
+	}
+	if engine != nil {
+		engine.SetBundleGenerations(listState.BundleGenerations())
+	}
+	return engine, streamConfig, nil
+}
+
+// checkDesyncDialerConflicts rejects dialer combinations whose ownership the
+// attachment cannot guarantee. It covers the packet engine and stream rules so
+// an enabled configuration never silently loses a configured dialer behavior.
+func checkDesyncDialerConflicts(dialerOptions option.DialerOptions, engine *desync.Engine, stream *desync.StreamConfig) error {
+	if engine == nil && stream == nil {
+		return nil
+	}
+	if engine != nil && engine.PacketEnabled() {
+		// These combinations need packet ownership that this increment does
+		// not implement. They are rejected explicitly instead of silently
+		// accepting a configuration that does nothing. A stream-only state
+		// engine owns no packet socket, so these dialer options stay valid.
+		if dialerOptions.TCPMultiPath {
+			return E.New("desync: tcp_multipath conflicts with enabled packet desync (additional subflow ownership is an outstanding parity gap)")
+		}
+		if dialerOptions.BindAddressNoPort {
+			return E.New("desync: bind_address_no_port conflicts with enabled packet desync (an exclusive early local port is required)")
+		}
+	}
+	return nil
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
@@ -54,12 +188,47 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Detour != "" {
 		return nil, E.New("`detour` is not supported in direct context")
 	}
-	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
+	var (
+		outboundEngine *desync.Engine
+		streamConfig   *desync.StreamConfig
+	)
+	if options.Desync != nil {
+		// Payload and list paths resolve through the established configuration
+		// path context (filemanager), exactly like other sing-box file options.
+		// Without a manager this is the process-relative path, preserving the
+		// previous behaviour for callers that do not install one.
+		basePath := filemanager.BasePath(ctx, "")
+		var err error
+		outboundEngine, streamConfig, err = compileDirectDesync(options.Desync, basePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	desyncEnabled := outboundEngine != nil || streamConfig != nil
+	if conflictErr := checkDesyncDialerConflicts(options.DialerOptions, outboundEngine, streamConfig); conflictErr != nil {
+		return nil, conflictErr
+	}
+	dialerOptions := dialer.Options{
 		Context:        ctx,
 		Options:        options.DialerOptions,
 		RemoteIsDomain: true,
 		DirectOutbound: true,
-	})
+	}
+	if desyncEnabled {
+		hook := &desyncHook{
+			engine:   outboundEngine,
+			stream:   streamConfig,
+			lifetime: ctx,
+			logger:   logger,
+		}
+		dialerOptions.AttemptHook = hook
+		// With `tcp_fast_open` the native dial must be deferred to the first
+		// transformed write so the single prepared owned attempt can carry
+		// the TFO data. The same hook supplies the once-only stream wrapper
+		// for the pending facade.
+		dialerOptions.PendingTCPHook = hook
+	}
+	outboundDialer, err := dialer.NewWithOptions(dialerOptions)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +244,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
 		}),
+		desync: outboundEngine,
+		stream: streamConfig,
+	}
+	if desyncEnabled {
+		// Enabled desync must never be treated as an empty direct outbound by
+		// detour validation or optimization.
+		outbound.isEmpty = false
 	}
 	//nolint:staticcheck
 	if options.ProxyProtocol != 0 {
@@ -94,7 +270,13 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if h.icmpPort != nil {
 			scope.Add(h.icmpPort.Close)
 		}
+		if h.desync != nil {
+			scope.Add(h.desync.Close)
+		}
 	case adapter.StartStatePostStart, adapter.StartStateStarted:
+		if h.desync != nil || h.stream != nil {
+			h.desyncStarted.Store(true)
+		}
 		if len(h.myAddresses.Load()) == 0 {
 			h.fetchMyAddresses()
 		}
@@ -154,6 +336,9 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	if h.isMyLoopbackAddress(destination.Addr) {
 		return nil, E.New("loopback connection to TUN range")
 	}
+	if err := h.checkLegacyConflict(ctx); err != nil {
+		return nil, err
+	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -170,6 +355,9 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	if h.isMyLoopbackAddress(destination.Addr) {
 		return nil, E.New("loopback connection to TUN range")
+	}
+	if err := h.checkLegacyConflict(ctx); err != nil {
+		return nil, err
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
@@ -213,6 +401,9 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
 	if h.isMyLoopbackAddress(destinationAddresses...) {
 		return nil, E.New("loopback connection to TUN range")
 	}
+	if err := h.checkLegacyConflict(ctx); err != nil {
+		return nil, err
+	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -230,6 +421,9 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, dest
 	if h.isMyLoopbackAddress(destinationAddresses...) {
 		return nil, E.New("loopback connection to TUN range")
 	}
+	if err := h.checkLegacyConflict(ctx); err != nil {
+		return nil, err
+	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
@@ -246,6 +440,9 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, dest
 func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
 	if h.isMyLoopbackAddress(destinationAddresses...) {
 		return nil, netip.Addr{}, E.New("loopback connection to TUN range")
+	}
+	if err := h.checkLegacyConflict(ctx); err != nil {
+		return nil, netip.Addr{}, err
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()

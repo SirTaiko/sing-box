@@ -1,0 +1,51 @@
+{
+  "log": { "level": "info" },
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "d1-fidelity",
+      "desync": {
+        "rules": [
+          {
+            "name": "http-hostfakesplit",
+            "network": ["tcp"],
+            "port": [80],
+            "methods": ["hostfakesplit"],
+            "hostfakesplit": {
+              "midhost": "host+3",
+              "mod": "host=example.org,altorder=0"
+            },
+            "repeats": 2,
+            "orig": { "ttl": 7, "mod_start": "n2", "mod_cutoff": "n8" },
+            "dup": {
+              "count": 1,
+              "ttl": 5,
+              "ip_id": "seq",
+              "start": "n2",
+              "cutoff": "n8"
+            }
+          },
+          {
+            "name": "tls-server-window",
+            "network": ["tcp"],
+            "port": [443],
+            "methods": ["fake"],
+            "fake": {
+              "payloads": [
+                { "protocol": "unknown", "hex": "1603010000" }
+              ]
+            },
+            "wssize": {
+              "size": 1024,
+              "scale": 0,
+              "cutoff": "d4",
+              "forced_cutoff": false
+            },
+            "wsize": { "size": 1024 },
+            "synack_split": "syn"
+          }
+        ]
+      }
+    }
+  ]
+}
