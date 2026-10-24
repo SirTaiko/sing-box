@@ -190,6 +190,11 @@ func (d *DefaultDialer) dialPendingTCP(ctx context.Context, base net.Dialer, net
 	return wrapped, pending, nil
 }
 
+// dialNativeAttempt is the platform native dial behind dialAttempt. It is a
+// variable only so hermetic lifecycle tests can substitute an owned transport
+// without creating a host socket; production always uses the platform helper.
+var dialNativeAttempt = dialAttempt
+
 // dialAttempt performs one native dial; a nil hook is the exact existing path.
 func (d *DefaultDialer) dialAttempt(ctx context.Context, base net.Dialer, network string, address string) (net.Conn, error) {
 	if d.attemptHook == nil {
@@ -220,7 +225,7 @@ func (d *DefaultDialer) dialAttempt(ctx context.Context, base net.Dialer, networ
 	if err != nil {
 		return nil, err
 	}
-	conn, err := dialAttempt(ctx, base, network, address, lease)
+	conn, err := dialNativeAttempt(ctx, base, network, address, lease)
 	if err != nil {
 		// A retained native operation keeps its own admission charge until the
 		// kernel reports terminal completion.

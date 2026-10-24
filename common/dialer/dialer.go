@@ -10,6 +10,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -33,6 +34,11 @@ type Options struct {
 	// together with AttemptHook and `tcp_fast_open`; a nil hook keeps the
 	// existing eager TFO path.
 	PendingTCPHook PendingTCPHook
+	// PacketListenerControl is the optional platform per-socket control that
+	// claims an owned packet-desync UDP listener endpoint exclusively before the
+	// kernel binds it. It is nil for disabled and stream-only configurations, so
+	// their listener controls are unchanged.
+	PacketListenerControl control.Func
 }
 
 // TODO: merge with NewWithOptions
@@ -76,6 +82,11 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 		if options.PendingTCPHook != nil {
 			if defaultDialer, isDefault := dialer.(*DefaultDialer); isDefault {
 				defaultDialer.SetPendingTCPHook(options.PendingTCPHook)
+			}
+		}
+		if options.PacketListenerControl != nil {
+			if defaultDialer, isDefault := dialer.(*DefaultDialer); isDefault {
+				defaultDialer.SetPacketListenerControl(options.PacketListenerControl)
 			}
 		}
 	}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,15 @@ func TestDialContextUsesAttemptHook(t *testing.T) {
 	}
 	if hook.closed.Load() != 1 {
 		t.Fatalf("failed attempt lease was not closed: %d", hook.closed.Load())
+	}
+	// The enabled Windows ConnectEx path takes the admission reference before
+	// any native effect and releases it exactly once; every platform must
+	// balance whatever it acquired.
+	if C.IsWindows && hook.holds.Load() != 1 {
+		t.Fatalf("native hold acquisitions = %d, want 1", hook.holds.Load())
+	}
+	if hook.releases.Load() != hook.holds.Load() {
+		t.Fatalf("native holds not balanced: acquired=%d released=%d", hook.holds.Load(), hook.releases.Load())
 	}
 }
 
@@ -101,15 +111,29 @@ func TestDialContextAttachFailureIsTerminal(t *testing.T) {
 	if hook.closed.Load() != 1 {
 		t.Fatalf("failed lease closed %d times", hook.closed.Load())
 	}
+	if C.IsWindows && hook.holds.Load() != 1 {
+		t.Fatalf("native hold acquisitions = %d, want 1", hook.holds.Load())
+	}
+	if hook.releases.Load() != hook.holds.Load() {
+		t.Fatalf("native holds not balanced: acquired=%d released=%d", hook.holds.Load(), hook.releases.Load())
+	}
 }
 
 func TestSerialNetworkClosesLoserLease(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	hook := &countHook{}
+	hook := &countHook{
+		// The loser is a distinct loopback destination whose attempt is
+		// refused during preparation. This is deterministic on every target:
+		// the test does not depend on the platform routing or refusing a
+		// particular 127/8 address, while the successful attempt still uses a
+		// real loopback listener and the real native dial path.
+		prepareErrAddr: netip.MustParseAddr("127.0.0.2"),
+		prepareErr:     errors.New("fixture: loser attempt preparation refused"),
+	}
 	dialer := &DefaultDialer{attemptHook: hook}
 	destination := M.SocksaddrFrom(netip.MustParseAddr("127.0.0.1"), uint16(listener.Addr().(*net.TCPAddr).Port))
 	conn, err := DialSerialNetwork(context.Background(), dialer, "tcp", destination,
@@ -122,11 +146,20 @@ func TestSerialNetworkClosesLoserLease(t *testing.T) {
 	if hook.leases.Load() != 2 {
 		t.Fatalf("leases = %d, want one per address attempt", hook.leases.Load())
 	}
+	if hook.prepared.Load() != 2 {
+		t.Fatalf("prepared attempts = %d, want both address attempts", hook.prepared.Load())
+	}
 	if hook.closed.Load() != 1 {
 		t.Fatalf("loser leases closed = %d, want 1", hook.closed.Load())
 	}
 	if hook.connAttached.Load() != 1 {
 		t.Fatalf("successful attempts attached = %d, want 1", hook.connAttached.Load())
+	}
+	if C.IsWindows && hook.holds.Load() != 2 {
+		t.Fatalf("native hold acquisitions = %d, want one per attempt", hook.holds.Load())
+	}
+	if hook.releases.Load() != hook.holds.Load() {
+		t.Fatalf("native holds not balanced: acquired=%d released=%d", hook.holds.Load(), hook.releases.Load())
 	}
 }
 
@@ -213,20 +246,40 @@ type countHook struct {
 	started      atomic.Int32
 	attached     atomic.Int32
 	connAttached atomic.Int32
+	holds        atomic.Int32
+	releases     atomic.Int32
 	attachErr    error
+	// prepareErrAddr makes one specific attempt destination fail at
+	// PrepareSocket. It is the platform-independent way to obtain a failed
+	// serial attempt: the fixture never relies on the target OS routing or
+	// refusing a particular loopback address.
+	prepareErrAddr netip.Addr
+	prepareErr     error
 }
 
 func (h *countHook) NewAttempt(ctx context.Context, intent AttemptIntent) (AttemptLease, error) {
 	h.leases.Add(1)
-	return &countLease{hook: h}, nil
+	return &countLease{
+		hook:         h,
+		failPrepare:  h.prepareErrAddr.IsValid() && intent.Destination.Addr == h.prepareErrAddr,
+		prepareError: h.prepareErr,
+	}, nil
 }
 
 type countLease struct {
-	hook *countHook
+	hook         *countHook
+	failPrepare  bool
+	prepareError error
 }
 
 func (l *countLease) PrepareSocket(fd uintptr) error {
 	l.hook.prepared.Add(1)
+	if l.failPrepare {
+		if l.prepareError != nil {
+			return l.prepareError
+		}
+		return errors.New("fixture: attempt preparation failed")
+	}
 	return nil
 }
 
@@ -238,6 +291,19 @@ func (l *countLease) StartCapture() error {
 }
 
 func (l *countLease) RequiresExclusiveBind() bool { return true }
+
+// AcquireNativeHold is the faithful test admission capability of this fixture
+// lease. The real enabled Windows ConnectEx path takes one admission
+// reference before any socket/event/OVERLAPPED exists and releases it exactly
+// once after the native operation reaches its terminal state; the fixture
+// counts both directions through an idempotent release.
+func (l *countLease) AcquireNativeHold() (func(), error) {
+	l.hook.holds.Add(1)
+	var once sync.Once
+	return func() {
+		once.Do(func() { l.hook.releases.Add(1) })
+	}, nil
+}
 
 func (l *countLease) AttachConn(conn net.Conn) (net.Conn, error) {
 	l.hook.connAttached.Add(1)

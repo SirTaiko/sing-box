@@ -591,9 +591,29 @@ conntrack/ipcache; configuration loading itself stays read-only.
 
 ## Compatibility and limits
 
-- Enabled packet desync rejects `tcp_multipath` and `bind_address_no_port` with
-  actionable errors: additional subflow ownership and no-port semantics are
-  outstanding parity gaps against exclusive pre-SYN ownership.
+- Enabled packet desync rejects `tcp_multipath`, `bind_address_no_port` and
+  `reuse_addr` with actionable errors: additional subflow ownership and no-port
+  semantics are outstanding parity gaps against exclusive pre-SYN ownership, and
+  an owned packet UDP endpoint must be exclusive because capture identifies a
+  flow by its local endpoint and cannot distinguish two sockets that share it.
+  The `reuse_addr` conflict is refused before any desync state is created (no
+  list/payload read, engine, capture or attempt charge); absent/disabled and
+  stream-only configurations keep `reuse_addr` unchanged.
+- Enabled packet desync also rejects a multicast `inet4_bind_address` or
+  `inet6_bind_address` with an actionable error naming the option and the
+  address. This is an additive compatibility restriction: a multicast local bind
+  is not exclusive even with `reuse_addr:false`, because the standard library's
+  multicast UDP listen path makes the endpoint shareable and binds the wildcard
+  address (verified against the pinned POSIX implementation), so the resulting
+  endpoint can be co-owned by another socket that tuple-based capture cannot tell
+  apart. The classification is semantic
+  (multicast address semantics, IPv4-in-IPv6 spellings unmapped), not a textual
+  match, and the refusal is applied from the configuration on every supported
+  platform before any desync state exists, rather than relying on
+  platform-specific socket behaviour after a bind. Ordinary listeners that do
+  not enable packet desync keep their multicast binds unchanged; absent,
+  explicitly `enabled:false`, stream-only and all-packet-rules-disabled
+  configurations keep them too, and unicast bind addresses are unaffected.
   `tcp_fast_open` is implemented for ordinary packet and stream configurations
   through the owned deferred attempt described in `direct-desync-stream.md`:
   no socket, no capture and no SYN exists before the first transformed send,

@@ -426,17 +426,30 @@ func TestPacketUDPLeaseStillCaptures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attached != conn {
-		t.Fatal("UDP AttachConn must keep the existing connection identity")
+	// The returned transport carries the already charged packet lease: the
+	// identity cannot stay raw, because the raw connection has no owner that
+	// could ever close the capture or discharge the admission slot.
+	if attached == net.Conn(conn) {
+		t.Fatal("UDP AttachConn returned the raw connection without a lease owner")
 	}
+	if err = attached.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closes.Load() != 1 {
+		t.Fatalf("raw connection closed %d times, want 1", conn.closes.Load())
+	}
+	if backend.closed.Load() != 1 {
+		t.Fatalf("UDP capture closed %d times, want 1", backend.closed.Load())
+	}
+	if engine.ActiveLeases() != 0 {
+		t.Fatalf("UDP lease not released by the returned Close: %d active", engine.ActiveLeases())
+	}
+	// The attempt-level close stays an idempotent control.
 	if err = lease.Close(nil); err != nil {
 		t.Fatal(err)
 	}
-	if backend.closed.Load() != 1 {
-		t.Fatalf("UDP capture closed %d times", backend.closed.Load())
-	}
-	if engine.ActiveLeases() != 0 {
-		t.Fatalf("UDP lease not released: %d active", engine.ActiveLeases())
+	if backend.closed.Load() != 1 || engine.ActiveLeases() != 0 {
+		t.Fatalf("attempt close after returned Close released twice: closed=%d active=%d", backend.closed.Load(), engine.ActiveLeases())
 	}
 }
 
@@ -660,14 +673,23 @@ func TestUDPListenerAttemptWithoutDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if attached != conn {
-		t.Fatal("UDP listener AttachPacketConn path must keep the connection identity")
+	// A packet listener attempt that owns a lease must not hand the raw
+	// connection back: the returned transport owns the lease and its capture.
+	if attached == net.Conn(conn) {
+		t.Fatal("UDP listener AttachConn path returned the raw connection without a lease owner")
 	}
+	if err = attached.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if backend.closed.Load() != 1 || engine.ActiveLeases() != 0 {
+		t.Fatalf("listener lease not released by the returned Close: closed=%d active=%d", backend.closed.Load(), engine.ActiveLeases())
+	}
+	// The attempt-level close stays an idempotent control.
 	if err = lease.Close(nil); err != nil {
 		t.Fatal(err)
 	}
 	if backend.closed.Load() != 1 || engine.ActiveLeases() != 0 {
-		t.Fatalf("listener lease not released: closed=%d active=%d", backend.closed.Load(), engine.ActiveLeases())
+		t.Fatalf("listener lease released twice: closed=%d active=%d", backend.closed.Load(), engine.ActiveLeases())
 	}
 	// Stream-only listeners need no engine at all and must not error either.
 	streamOnly := &desyncHook{stream: fake, lifetime: context.Background()}

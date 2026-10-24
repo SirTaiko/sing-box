@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
 )
@@ -90,7 +91,7 @@ func TestNewDefaultPropagatesIPv6Zone(t *testing.T) {
 
 func TestNewDefaultInstallsRemoteSocketOptions(t *testing.T) {
 	// Absent options keep the exact previous option state and do not add our
-	// socket control to the chain.
+	// socket control to the chain. This is portable on every target.
 	plain, err := NewDefault(context.Background(), option.DialerOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -103,8 +104,16 @@ func TestNewDefaultInstallsRemoteSocketOptions(t *testing.T) {
 	}
 	receiveBuffer := uint32(1_000_000)
 	sendBuffer := uint32(500_000)
+	buffers := option.DialerOptions{
+		AbstractDialerOptions: option.AbstractDialerOptions{
+			TCPSocketOptions: &option.TCPSocketOptions{
+				ReceiveBufferSize: &receiveBuffer,
+				SendBufferSize:    &sendBuffer,
+			},
+		},
+	}
 	timeout := badoption.Duration(20 * time.Second)
-	configured, err := NewDefault(context.Background(), option.DialerOptions{
+	withTimeout := option.DialerOptions{
 		AbstractDialerOptions: option.AbstractDialerOptions{
 			TCPSocketOptions: &option.TCPSocketOptions{
 				ReceiveBufferSize: &receiveBuffer,
@@ -112,7 +121,11 @@ func TestNewDefaultInstallsRemoteSocketOptions(t *testing.T) {
 				UserTimeout:       &timeout,
 			},
 		},
-	})
+	}
+	// The buffer controls are portable. Only the platform-adjusted value is
+	// asserted below, because Linux passes the source bytes divided by two
+	// (tpws.c semantics) while every other target passes them directly.
+	configured, err := NewDefault(context.Background(), buffers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,11 +146,33 @@ func TestNewDefaultInstallsRemoteSocketOptions(t *testing.T) {
 	if configured.dialer4.Dialer.Control == nil || configured.dialer6.Dialer.Control == nil {
 		t.Fatal("TFO dialers lost the socket control")
 	}
-	if configured.tcpSocketOptions.ReceiveBufferSize != 500_000 || configured.tcpSocketOptions.SendBufferSize != 250_000 {
-		t.Fatalf("Linux halving not applied: %+v", configured.tcpSocketOptions)
-	}
-	if configured.tcpSocketOptions.UserTimeoutMillis != 20_000 {
-		t.Fatalf("user timeout milliseconds: %+v", configured.tcpSocketOptions)
+	if C.IsLinux {
+		if configured.tcpSocketOptions.ReceiveBufferSize != 500_000 || configured.tcpSocketOptions.SendBufferSize != 250_000 {
+			t.Fatalf("Linux halving not applied: %+v", configured.tcpSocketOptions)
+		}
+		if configured.tcpSocketOptions.UserTimeoutMillis != 0 {
+			t.Fatalf("buffer-only options set a user timeout: %+v", configured.tcpSocketOptions)
+		}
+		withUserTimeout, err := NewDefault(context.Background(), withTimeout)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if withUserTimeout.tcpSocketOptions.UserTimeoutMillis != 20_000 {
+			t.Fatalf("user timeout milliseconds: %+v", withUserTimeout.tcpSocketOptions)
+		}
+	} else {
+		if configured.tcpSocketOptions.ReceiveBufferSize != 1_000_000 || configured.tcpSocketOptions.SendBufferSize != 500_000 {
+			t.Fatalf("non-Linux targets must pass the requested bytes directly: %+v", configured.tcpSocketOptions)
+		}
+		// TCP_USER_TIMEOUT has no Winsock equivalent; a positive user timeout
+		// is an explicit source-inapplicable configuration error, never a
+		// silent no-op or a Linux buffer value. Windows and other non-Linux
+		// targets must reject it before any socket control exists.
+		if _, err = NewDefault(context.Background(), withTimeout); err == nil {
+			t.Fatal("a positive user_timeout must be rejected outside Linux")
+		} else if !strings.Contains(err.Error(), "TCP_USER_TIMEOUT") {
+			t.Fatalf("unexpected rejection: %v", err)
+		}
 	}
 }
 

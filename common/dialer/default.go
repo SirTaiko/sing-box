@@ -87,6 +87,21 @@ func (d *DefaultDialer) AttemptHook() AttemptHook {
 	return d.attemptHook
 }
 
+// SetPacketListenerControl appends the platform per-socket control that claims a
+// packet-desync UDP listener endpoint exclusively before bind. Capture identifies
+// a listener flow by its local endpoint, so an endpoint a sibling socket can join
+// cannot be owned. It must be called before the dialer is published and is left
+// unset for disabled and stream-only configurations, which therefore keep their
+// ordinary listener controls. The control lives on the dialer's single UDP
+// ListenConfig, which the ordinary ListenPacket and the serial-interface listener
+// paths both bind through.
+func (d *DefaultDialer) SetPacketListenerControl(exclusiveControl control.Func) {
+	if exclusiveControl == nil {
+		return
+	}
+	d.udpListener.Control = control.Append(d.udpListener.Control, exclusiveControl)
+}
+
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
 	connectionManager := service.FromContext[adapter.ConnectionManager](ctx)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
@@ -348,7 +363,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 			if err != nil {
 				return nil, err
 			}
-			tracked, trackErr := d.trackConn(ctx, address, conn, nil)
+			tracked, trackErr := d.trackConn(ctx, network, address, conn, nil)
 			if trackErr != nil {
 				_ = conn.Close()
 				return nil, trackErr
@@ -381,7 +396,7 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 				return d.dialAttempt(ctx, d.dialer6.Dialer, network, address.String())
 			}
 		})
-		return d.trackConn(ctx, address, conn, err)
+		return d.trackConn(ctx, network, address, conn, err)
 	} else {
 		return d.DialParallelInterface(ctx, network, address, d.networkStrategy, d.networkType, d.fallbackNetworkType, d.networkFallbackDelay)
 	}
@@ -432,7 +447,7 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 	if !fastFallback && !isPrimary {
 		d.networkLastFallback.Store(time.Now())
 	}
-	return d.trackConn(ctx, address, conn, nil)
+	return d.trackConn(ctx, network, address, conn, nil)
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -516,18 +531,32 @@ func (d *DefaultDialer) UDPListenerControl() (control.Func, bool) {
 	return listenerControl, egressEnabled
 }
 
-func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, conn net.Conn, err error) (net.Conn, error) {
+func (d *DefaultDialer) trackConn(ctx context.Context, network string, destination M.Socksaddr, conn net.Conn, err error) (net.Conn, error) {
 	if err != nil {
 		return conn, err
 	}
-	if nativeConn, isUDPConn := conn.(*net.UDPConn); isUDPConn {
-		var rawConn syscall.RawConn
-		rawConn, err = nativeConn.SyscallConn()
-		if err != nil {
-			conn.Close()
-			return nil, err
+	// A connected UDP transport needs the read tracking wrapper below: only a
+	// successful zero-byte read can be the kernel reporting that the peer is
+	// gone. The wrapper needs the native socket view, not a concrete transport
+	// type. A dial attempt may already have returned an owning wrapper (the
+	// packet-desync attempt lease) that keeps the native socket capability while
+	// hiding the concrete *net.UDPConn, so that capability decides here. A UDP
+	// transport without a native socket keeps the existing unwrapped behavior.
+	if N.NetworkName(network) == N.NetworkUDP {
+		if _, isTracked := conn.(*udpConn); !isTracked {
+			if syscallConn, isSyscallConn := conn.(syscall.Conn); isSyscallConn {
+				var rawConn syscall.RawConn
+				rawConn, err = syscallConn.SyscallConn()
+				if err != nil {
+					conn.Close()
+					return nil, err
+				}
+				// The tracking wrapper stays outside the object it was given:
+				// that object keeps its own close, capture and read ownership
+				// and is never unwrapped for read/write replacement.
+				conn = &udpConn{Conn: conn, rawConn: rawConn}
+			}
 		}
-		conn = &udpConn{Conn: conn, rawConn: rawConn}
 	}
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackConn(conn)

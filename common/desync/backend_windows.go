@@ -5,6 +5,7 @@ package desync
 import (
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"net/netip"
 	"sync"
 
@@ -349,10 +350,24 @@ func (c *windowsCapture) Close() error {
 	return c.closeErr
 }
 
-// prepareSocket registers capture on an already bound Winsock handle. The
-// exclusive bind and ConnectEx lifecycle live in the dialer's enabled-only
-// native connect helper; ordinary net.Dialer.Control is never used for it.
+// prepareSocket establishes the owned endpoint and registers capture on the
+// native Winsock handle.
+//
+// A TCP packet attempt reaches this hook after the native ConnectEx helper has
+// already bound the exclusive local port. A UDP packet attempt reaches it from
+// the dialer's last-chance Control hook, which runs before net.Dialer's own
+// bind, and the dialer clears its local address for packet leases so the lease
+// is the single bind owner: the exclusive port therefore has to be established
+// here, exactly like the Linux hook. Without that bind the socket is still
+// unbound and getsockname fails with WSAEINVAL ("An invalid argument was
+// supplied."), which used to abort every Windows packet-enabled connected UDP
+// dial before capture or tracking.
 func prepareSocket(lease *Lease, fd uintptr) error {
+	if lease.Intent().Transport == TransportUDP {
+		if err := bindExclusiveUDPAddress(lease, fd); err != nil {
+			return err
+		}
+	}
 	if lease.LocalAddress().Port() == 0 {
 		address, err := sockaddrForHandle(fd)
 		if err != nil {
@@ -368,6 +383,61 @@ func prepareSocket(lease *Lease, fd uintptr) error {
 		lease.setSocketInterface(index, name)
 	}
 	return lease.StartCapture()
+}
+
+// bindExclusiveUDPAddress binds the attempt's requested local address on the
+// unbound Winsock UDP socket. The port stays kernel-assigned, so the owned
+// capture envelope is scoped to the actual port the kernel handed out, read
+// back from the socket immediately after this bind. The requested source
+// address, its IPv6 zone and the interface control that already ran are
+// honored; an address the host cannot bind fails the attempt closed.
+func bindExclusiveUDPAddress(lease *Lease, fd uintptr) error {
+	intent := lease.Intent()
+	handle := windows.Handle(fd)
+	// The endpoint this attempt is about to receive must be exclusively owned
+	// before the kernel assigns it: a second Winsock socket that sets
+	// SO_REUSEADDR can otherwise share the same local endpoint, and tuple
+	// capture cannot tell the two sockets apart. Winsock honours the option
+	// only before bind, so it is applied to the still-unbound handle.
+	if err := setExclusiveUDPBind(handle); err != nil {
+		return err
+	}
+	switch intent.Family {
+	case FamilyIPv4:
+		bind := &windows.SockaddrInet4{}
+		if intent.Source.IsValid() {
+			address := intent.Source.Addr().Unmap()
+			if !address.Is4() {
+				return fmt.Errorf("desync: IPv6 bind address for an IPv4 destination")
+			}
+			bind.Addr = address.As4()
+		}
+		if err := windows.Bind(handle, bind); err != nil {
+			return fmt.Errorf("desync: bind exclusive local port: %w", err)
+		}
+	case FamilyIPv6:
+		bind := &windows.SockaddrInet6{}
+		if intent.Source.IsValid() {
+			address := intent.Source.Addr().Unmap()
+			if address.Is4() {
+				return fmt.Errorf("desync: IPv4 bind address for an IPv6 destination")
+			}
+			bind.Addr = address.As16()
+			if zone := intent.Source.Addr().Zone(); zone != "" {
+				iface, err := net.InterfaceByName(zone)
+				if err != nil {
+					return fmt.Errorf("desync: resolve zone %s: %w", zone, err)
+				}
+				bind.ZoneId = uint32(iface.Index)
+			}
+		}
+		if err := windows.Bind(handle, bind); err != nil {
+			return fmt.Errorf("desync: bind exclusive local port: %w", err)
+		}
+	default:
+		return fmt.Errorf("desync: unsupported address family")
+	}
+	return nil
 }
 
 // Winsock unicast interface options. Both families use option 31 at their own

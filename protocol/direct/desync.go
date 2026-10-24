@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/desync"
@@ -283,6 +284,12 @@ func (l *desyncLease) AcquireNativeHold() (func(), error) {
 // capture observes the transformed packets) and then through a wrapper that
 // closes the packet capture lease with the connection. A wrapping failure is
 // terminal: no unwrapped connection is returned.
+//
+// A packet-enabled UDP attempt has no stream work, but it does own the
+// attempt's charged lease and opened capture. That lease is the last ownership
+// of the attempt after the dial returned, so the returned connected transport
+// carries its exactly-once close. A stream-only or disabled UDP attempt owns
+// no lease and keeps the original connection unchanged.
 func (l *desyncLease) AttachConn(conn net.Conn) (net.Conn, error) {
 	if conn == nil {
 		return nil, E.New("desync: attach nil connection")
@@ -294,6 +301,9 @@ func (l *desyncLease) AttachConn(conn net.Conn) (net.Conn, error) {
 	}
 	l.attached = true
 	if !l.isTCP() {
+		if l.lease != nil {
+			return &leaseUDPConn{Conn: conn, lease: l.lease}, nil
+		}
 		return conn, nil
 	}
 	if l.intent.Deferred {
@@ -331,10 +341,16 @@ func (l *desyncLease) AttachConn(conn net.Conn) (net.Conn, error) {
 	return conn, nil
 }
 
-// AttachPacketConn registers no stream work: stream rules are TCP-only and
-// UDP behavior is unchanged.
+// AttachPacketConn transfers the same existing attempt lease ownership to a
+// bound UDP listener: stream rules are TCP-only and UDP behavior is unchanged,
+// but the charged lease and its capture must end with the returned listener,
+// not with Engine shutdown. A stream-only or disabled listener owns no lease
+// and keeps the original PacketConn unchanged.
 func (l *desyncLease) AttachPacketConn(conn net.PacketConn) net.PacketConn {
-	return conn
+	if conn == nil || l.lease == nil {
+		return conn
+	}
+	return &leasePacketConn{PacketConn: conn, lease: l.lease}
 }
 
 func (l *desyncLease) Close(reason error) error {
@@ -411,6 +427,67 @@ func (c *leaseConn) NativeStreamConn() net.Conn { return c.Conn }
 func (c *leaseConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closeErr = errors.Join(c.Conn.Close(), c.lease.Close(nil))
+	})
+	return c.closeErr
+}
+
+// leaseUDPConn ties the packet lease of a connected UDP attempt to the
+// returned transport lifetime. It is the UDP counterpart of leaseConn: no
+// stream work and no second lifetime owner, only the same already charged
+// lease discharged exactly once, with the transport's own close error joined
+// and preserved. The native socket capability is forwarded so existing UDP
+// consumers keep the same view of the returned connection.
+type leaseUDPConn struct {
+	net.Conn
+	lease *desync.Lease
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// SyscallConn forwards the optional native socket capability of the wrapped
+// connection. TCP socket options and UDP socket controls treat this interface
+// as optional, so an underlying transport without a native descriptor keeps
+// returning the same error it would have returned itself.
+func (c *leaseUDPConn) SyscallConn() (syscall.RawConn, error) {
+	syscallConn, isSyscallConn := c.Conn.(syscall.Conn)
+	if !isSyscallConn {
+		return nil, E.New("desync: UDP connection does not expose a native socket")
+	}
+	return syscallConn.SyscallConn()
+}
+
+func (c *leaseUDPConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = errors.Join(c.Conn.Close(), c.lease.Close(nil))
+	})
+	return c.closeErr
+}
+
+// leasePacketConn ties the packet lease of a bound UDP listener attempt to the
+// returned listener lifetime. Close releases the native listener first, then
+// the same existing lease (capture and admission charge) exactly once.
+type leasePacketConn struct {
+	net.PacketConn
+	lease *desync.Lease
+
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// SyscallConn forwards the optional native socket capability of the wrapped
+// listener, exactly like leaseUDPConn.
+func (c *leasePacketConn) SyscallConn() (syscall.RawConn, error) {
+	syscallConn, isSyscallConn := c.PacketConn.(syscall.Conn)
+	if !isSyscallConn {
+		return nil, E.New("desync: UDP listener does not expose a native socket")
+	}
+	return syscallConn.SyscallConn()
+}
+
+func (c *leasePacketConn) Close() error {
+	c.closeOnce.Do(func() {
+		c.closeErr = errors.Join(c.PacketConn.Close(), c.lease.Close(nil))
 	})
 	return c.closeErr
 }
