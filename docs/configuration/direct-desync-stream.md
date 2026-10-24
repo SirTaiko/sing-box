@@ -240,10 +240,11 @@ packet methods.
   half deadline and is refused with `os.ErrDeadlineExceeded` if that deadline
   expires first. `fix_seg` on the first fragment has
   nothing in flight to inspect, so it does not activate the connection early.
-  Two combinations remain OPEN and are visible guards, not silent fallbacks: a
-  first split fragment that needs OOB or low-TTL disorder is refused before any
-  byte is written, because SYN data cannot carry a per-segment socket option,
-  and Linux packet capture combined with `tcp_multipath` is still rejected.
+  Two combinations are accepted limitations and are visible guards, not silent
+  fallbacks: a first split fragment that needs OOB or low-TTL disorder is
+  refused before any byte is written, because SYN data cannot carry a
+  per-segment socket option, and Linux packet capture combined with
+  `tcp_multipath` is rejected before network I/O.
   `mss`/`skip_nodelay` are applied
   from the preconnect rule selection and, like tpws, are not retroactively
   changed when a later host-based re-selection picks another rule. `TCP_NODELAY`

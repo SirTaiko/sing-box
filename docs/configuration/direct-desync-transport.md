@@ -161,14 +161,18 @@ resolution and the native connect both belong to the dialer attempt):
  "tcp_disable_splice":true,"tcp_max_orphan_time":"5s"}
 ```
 
-## Not implemented in this increment
+## Accepted compatibility limits
 
-Requested MPTCP with Linux packet capture and TFO with a first send that needs
-`MSG_OOB`/low-TTL disorder remain the two open compatibility rows. Their
-existing guards are preserved; this document does not claim combined parity.
-Ordinary deferred TFO and the shared SOCKS resolver policy are separate
-increments; deferred-TFO connections count as unavailable until their actual
-native connect completes.
+MPTCP with Linux packet capture and TFO with a first send that needs
+`MSG_OOB`/low-TTL disorder are accepted sing-box integration limitations (user
+decision, 2026-10-24), not open compatibility rows. Each combination is refused
+with an actionable error before network I/O and is never silently disabled.
+Ordinary MPTCP use, the allowed stream-only configurations and ordinary
+deferred TFO remain supported. These are limits of this integration, not a
+claim that upstream zapret universally forbids those combinations, and not a
+claim of parity for every combination. The shared SOCKS resolver policy is a
+separate increment; deferred-TFO connections count as unavailable until their
+actual native connect completes.
 
 ## Detour and admission ownership
 

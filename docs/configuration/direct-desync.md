@@ -642,20 +642,31 @@ conntrack/ipcache; configuration loading itself stays read-only.
   surfaces (`desync diagnostics`, `desync reload`, `desync list-refresh`); the
   Windows capture selectors (`capture.windows.wf_iface/wf_l3/wf_tcp/wf_udp/
   wf_raw/wf_raw_part/filter_lan/filter_save`, SSID and NLM activation) are
-  implemented, compile on Windows and are validated hermetically, while their
-  native execution is SKIP without a Windows guest. The UDP second-stage
-  `fooling_orig` handling of `udplen`/`tamper`/`ipfrag2` (including the IPv6
-  extension chain), the tuple-owned conntrack cutoff latches with
-  SYN/SYN-ACK-only TCP track creation, and the IP-cache `hostname_is_ip`
-  marker with the interface-scoped key are implemented and covered by focused
-  tests; the cache stays in memory exactly as documented above. Still open and
-  unapproved: the U4 Linux packet + MPTCP mapping and the U4 TFO + first-send
-  OOB/disorder combination (both keep their visible guards: rejected with an
-  actionable error, never silently disabled).
-  The native wire/application evidence of the VM lab is SKIP, not missing
-  implementation. Accepted stage names never silently no-op: an unimplemented
-  field, method or mode is rejected at compile time. See the implementation
-  report for the exact remaining inventory.
+  implemented, compile on Windows and are validated hermetically. Their
+  WinDivert driver and wire behaviour, and present-WLAN/SSID activation, were
+  not executed; native Windows socket and ownership controls were exercised on
+  a Windows Server 2022 test guest during the focused QA run. The UDP
+  second-stage `fooling_orig` handling of `udplen`/`tamper`/`ipfrag2`
+  (including the IPv6 extension chain), the tuple-owned conntrack cutoff
+  latches with SYN/SYN-ACK-only TCP track creation, and the IP-cache
+  `hostname_is_ip` marker with the interface-scoped key are implemented and
+  covered by focused tests; the cache stays in memory exactly as documented
+  above. The two remaining compatibility rows are accepted sing-box integration
+  limitations (user decision, 2026-10-24), not open decisions: Linux packet
+  desync combined with `tcp_multipath`, and `tcp_fast_open` with a first send
+  that would need `MSG_OOB`/low-TTL disorder, are each rejected with an
+  actionable error before network I/O and never silently disabled. Ordinary
+  MPTCP use and the allowed stream-only configurations remain supported, and
+  ordinary deferred TFO and the other supported combinations are unchanged.
+  These refusals are not a claim that upstream zapret universally forbids
+  those combinations, and not a claim of parity for every combination (see
+  [`direct-desync-delivery.md`](direct-desync-delivery.md) for the delivery and
+  verification record).
+  Native wire and application evidence remains unverified (SKIP), not missing
+  implementation; [`direct-desync-delivery.md`](direct-desync-delivery.md)
+  lists the exact executed and not-executed checks. Accepted stage names never
+  silently no-op: an unimplemented field, method or mode is rejected at compile
+  time.
 
 ### Retained native admission
 
