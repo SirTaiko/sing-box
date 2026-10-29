@@ -317,18 +317,32 @@ func (c *windowsCaptureConfig) excludesOwnedEndpoint(endpoint Endpoint) error {
 	if c.rawText != "" {
 		return nil
 	}
+	// Omitted wf_tcp/wf_udp is the upstream "no port clause" form: the driver
+	// filter then carries no transport-port narrowing at all, so a non-port
+	// selector (wf_iface, wf_l3, filter_lan, wf_raw_part) must not erase the
+	// default admission of an owned attempt. Only a configured port list
+	// restricts transports, and then the missing protocol is a real
+	// restriction: upstream ORs the configured tcp/udp clauses, so an
+	// unlisted transport is not captured.
+	transportNarrowed := c.tcpPorts != nil || c.udpPorts != nil
 	if endpoint.Destination.IsValid() {
 		switch endpoint.Transport {
 		case TransportTCP:
 			if c.tcpPorts == nil {
-				return fmt.Errorf("desync: capture.windows excludes the owned TCP attempt (wf_tcp is not configured)")
+				if transportNarrowed {
+					return fmt.Errorf("desync: capture.windows excludes the owned TCP attempt (wf_tcp is not configured)")
+				}
+				return nil
 			}
 			if !c.tcpPorts.allows(endpoint.Destination.Port()) {
 				return fmt.Errorf("desync: capture.windows.wf_tcp excludes the owned TCP port %d", endpoint.Destination.Port())
 			}
 		case TransportUDP:
 			if c.udpPorts == nil {
-				return fmt.Errorf("desync: capture.windows excludes the owned UDP attempt (wf_udp is not configured)")
+				if transportNarrowed {
+					return fmt.Errorf("desync: capture.windows excludes the owned UDP attempt (wf_udp is not configured)")
+				}
+				return nil
 			}
 			if !c.udpPorts.allows(endpoint.Destination.Port()) {
 				return fmt.Errorf("desync: capture.windows.wf_udp excludes the owned UDP port %d", endpoint.Destination.Port())
@@ -340,48 +354,10 @@ func (c *windowsCaptureConfig) excludesOwnedEndpoint(endpoint Endpoint) error {
 
 // envelope builds the owned kernel filter for one direction. The envelope is
 // authoritative: direction, family, exact tuple and the owned interface index
-// are always present.
+// are always present. Both capture paths share ownedWindowsEnvelope, so the
+// configured path cannot widen or narrow the plain one.
 func (c *windowsCaptureConfig) envelope(endpoint Endpoint, outbound bool) (*windivert.Filter, error) {
-	var filter *windivert.Filter
-	var err error
-	switch endpoint.Transport {
-	case TransportTCP:
-		if endpoint.Destination.IsValid() {
-			if outbound {
-				filter, err = windivert.OutboundTCP(endpoint.Source, endpoint.Destination)
-			} else {
-				filter, err = windivert.InboundTCPFlow(endpoint.Destination, endpoint.Source)
-			}
-		} else {
-			filter, err = windivert.OutboundTCPLocalPort(endpoint.Source)
-		}
-	case TransportUDP:
-		if endpoint.Destination.IsValid() {
-			if outbound {
-				filter, err = windivert.OutboundUDP(endpoint.Source, endpoint.Destination)
-			} else {
-				filter, err = windivert.InboundUDPFlow(endpoint.Destination, endpoint.Source)
-			}
-		} else {
-			filter, err = windivert.OutboundUDPLocalPort(endpoint.Source)
-		}
-	default:
-		return nil, fmt.Errorf("desync: capture.windows: unsupported transport")
-	}
-	if err != nil {
-		return nil, err
-	}
-	if endpoint.InterfaceIndex != 0 {
-		interfaceFilter, interfaceErr := windivert.InterfaceIndex(endpoint.InterfaceIndex, 0)
-		if interfaceErr != nil {
-			return nil, interfaceErr
-		}
-		filter, err = windivert.And(filter, interfaceFilter)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return filter, nil
+	return ownedWindowsEnvelope(endpoint, outbound)
 }
 
 // userExpression renders the operator expression for one direction. It is

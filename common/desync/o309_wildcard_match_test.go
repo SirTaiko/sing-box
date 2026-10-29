@@ -291,7 +291,7 @@ func TestO309AnyEnginePacketEffects(t *testing.T) {
 		}
 	})
 	t.Run("udp-dup-effect", func(t *testing.T) {
-		h := newHeldHarnessUDP(t, `[{"network":["udp"],"ip_cidr":["any"],"orig":{"ttl":9},"dup":{"count":1}}]`)
+		h := newHeldHarnessUDP(t, `[{"network":["udp"],"ip_cidr":["any"],"any_protocol":true,"orig":{"ttl":9},"dup":{"count":1}}]`)
 		packet := buildUDP4(t, []byte("QUIC-like payload"))
 		verdict := h.lease.HandlePacket(packet.Raw, DirectionOutbound, func(replacement []byte) error {
 			h.injected = append(h.injected, append([]byte(nil), replacement...))
@@ -361,19 +361,21 @@ func TestO309AnyListFileReloadAndEmptyPositiveSemantics(t *testing.T) {
 		t.Fatal("failed reload must keep the last-good wildcard snapshot")
 	}
 
-	// A configured positive list that is empty matches nothing; it does not
-	// silently become an unrestricted rule.
+	// A positive IP file that resolves to no entries imposes no positive-IP
+	// restriction (pinned zapret v72.9 ipset.c: all include lists empty means
+	// check passes), for both families. The rule is still bounded by its other
+	// predicates and its exclusions.
 	if err = os.WriteFile(list, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, err = engine.ReloadListsContext(context.Background()); err != nil {
 		t.Fatalf("reload to empty list: %v", err)
 	}
-	if engine.Config().Rules[0].Matches(o309Facts(FamilyIPv4, TransportUDP, "198.51.100.7", 10000, ProtocolUnknown)) {
-		t.Fatal("an explicitly configured empty positive list must match nothing")
+	if !engine.Config().Rules[0].Matches(o309Facts(FamilyIPv4, TransportUDP, "198.51.100.7", 10000, ProtocolUnknown)) {
+		t.Fatal("an all-empty positive IP include set must not restrict IPv4")
 	}
-	if engine.Config().Rules[0].Matches(o309Facts(FamilyIPv6, TransportUDP, "2001:db8::7", 10000, ProtocolUnknown)) {
-		t.Fatal("an explicitly configured empty positive list must match no IPv6 address")
+	if !engine.Config().Rules[0].Matches(o309Facts(FamilyIPv6, TransportUDP, "2001:db8::7", 10000, ProtocolUnknown)) {
+		t.Fatal("an all-empty positive IP include set must not restrict IPv6")
 	}
 
 	// An omitted positive list stays unrestricted.

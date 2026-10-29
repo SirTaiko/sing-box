@@ -2,6 +2,8 @@
 
 package desync
 
+// Model tests: no kernel object is created, and every case says so.
+
 import (
 	"net/netip"
 	"sync"
@@ -44,10 +46,10 @@ func TestLinuxCaptureAnswersPrequeuedPacketAfterDelayedReader(t *testing.T) {
 		}
 		t.Run(name, func(t *testing.T) {
 			data := newFakeNFQueueConn("drain", 10, nil)
-			rules := &fakeRuleWriter{}
-			seams := installLinuxCaptureSeams(t, data, rules)
+			seams := installLinuxCaptureSeams(t, data)
 			gate := &drainReadGate{fakeNFQueueConn: data, entered: make(chan struct{}), resume: make(chan struct{})}
-			openNFQueueConn = func() (nfqueueConn, error) { return gate, nil }
+			gate.portid = 0x51a00001
+			openQueueTransport = func(port uint32) (nfqueueTransport, error) { return gate, nil }
 			engine, lease := newLinuxCaptureLease(t, 15300)
 			if err := lease.StartCapture(); err != nil {
 				t.Fatal(err)
@@ -97,11 +99,14 @@ func TestLinuxCaptureAnswersPrequeuedPacketAfterDelayedReader(t *testing.T) {
 			if seams.extraConnections() != 0 {
 				t.Fatalf("capture opened %d extra connections", seams.extraConnections())
 			}
-			if got := countQueueCommand(t, data.executedMessages(), c.queue, nfqCfgCmdUnbind); got != 1 {
-				t.Fatalf("owned queue unbind count=%d, want 1", got)
+			if got := countQueueCommand(t, data.executedMessages(), c.inQueue, nfqCfgCmdUnbind); got != 1 {
+				t.Fatalf("inbound queue unbind count=%d, want 1", got)
+			}
+			if got := countQueueCommand(t, data.executedMessages(), c.queue, nfqCfgCmdUnbind); got != 0 {
+				t.Fatalf("outq unbind count=%d, want 0 (witness is released by its owning socket)", got)
 			}
 			vi := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "verdict" && e.id == id })
-			ui := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "unbind" && e.queue == c.queue })
+			ui := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "unbind" && e.queue == c.inQueue })
 			if vi < 0 || ui < 0 || ui < vi {
 				t.Fatalf("terminal verdict must precede the unbind: verdict=%d unbind=%d", vi, ui)
 			}
@@ -130,10 +135,10 @@ func (g *drainVerdictGate) Send(message netlink.Message) (netlink.Message, error
 // then receives its one accept verdict before the unbind.
 func TestLinuxCaptureHeldCallbackCompletesBeforeUnbind(t *testing.T) {
 	data := newFakeNFQueueConn("drain-held", 12, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	gate := &drainVerdictGate{fakeNFQueueConn: data, entered: make(chan struct{}), resume: make(chan struct{})}
-	openNFQueueConn = func() (nfqueueConn, error) { return gate, nil }
+	data.portid = 0x51a00002
+	openQueueTransport = func(port uint32) (nfqueueTransport, error) { return gate, nil }
 	// A transformation rule is required so the first packet is held as an
 	// incomplete original instead of passing through immediately.
 	config, err := Compile(enabledOption(`{"enabled":true,"capture":{"linux":{"qnum":15301}},"rules":[{"network":["tcp"],"port":[443],"methods":["multisplit"],"multisplit":{"split_pos":["5"]}}]}`), "")
@@ -191,7 +196,7 @@ func TestLinuxCaptureHeldCallbackCompletesBeforeUnbind(t *testing.T) {
 		t.Fatalf("held terminal disposition=%v", v)
 	}
 	vi := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "verdict" && e.id == 902 })
-	ui := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "unbind" && e.queue == c.queue })
+	ui := seams.kernel.eventIndex(func(e fakeKernelEvent) bool { return e.kind == "unbind" && e.queue == c.inQueue })
 	if vi < 0 || ui <= vi || engine.ActiveLeases() != 0 || data.closings() != 1 {
 		t.Fatalf("invalid teardown order verdict=%d unbind=%d", vi, ui)
 	}

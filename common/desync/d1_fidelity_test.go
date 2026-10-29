@@ -352,7 +352,10 @@ func TestDupIntervalsReplacementAndIDs(t *testing.T) {
 }
 
 func TestUDPOrigAndDupStayAtMostOnce(t *testing.T) {
-	h := newHeldHarnessUDP(t, `[{"network":["udp"],"port":[443],
+	// The fixture payload is unclassified, so the pinned-faithful profile must
+	// carry the explicit desync_any_proto permission; without it pinned passes
+	// the datagram unchanged (contract §5 / F3).
+	h := newHeldHarnessUDP(t, `[{"network":["udp"],"port":[443],"any_protocol":true,
 		"orig":{"ttl":9},"dup":{"count":1,"ttl":5,"ip_id":"seq"}}]`)
 	packet := buildUDP4(t, []byte("QUIC-like payload"))
 	verdict := h.lease.HandlePacket(packet.Raw, DirectionOutbound, func(replacement []byte) error {

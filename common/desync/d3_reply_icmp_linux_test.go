@@ -4,7 +4,8 @@ package desync
 
 // Owned quoted-ICMP filtering (capture.filter_ttl_expired_icmp) and the
 // reply-direction packet limit. Every fixture is a synthetic packet: no
-// network, socket or privilege is used.
+// network, socket or privilege is used. Model tests: no kernel object is
+// created, and every case says so.
 
 import (
 	"encoding/binary"
@@ -189,8 +190,7 @@ func waitForVerdict(t *testing.T, conn *fakeNFQueueConn, id uint32) uint32 {
 // owned queues exactly once.
 func TestLinuxOwnedICMPQueueLifecycleAndDispatch(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	lease := newFilteredICMPLease(t, 15220)
 
 	capture, err := openLinuxCapture(lease)
@@ -206,28 +206,26 @@ func TestLinuxOwnedICMPQueueLifecycleAndDispatch(t *testing.T) {
 			t.Fatalf("queue %d binds = %d, want 1", queue, got)
 		}
 	}
-	icmpRule := ruleWithQueue(rules.rules, linux.icmpQueue)
-	if icmpRule == nil {
-		t.Fatal("owned ICMP rule missing")
+	icmpRules := captureRoleRules(t, seams, linux, "queue-e")
+	if len(icmpRules) != 1 {
+		t.Fatal("owned ICMP queue rule missing")
 	}
-	// The rule matches ICMP type 11 and never carries a verdict other than the
-	// queue: a kernel-side drop is impossible.
-	icmpTypes := 0
-	for _, expression := range icmpRule.Exprs {
-		if verdict, ok := expression.(*expr.Verdict); ok {
-			t.Fatalf("ICMP rule carries kernel verdict %v", verdict.Kind)
-		}
-		if comparison, ok := expression.(*expr.Cmp); ok && len(comparison.Data) == 1 &&
-			(comparison.Data[0] == 11 || comparison.Data[0] == 3) && comparison.Register == 1 {
-			icmpTypes++
-		}
+	if queues := fakeRuleQueues(icmpRules[0]); len(queues) != 1 || queues[0] != linux.icmpQueue {
+		t.Fatalf("ICMP queue rule queues = %v, want %d", queues, linux.icmpQueue)
 	}
-	if icmpTypes == 0 {
-		t.Fatal("ICMP rule does not match the time-exceeded type")
+	entryRules := captureRoleRules(t, seams, linux, "entry-e")
+	if len(entryRules) != 1 {
+		t.Fatal("owned ICMP dispatch entry missing")
+	}
+	// The dispatch entry matches ICMP type 11 and carries no kernel verdict.
+	if !fakeRuleMatchesByte(entryRules[0], 11) {
+		t.Fatal("ICMP dispatch entry does not match the time-exceeded type")
 	}
 
 	lease.noteInjection()
-	data.incoming <- fakePacketMessage(linux.icmpQueue, 7, ownedICMPv4Error())
+	if !seams.kernel.deliver(linux.icmpQueue, fakePacketMessage(linux.icmpQueue, 7, ownedICMPv4Error()), 7) {
+		t.Fatal("owned ICMP queue refused the packet")
+	}
 	if verdict := waitForVerdict(t, data, 7); verdict != 0 {
 		t.Fatalf("owned error verdict = %d, want drop (0)", verdict)
 	}
@@ -235,7 +233,9 @@ func TestLinuxOwnedICMPQueueLifecycleAndDispatch(t *testing.T) {
 		testICMPv4TypeTimeExceeded,
 		buildQuote4(netip.MustParseAddrPort("192.0.2.10:40000"),
 			netip.MustParseAddrPort("198.51.100.99:443"), 6, 16))
-	data.incoming <- fakePacketMessage(linux.icmpQueue, 8, foreign)
+	if !seams.kernel.deliver(linux.icmpQueue, fakePacketMessage(linux.icmpQueue, 8, foreign), 8) {
+		t.Fatal("owned ICMP queue refused the foreign packet")
+	}
 	if verdict := waitForVerdict(t, data, 8); verdict != 1 {
 		t.Fatalf("foreign error verdict = %d, want accept (1)", verdict)
 	}
@@ -243,7 +243,10 @@ func TestLinuxOwnedICMPQueueLifecycleAndDispatch(t *testing.T) {
 	if err = capture.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	for _, queue := range []uint16{linux.queue, linux.inQueue, linux.icmpQueue} {
+	if got := countQueueCommand(t, data.executedMessages(), linux.queue, nfqCfgCmdUnbind); got != 0 {
+		t.Fatalf("outq unbinds = %d, want 0 (witness released by its owning socket)", got)
+	}
+	for _, queue := range []uint16{linux.inQueue, linux.icmpQueue} {
 		if got := countQueueCommand(t, data.executedMessages(), queue, nfqCfgCmdUnbind); got != 1 {
 			t.Fatalf("queue %d unbinds = %d, want 1", queue, got)
 		}
@@ -560,59 +563,59 @@ func ctDirectionAttribute(t *testing.T, expression []byte) uint32 {
 }
 
 // TestLinuxReplyPacketLimitRuleBatch drives a positive inbound bound through the
-// capture and verifies the real kernel batch: table/chain, the transport and
-// tuple predicates, `ct reply packets <= N`, and the owned inbound queue.
+// capture and verifies the encoded reply rule inside the capture-owned input
+// chain: the transport/tuple predicates of the dispatch entry, the
+// `ct reply packets <= N` counter and the owned inbound queue.
 func TestLinuxReplyPacketLimitRuleBatch(t *testing.T) {
-	sender := installFakeBatchSender(t)
-	linux, _ := openLinuxCaptureForRules(t, 15210, `,"packet_limits":{"tcp_in":3}`)
-	if len(sender.batches) != 1 {
-		t.Fatalf("batches = %d, want 1", len(sender.batches))
+	linux, seams := openLinuxCaptureForRules(t, 15210, `,"packet_limits":{"tcp_in":3}`)
+	entryRules := captureRoleRules(t, seams, linux, "entry-i")
+	if len(entryRules) != 1 {
+		t.Fatalf("entry-i rules = %d, want 1", len(entryRules))
 	}
-	messages := decodeRuleBatch(t, sender.batches[0])
-	if len(messages) != 3 {
-		t.Fatalf("batch messages = %d, want 3", len(messages))
+	queueRules := captureRoleRules(t, seams, linux, "queue-i")
+	if len(queueRules) != 1 {
+		t.Fatalf("queue-i rules = %d, want 1", len(queueRules))
 	}
-	rule := messages[1]
-	if len(rule.attributes) == 0 {
-		t.Fatal("empty rule message")
+	decoded, err := decodedExpressions(queueRules[0])
+	if err != nil {
+		t.Fatalf("decode queue-i: %v", err)
 	}
-	if strings.TrimRight(rule.table, "\x00") != linuxTableName(linux) {
-		t.Fatalf("rule table = %q, want %q", strings.TrimRight(rule.table, "\x00"), linuxTableName(linux))
-	}
-	if rule.chain != "input\x00" && rule.chain != "input" {
-		t.Fatalf("rule chain = %q, want input", rule.chain)
-	}
-	// Exactly one ct expression, carrying REPLY, before the queue verdict.
-	ctIndex, queueIndex, ctDirection := -1, -1, uint32(0)
-	for index, expression := range rule.expressions {
-		switch {
-		case expression.name == "ct":
+	ctIndex, queueIndex, direction := -1, -1, uint32(0)
+	foundKey := uint32(0)
+	for index, expression := range decoded {
+		switch expression.name {
+		case "ct":
 			if ctIndex >= 0 {
 				t.Fatal("more than one ct expression in the reply rule")
 			}
 			ctIndex = index
-			ctDirection = expression.ctDirection
-			if expression.ctKey != uint32(expr.CtKeyPKTS) {
-				t.Fatalf("ct key = %d, want packet counter", expression.ctKey)
-			}
-		case expression.name == "queue":
+			foundKey = binary.BigEndian.Uint32(expression.data[unix.NFTA_CT_KEY])
+			direction = binary.BigEndian.Uint32(expression.data[unix.NFTA_CT_DIRECTION])
+		case "queue":
 			queueIndex = index
-			if expression.queue != linux.inQueue {
-				t.Fatalf("queue = %d, want owned inbound %d", expression.queue, linux.inQueue)
+			if queues := fakeRuleQueues(queueRules[0]); len(queues) != 1 || queues[0] != linux.inQueue {
+				t.Fatalf("queue = %v, want owned inbound %d", queues, linux.inQueue)
 			}
 		}
 	}
 	if ctIndex < 0 {
 		t.Fatal("reply packet counter expression missing")
 	}
-	if ctDirection != 1 {
-		t.Fatalf("ct direction = %d, want reply (1)", ctDirection)
+	if foundKey != uint32(expr.CtKeyPKTS) {
+		t.Fatalf("ct key = %d, want packet counter", foundKey)
+	}
+	if direction != uint32(nftCtDirectionReply) {
+		t.Fatalf("ct direction = %d, want reply (1)", direction)
 	}
 	if queueIndex < 0 || ctIndex > queueIndex {
 		t.Fatalf("ct expression (index %d) must precede the queue (index %d)", ctIndex, queueIndex)
 	}
-	if !ruleBoundedBy(t, rule.expressions, 3) {
-		t.Fatal("reply packet bound <= 3 missing")
+	if limit, ok := fakeRuleHasCtPacketsBound(queueRules[0]); !ok || limit != 3 {
+		t.Fatalf("reply packet bound = %d/%v, want 3/true", limit, ok)
+	}
+	// The dispatch entry carries the owned reverse tuple without the limit.
+	if limit, ok := fakeRuleHasCtPacketsBound(entryRules[0]); ok {
+		t.Fatalf("dispatch entry unexpectedly carries a packet bound of %d", limit)
 	}
 }
 

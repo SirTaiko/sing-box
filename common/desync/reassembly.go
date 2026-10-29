@@ -11,7 +11,10 @@ import (
 // reassembler is a bounded, retransmit-safe TCP payload reassembler. Segments
 // are keyed by absolute sequence number and overlapping duplicate bytes are
 // discarded, so a native retransmission is a counter event but never appends
-// duplicate logical bytes.
+// duplicate logical bytes. A retransmission may resegment the pending flight:
+// bytes already stored keep their first captured value, and every genuinely new
+// byte is stored at its own absolute sequence, so a partial overlap extends the
+// contiguous stream instead of misplacing or truncating it.
 type reassembler struct {
 	limit    int
 	segments map[uint32][]byte
@@ -22,6 +25,51 @@ func newReassembler(limit int) *reassembler {
 	return &reassembler{limit: limit, segments: make(map[uint32][]byte)}
 }
 
+// payloadPiece is one run of captured payload bytes at its absolute stream
+// position.
+type payloadPiece struct {
+	start uint32
+	data  []byte
+}
+
+// uncoveredPayload returns the maximal subranges of data that are not inside
+// any covered range, in ascending stream order. Overlap is decided with TCP
+// serial arithmetic, so a range that crosses the uint32 wrap is handled like
+// any other. The result shares its backing bytes with data.
+func uncoveredPayload(sequence uint32, data []byte, covered []payloadInterval) []payloadPiece {
+	pieces := []payloadPiece{{start: sequence, data: data}}
+	for _, have := range covered {
+		if have.length <= 0 {
+			continue
+		}
+		if len(pieces) == 0 {
+			break
+		}
+		haveEnd := have.start + uint32(have.length)
+		next := make([]payloadPiece, 0, len(pieces)+1)
+		for _, piece := range pieces {
+			pieceEnd := piece.start + uint32(len(piece.data))
+			if !sequenceBefore(piece.start, haveEnd) || !sequenceBefore(have.start, pieceEnd) {
+				// Disjoint: keep the whole piece.
+				next = append(next, piece)
+				continue
+			}
+			if sequenceBefore(piece.start, have.start) {
+				// Keep the part before the covered range.
+				head := int(have.start - piece.start)
+				next = append(next, payloadPiece{start: piece.start, data: piece.data[:head]})
+			}
+			if sequenceBefore(haveEnd, pieceEnd) {
+				// Keep the part after the covered range at its true sequence.
+				tail := int(haveEnd - piece.start)
+				next = append(next, payloadPiece{start: haveEnd, data: piece.data[tail:]})
+			}
+		}
+		pieces = next
+	}
+	return pieces
+}
+
 func (r *reassembler) Add(sequence uint32, data []byte) error {
 	if len(data) == 0 {
 		return nil
@@ -29,52 +77,22 @@ func (r *reassembler) Add(sequence uint32, data []byte) error {
 	if len(data) > r.limit {
 		return fmt.Errorf("desync: segment exceeds reassembly limit")
 	}
-	start := sequence
-	end := sequence + uint32(len(data))
-	trimmedStart := start
-	trimmed := data
-	for existingStart, existing := range r.segments {
-		existingEnd := existingStart + uint32(len(existing))
-		if !sequenceInside(trimmedStart, existingStart, existingEnd) &&
-			!sequenceInside(existingStart, trimmedStart, trimmedStart+uint32(len(trimmed))) {
-			// Disjoint: also handle the case where the new segment fully
-			// covers the existing one; both are kept and merged on extraction.
-			continue
-		}
-		if sequenceBefore(trimmedStart, existingStart) && sequenceBefore(existingEnd, trimmedStart+uint32(len(trimmed))) {
-			// Existing segment is inside the new one: drop it.
-			delete(r.segments, existingStart)
-			r.total -= len(existing)
-			continue
-		}
-		if !sequenceBefore(trimmedStart, existingStart) {
-			// New segment starts inside an existing one: trim the head.
-			skip := int(trimmedStart - existingStart)
-			if skip >= len(trimmed) {
-				return nil
-			}
-			trimmedStart = existingStart + uint32(skip)
-			trimmed = trimmed[skip:]
-		}
-		if sequenceBefore(existingEnd, trimmedStart+uint32(len(trimmed))) && sequenceBefore(trimmedStart, existingEnd) {
-			// New segment extends past an existing one: trim the tail so the
-			// stored ranges stay disjoint.
-			overlap := int(existingEnd - trimmedStart)
-			if overlap >= len(trimmed) {
-				return nil
-			}
-			trimmed = trimmed[:overlap]
-		}
+	covered := make([]payloadInterval, 0, len(r.segments))
+	for start, existing := range r.segments {
+		covered = append(covered, payloadInterval{start: start, length: len(existing)})
 	}
-	_ = end
-	if len(trimmed) == 0 {
-		return nil
+	pieces := uncoveredPayload(sequence, data, covered)
+	added := 0
+	for _, piece := range pieces {
+		added += len(piece.data)
 	}
-	if r.total+len(trimmed) > r.limit {
+	if r.total+added > r.limit {
 		return fmt.Errorf("desync: reassembly limit exceeded")
 	}
-	r.segments[trimmedStart] = append([]byte(nil), trimmed...)
-	r.total += len(trimmed)
+	for _, piece := range pieces {
+		r.segments[piece.start] = append([]byte(nil), piece.data...)
+	}
+	r.total += added
 	return nil
 }
 
@@ -126,8 +144,8 @@ func protocolFacts(message []byte) (Protocol, string, Facts) {
 		return ProtocolUnknown, "", facts
 	}
 	if len(message) >= 1 && message[0] == 0x16 {
-		host, hostStart, hostEnd, sniExtEnd, _ := parseTLSClientHello(message)
-		facts.HostStart, facts.HostEnd, facts.SNIExtEnd = hostStart, hostEnd, sniExtEnd
+		host, hostStart, hostEnd, sniExtAnchor, _ := parseTLSClientHello(message)
+		facts.HostStart, facts.HostEnd, facts.SNIExtEnd = hostStart, hostEnd, sniExtAnchor
 		facts.MethodStart = 0
 		facts.Protocol = ProtocolTLS
 		if host != "" {
@@ -322,8 +340,10 @@ func collectTLSHandshake(message []byte) ([]byte, []tlsSegment, bool) {
 
 // parseTLSClientHello parses a TLS ClientHello that may span multiple TLS
 // records. Offsets are returned in captured-stream coordinates and complete
-// reports whether the whole handshake body is present.
-func parseTLSClientHello(message []byte) (host string, hostStart int, hostEnd int, sniExtEnd int, complete bool) {
+// reports whether the whole handshake body is present. It returns the host
+// value bounds and the server_name extension BODY START (the upstream `sniext`
+// anchor); the record header is included in every reported offset.
+func parseTLSClientHello(message []byte) (host string, hostStart int, hostEnd int, sniExtAnchor int, complete bool) {
 	handshake, segments, complete := collectTLSHandshake(message)
 	host, helloStart, helloEnd, helloExt, helloOK := parseClientHelloBytes(handshake)
 	if !helloOK {
@@ -334,8 +354,12 @@ func parseTLSClientHello(message []byte) (host string, hostStart int, hostEnd in
 }
 
 // parseClientHelloBytes bounds-checks a concatenated ClientHello handshake and
-// extracts the SNI value and the end offset of the server_name extension.
-func parseClientHelloBytes(handshake []byte) (host string, hostStart int, hostEnd int, sniExtEnd int, ok bool) {
+// extracts the SNI value and the server_name extension BODY START. Upstream
+// TLSFindExtInHandshake returns the body pointer after skipping the four-byte
+// extension header (nfq/protocol.c:462-470) and TLSPos anchors `sniext` on it
+// (nfq/protocol.c:549-554), so the anchor is the two-byte name list length and
+// never the end of the extension.
+func parseClientHelloBytes(handshake []byte) (host string, hostStart int, hostEnd int, sniExtAnchor int, ok bool) {
 	if len(handshake) < 4 || handshake[0] != 0x01 {
 		return "", 0, 0, 0, false
 	}
@@ -386,19 +410,20 @@ func parseClientHelloBytes(handshake []byte) (host string, hostStart int, hostEn
 			// when the host_name is rejected, and an empty or non-host_name
 			// entry is parsed but never matchable. The shared reassembler must
 			// behave the same: the hello is complete (no deferred hold), the
-			// extension anchor is kept, and no host is reported.
-			sniExtEnd = bodyEnd
+			// extension anchor is kept, and no host is reported. The anchor is
+			// the extension body start, exactly like TLSFindExtInHandshake.
+			sniExtAnchor = bodyStart
 			if bodyStart+5 > bodyEnd {
-				return "", 0, 0, sniExtEnd, true
+				return "", 0, 0, sniExtAnchor, true
 			}
 			nameType := handshake[bodyStart+2]
 			nameLength := int(binary.BigEndian.Uint16(handshake[bodyStart+3 : bodyStart+5]))
 			nameStart := bodyStart + 5
 			nameEnd := nameStart + nameLength
 			if nameType != 0 || nameLength == 0 || nameEnd > bodyEnd {
-				return "", 0, 0, sniExtEnd, true
+				return "", 0, 0, sniExtAnchor, true
 			}
-			return string(handshake[nameStart:nameEnd]), nameStart, nameEnd, sniExtEnd, true
+			return string(handshake[nameStart:nameEnd]), nameStart, nameEnd, sniExtAnchor, true
 		}
 		offset = bodyEnd
 	}

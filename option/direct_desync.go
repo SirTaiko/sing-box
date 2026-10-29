@@ -327,8 +327,10 @@ type DirectDesyncFakeOptions struct {
 	TTL6        int                        `json:"ttl6,omitempty"`
 	AutoTTL     string                     `json:"autottl,omitempty"`
 	AutoTTL6    string                     `json:"autottl6,omitempty"`
-	// Seq selects upstream fake TCP sequence mode: every fake advances by the
-	// previous fake length instead of overlapping the original.
+	// Seq selects upstream fake TCP sequence mode (--dpi-desync-fake-tcp-mod=seq,
+	// nfq/desync.c:2008): after all repeats of one fake payload item, the base
+	// sequence advances by that payload's length. Without it every fake rides
+	// the captured packet's sequence.
 	Seq bool `json:"seq,omitempty"`
 }
 

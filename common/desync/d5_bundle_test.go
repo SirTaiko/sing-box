@@ -96,8 +96,8 @@ func TestD5BundleSharedStateReadsManifestOnce(t *testing.T) {
 	if !rule.IPs.contains(netip.MustParseAddr("192.0.2.55")) {
 		t.Fatal("bundle IP dataset was not applied")
 	}
-	if !rule.domainRestrict || !rule.ipRestrict {
-		t.Fatal("bundle positives must be explicit restrictions")
+	if !rule.domainRestrict || !rule.IPs.restricts() {
+		t.Fatal("nonempty bundle positives must compile into active restrictions")
 	}
 	if got := state.BundleGenerations(); len(got) != 1 || got[0] != generation {
 		t.Fatalf("unexpected generations %v (want %s)", got, generation)

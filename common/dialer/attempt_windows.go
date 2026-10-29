@@ -18,6 +18,10 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// soExclusiveAddrUse is Winsock's SO_EXCLUSIVEADDRUSE, which winsock2.h defines
+// as (int)(~SO_REUSEADDR). x/sys/windows does not export it.
+const soExclusiveAddrUse = ^windows.SO_REUSEADDR
+
 func dialAttempt(ctx context.Context, base net.Dialer, network, address string, lease AttemptLease) (net.Conn, error) {
 	if N.NetworkName(network) != N.NetworkTCP {
 		return dialAttemptControl(ctx, base, network, address, lease)
@@ -186,6 +190,17 @@ func dialConnectEx(ctx context.Context, base net.Dialer, network, address string
 			copy(bind.Addr[:], ip4)
 		}
 		bindAddress = bind
+	}
+	// A packet-enabled attempt owns its local endpoint exclusively. Winsock
+	// applies SO_EXCLUSIVEADDRUSE only before bind, and an ordinary Bind does
+	// not exclude a foreign SO_REUSEADDR contender on the same port. The
+	// option is applied after the caller's controls (which may still adjust
+	// socket state) and before Bind, and only on the packet path: stream-only
+	// leases keep the ordinary dialer bind behavior.
+	if lease != nil && lease.RequiresExclusiveBind() {
+		if err = windows.SetsockoptInt(handle, windows.SOL_SOCKET, soExclusiveAddrUse, 1); err != nil {
+			return nil, 0, E.Cause(err, "desync: setsockopt(SO_EXCLUSIVEADDRUSE)")
+		}
 	}
 	if err = windows.Bind(handle, bindAddress); err != nil {
 		return nil, 0, E.Cause(err, "desync: bind exclusive local port")

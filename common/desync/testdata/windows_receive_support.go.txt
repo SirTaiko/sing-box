@@ -1,0 +1,20 @@
+package desync
+
+import "reflect"
+
+func WindowsModelEndpointRooted(l *Lease) bool {
+ l.mu.Lock(); defer l.mu.Unlock()
+ v := reflect.ValueOf(l).Elem().FieldByName("retainedEndpoint")
+ return v.IsValid() && !v.IsNil()
+}
+
+// Included only by the reversible Windows-source offline overlay.
+func WindowsModelHeldBytes(e *Engine) int64 { return e.heldBytes.Load() }
+func WindowsModelLocksAvailable(l *Lease) bool {
+ if !l.engine.mu.TryLock() { return false }; l.engine.mu.Unlock()
+ if !l.mu.TryLock() { return false }
+ flows:=make([]*flowState,0,len(l.udpFlows));for _,f:=range l.udpFlows{flows=append(flows,f)}
+ l.mu.Unlock()
+ for _,f:=range flows { if !f.mu.TryLock(){return false};f.mu.Unlock() }
+ return true
+}

@@ -3,7 +3,7 @@
 package desync
 
 // Hermetic lifecycle and packet-delivery tests for the Linux NFQUEUE capture
-// backend.
+// backend. Model tests: no kernel object is created, and every case says so.
 //
 // The native QA of this backend (t_fd9d1fe5) observed three facts that this
 // harness has to model, not just mimic with mocked return values:
@@ -37,6 +37,8 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +46,8 @@ import (
 
 	"github.com/mdlayher/netlink"
 	"github.com/sagernet/nftables"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -52,6 +56,7 @@ var (
 	errFakeNoDeadline      = errors.New("fake nfqueue connection does not support read deadlines")
 	errFakeForeignPort     = errors.New("operation not permitted")
 	errFakeQueueNotBound   = errors.New("no such queue")
+	errFakeNoSuchInstance  = errors.New("no such queue instance")
 	errFakeQueueBusy       = errors.New("device or resource busy")
 	errFakeControlRejected = errors.New("fake kernel rejected the queue-control message")
 )
@@ -72,11 +77,111 @@ type fakeKernelEvent struct {
 type fakeQueueKernel struct {
 	mu       sync.Mutex
 	bindings map[uint16]*fakeNFQueueConn
-	events   []fakeKernelEvent
+	// entries is the queue-entry table of one instance: the packet ids it still
+	// holds. A packet id is added when the packet is enqueued, removed when its
+	// verdict is applied, and removed with NF_DROP when the kernel flushes the
+	// instance (nfnetlink_queue.c: queue->queue_list and find_dequeue_entry()).
+	entries map[uint16]map[uint32]bool
+	events  []fakeKernelEvent
+	// reportPath mirrors /proc/net/netfilter/nfnetlink_queue for the model
+	// kernel: every state change rewrites one row per bound instance with its
+	// exact current queue_total. extraReportRows are deliberate stale or
+	// foreign rows that survive state changes.
+	reportPath      string
+	extraReportRows []string
 }
 
 func newFakeQueueKernel() *fakeQueueKernel {
-	return &fakeQueueKernel{bindings: make(map[uint16]*fakeNFQueueConn)}
+	return &fakeQueueKernel{
+		bindings: make(map[uint16]*fakeNFQueueConn),
+		entries:  make(map[uint16]map[uint32]bool),
+	}
+}
+
+// addEntryLocked records one enqueued packet of an instance. Caller holds k.mu.
+func (k *fakeQueueKernel) addEntryLocked(queue uint16, id uint32) {
+	if k.entries[queue] == nil {
+		k.entries[queue] = make(map[uint32]bool)
+	}
+	k.entries[queue][id] = true
+	k.publishReportLocked()
+}
+
+// The deployed producer's seq_show() prints nine columns. The model reports the
+// same copy_mode/copy_range the capture configures with NFQA_CFG_PARAMS
+// (0x0000ffff range, NFQNL_COPY_PACKET=2) rather than an abbreviated row. The
+// values are spelled out here, independent of the parser's own constants, so a
+// wrong parser constant cannot make the fixture agree with the bug.
+const (
+	fakeReportCopyMode  = 2
+	fakeReportCopyRange = 0x0000ffff
+)
+
+// queueReportRow renders one row with the exact deployed producer grammar
+// (linux-v6.8 net/netfilter/nfnetlink_queue.c seq_show): nine unsigned decimal
+// columns and the constant trailing 1.
+func queueReportRow(queue uint16, port, total uint32) string {
+	return fmt.Sprintf("%5d %6d %5d %1d %5d %5d %5d %8d %2d",
+		queue, port, total, fakeReportCopyMode, fakeReportCopyRange, 0, 0, 0, 1)
+}
+
+// publishReportLocked rewrites the model /proc/net/netfilter/nfnetlink_queue
+// file: one deployed-shape row per bound instance, in queue order, with the
+// exact number of packets the instance still holds. Caller holds k.mu.
+func (k *fakeQueueKernel) publishReportLocked() {
+	if k.reportPath == "" {
+		return
+	}
+	queues := make([]int, 0, len(k.bindings))
+	for queue := range k.bindings {
+		queues = append(queues, int(queue))
+	}
+	sort.Ints(queues)
+	var report strings.Builder
+	for _, value := range queues {
+		queue := uint16(value)
+		report.WriteString(queueReportRow(queue, k.bindings[queue].portid, uint32(len(k.entries[queue]))) + "\n")
+	}
+	for _, row := range k.extraReportRows {
+		report.WriteString(row + "\n")
+	}
+	_ = os.WriteFile(k.reportPath, []byte(report.String()), 0o644)
+}
+
+// dropEntriesLocked flushes every queued entry of one instance the way the
+// kernel does it on nfqnl_flush(): the entry is dequeued and the packet is
+// reinjected with NF_DROP, so the id can no longer be answered. Caller holds
+// k.mu.
+func (k *fakeQueueKernel) dropEntriesLocked(queue uint16) {
+	ids := make([]uint32, 0, len(k.entries[queue]))
+	for id := range k.entries[queue] {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		k.events = append(k.events, fakeKernelEvent{kind: "drop", queue: queue, id: id})
+	}
+	delete(k.entries, queue)
+	k.publishReportLocked()
+}
+
+// hookDrop models nf_queue_nf_hook_drop(): unregistering one netfilter hook in
+// a network namespace flushes EVERY queue instance of that namespace and
+// reinjects the packets it still holds with NF_DROP
+// (net/netfilter/core.c: __nf_unregister_net_hook -> nf_queue_nf_hook_drop ->
+// net/netfilter/nfnetlink_queue.c: nfqnl_nf_hook_drop -> nfqnl_flush(NULL)).
+//
+// Deleting an nftables table unregisters the hooks of its base chains, so a
+// capture's own table removal is such an event: every packet that is still
+// queued at that moment is dropped and its id becomes invalid. The instances
+// themselves stay bound - only the hook that feeds them is gone.
+func (k *fakeQueueKernel) hookDrop() {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.events = append(k.events, fakeKernelEvent{kind: "hookdrop"})
+	for queue := range k.bindings {
+		k.dropEntriesLocked(queue)
+	}
 }
 
 func (k *fakeQueueKernel) record(event fakeKernelEvent) {
@@ -99,6 +204,7 @@ func (k *fakeQueueKernel) control(owner *fakeNFQueueConn, queue uint16, command 
 		}
 		k.bindings[queue] = owner
 		k.events = append(k.events, fakeKernelEvent{kind: "bind", queue: queue, port: owner.portid})
+		k.publishReportLocked()
 		return nil
 	case nfqCfgCmdUnbind:
 		if !isBound {
@@ -109,11 +215,15 @@ func (k *fakeQueueKernel) control(owner *fakeNFQueueConn, queue uint16, command 
 		}
 		delete(k.bindings, queue)
 		k.events = append(k.events, fakeKernelEvent{kind: "unbind", queue: queue, port: owner.portid})
+		k.publishReportLocked()
 		return nil
 	default:
 		// Queue parameter update.
 		if !isBound {
-			return errFakeQueueNotBound
+			// A parameter or queue-limit message for a queue number without an
+			// instance is the kernel's -ENODEV, the exact shape QA464 observed
+			// when a released port destroyed a freshly bound queue.
+			return errFakeNoSuchInstance
 		}
 		if bound != owner {
 			return errFakeForeignPort
@@ -134,18 +244,35 @@ func (k *fakeQueueKernel) deliver(queue uint16, message netlink.Message, id uint
 		k.mu.Unlock()
 		return false
 	}
+	k.addEntryLocked(queue, id)
 	k.events = append(k.events, fakeKernelEvent{kind: "deliver", queue: queue, port: owner.portid, id: id})
 	k.mu.Unlock()
 	return owner.deliver(message)
 }
 
-// verdict records the disposition the capture sent for one packet.
+// verdict applies the disposition the capture sent for one packet, with the
+// kernel's acceptance rule: nfqnl_recv_verdict() looks the id up in the
+// instance's entry list and answers -ENOENT when find_dequeue_entry() no longer
+// holds it (the packet was already answered, or a hook drop flushed it), and
+// netlink_rcv_skb() acknowledges a failed request even without NLM_F_ACK. That
+// acknowledgement is an ordinary message on the verdict socket, so the next
+// Receive - not the Send - reports it.
 func (k *fakeQueueKernel) verdict(owner *fakeNFQueueConn, queue uint16, id, verdict uint32) {
 	k.mu.Lock()
-	defer k.mu.Unlock()
+	if !k.entries[queue][id] {
+		k.events = append(k.events, fakeKernelEvent{
+			kind: "reject", queue: queue, port: owner.portid, id: id, verdict: verdict,
+		})
+		k.mu.Unlock()
+		owner.notifyKernelRejection(unix.ENOENT)
+		return
+	}
+	delete(k.entries[queue], id)
 	k.events = append(k.events, fakeKernelEvent{
 		kind: "verdict", queue: queue, port: owner.portid, id: id, verdict: verdict,
 	})
+	k.publishReportLocked()
+	k.mu.Unlock()
 }
 
 func (k *fakeQueueKernel) owner(queue uint16) *fakeNFQueueConn {
@@ -270,6 +397,35 @@ func (f *fakeNFQueueConn) deadlineState() (*fakeDeadlineGen, chan struct{}, bool
 	return f.deadlineGen, f.deadlineWake, expired
 }
 
+// notifyKernelRejection queues the kernel's acknowledgement of a failed request
+// on this connection: an NLMSG_ERROR message whose payload is the negative
+// errno, unicast to the port that sent the rejected request (netlink_ack()).
+func (f *fakeNFQueueConn) notifyKernelRejection(errno unix.Errno) {
+	payload := make([]byte, 4)
+	binary.NativeEndian.PutUint32(payload, uint32(-int32(errno)))
+	select {
+	case f.incoming <- netlink.Message{Header: netlink.Header{Type: netlink.Error}, Data: payload}:
+	default:
+	}
+}
+
+// fakeReceiveError mirrors the pinned library's checkMessage(): an NLMSG_ERROR
+// message carrying a non-zero code is returned to the caller as an OpError with
+// Op "receive" and the raw errno - deliberately not an os.SyscallError, because
+// the error came from a netlink message and not from a system call. That is why
+// a rejected verdict surfaces on the NEXT Receive as
+// "netlink receive: no such file or directory", never on the Send itself.
+func fakeReceiveError(message netlink.Message) error {
+	if message.Header.Type != netlink.Error || len(message.Data) < 4 {
+		return nil
+	}
+	code := int32(binary.NativeEndian.Uint32(message.Data[:4]))
+	if code == 0 {
+		return nil
+	}
+	return &netlink.OpError{Op: "receive", Err: unix.Errno(-code)}
+}
+
 func (f *fakeNFQueueConn) Receive() ([]netlink.Message, error) {
 	f.receiveOnce.Do(func() { close(f.receiving) })
 	// Mirror netlink.Conn.Receive: the read lock is held for the whole
@@ -289,6 +445,9 @@ func (f *fakeNFQueueConn) Receive() ([]netlink.Message, error) {
 		}
 		select {
 		case message := <-f.incoming:
+			if err := fakeReceiveError(message); err != nil {
+				return nil, err
+			}
 			return []netlink.Message{message}, nil
 		case <-f.closedCh:
 			return nil, errFakeNFQueueClosed
@@ -341,7 +500,8 @@ func (f *fakeNFQueueConn) Execute(message netlink.Message) ([]netlink.Message, e
 	f.sequence++
 	sequence := f.sequence
 	f.stateMu.Unlock()
-	return []netlink.Message{{Header: netlink.Header{Type: netlink.Error, Sequence: sequence}}}, nil
+	ack := make([]byte, 4)
+	return []netlink.Message{{Header: netlink.Header{Type: netlink.Error, Sequence: sequence}, Data: ack}}, nil
 }
 
 func (f *fakeNFQueueConn) Send(message netlink.Message) (netlink.Message, error) {
@@ -397,9 +557,12 @@ func (f *fakeNFQueueConn) Close() error {
 		f.closed.Store(true)
 		f.stateMu.Lock()
 		f.closeCount++
-		hook := f.executeHook
-		_ = hook
 		f.stateMu.Unlock()
+		// Kernel socket release destroys every NFQUEUE instance bound to this
+		// port in one instances_lock critical section.
+		if f.kernel != nil {
+			f.kernel.releasePort(f)
+		}
 		f.deadlineMu.Lock()
 		if f.deadlineTimer != nil {
 			f.deadlineTimer.Stop()
@@ -409,6 +572,23 @@ func (f *fakeNFQueueConn) Close() error {
 		close(f.closedCh)
 	})
 	return nil
+}
+
+// releasePort models netlink_release -> NETLINK_URELEASE ->
+// nfqnl_rcv_nl_event: every instance whose peer_portid is this port is
+// destroyed, and its pending entries are flushed with NF_DROP.
+func (k *fakeQueueKernel) releasePort(conn *fakeNFQueueConn) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for queue, owner := range k.bindings {
+		if owner != conn {
+			continue
+		}
+		delete(k.bindings, queue)
+		k.dropEntriesLocked(queue)
+		k.events = append(k.events, fakeKernelEvent{kind: "release", queue: queue, port: conn.portid})
+	}
+	k.publishReportLocked()
 }
 
 // pending mirrors a MSG_PEEK|MSG_DONTWAIT probe on the socket: it reports an
@@ -421,6 +601,9 @@ func (f *fakeNFQueueConn) pending() (bool, error) {
 	}
 	return len(f.incoming) > 0, nil
 }
+
+// boundPort is the explicitly bound queue-class port of this connection.
+func (f *fakeNFQueueConn) boundPort() uint32 { return f.portid }
 
 func (f *fakeNFQueueConn) executedMessages() []netlink.Message {
 	f.stateMu.Lock()
@@ -497,8 +680,8 @@ func parseNFQueueVerdict(message netlink.Message) (uint16, uint32, uint32, bool)
 	return 0, 0, 0, false
 }
 
-// fakeRuleWriter records the owned-table lifecycle instead of opening a
-// NETLINK_NETFILTER nftables transaction.
+// fakeRuleWriter is retained only for the reply-limit batch model tests; the
+// persistent-anchor lifecycle itself runs against fakeNftNamespace.
 type fakeRuleWriter struct {
 	mu             sync.Mutex
 	tables         []*nftables.Table
@@ -543,64 +726,52 @@ func (f *fakeRuleWriter) Flush() error {
 	err := f.flushErr
 	f.mu.Unlock()
 	if pending && hook != nil {
-		// The hook runs exactly between the table removal and the queue
-		// teardown, which is the interleaving window a captured packet can
-		// still be sitting in.
 		hook()
 	}
 	return err
 }
 
-func (f *fakeRuleWriter) deletedTables() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.deleted...)
-}
-
-func (f *fakeRuleWriter) flushCount() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.flushes
-}
-
-func (f *fakeRuleWriter) setFlushError(err error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.flushErr = err
-}
-
-func (f *fakeRuleWriter) setDeleteHook(hook func()) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.deleteHook = hook
-}
-
-// linuxCaptureSeams is the in-memory replacement of the two native seams. The
-// dial factory hands out the queue connection first; any additional connection
-// the implementation opens is tracked, because a capture must own exactly one:
-// the port that receives is the port that binds.
+// linuxCaptureSeams installs the hermetic native and anchor seams of one test.
+// The dial factory hands out the queue connection first; any additional
+// connection the implementation opens is tracked, because a capture must own
+// exactly one: the port that receives is the port that binds.
 type linuxCaptureSeams struct {
 	first     *fakeNFQueueConn
 	firstUsed bool
 	kernel    *fakeQueueKernel
-	mu        sync.Mutex
-	extra     []*fakeNFQueueConn
-	extraNext uint32
+	anchors   *fakeNftNamespace
+
+	mu         sync.Mutex
+	extra      []*fakeNFQueueConn
+	extraNext  uint32
+	boundPorts []uint32
+
+	guardsMu sync.Mutex
+	guards   map[string]bool
+	// forceGuardBusy models a guard inherited by a child: the exact-name probe
+	// stays busy even after the local fd was closed.
+	forceGuardBusy bool
+
+	fenceMu sync.Mutex
+	fence   *fakeFenceTransport
 }
 
-func (s *linuxCaptureSeams) dial() (nfqueueConn, error) {
+func (s *linuxCaptureSeams) dial(port uint32) (nfqueueTransport, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.firstUsed {
 		s.firstUsed = true
 		if s.first == nil {
-			s.first = newFakeNFQueueConn("queue", 0x51a00001, s.kernel)
+			s.first = newFakeNFQueueConn("queue", port, s.kernel)
 		}
+		s.first.portid = port
+		s.boundPorts = append(s.boundPorts, port)
 		return s.first, nil
 	}
 	s.extraNext++
-	extra := newFakeNFQueueConn(fmt.Sprintf("extra-%d", s.extraNext), 0x51a00001+s.extraNext, s.kernel)
+	extra := newFakeNFQueueConn(fmt.Sprintf("extra-%d", s.extraNext), port, s.kernel)
 	s.extra = append(s.extra, extra)
+	s.boundPorts = append(s.boundPorts, port)
 	return extra, nil
 }
 
@@ -610,29 +781,127 @@ func (s *linuxCaptureSeams) extraConnections() int {
 	return len(s.extra)
 }
 
-// installLinuxCaptureSeams swaps the native seams for one test and restores
-// them afterwards. The probe file path is missing on purpose: absence of the
-// kernel report must never be read as a collision.
-func installLinuxCaptureSeams(t *testing.T, queue *fakeNFQueueConn, rules *fakeRuleWriter) *linuxCaptureSeams {
+func (s *linuxCaptureSeams) boundPortList() []uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]uint32(nil), s.boundPorts...)
+}
+
+func (s *linuxCaptureSeams) bindGuard(name string) (*anchorGuard, error) {
+	s.guardsMu.Lock()
+	defer s.guardsMu.Unlock()
+	if s.guards[name] {
+		return nil, unix.EADDRINUSE
+	}
+	s.guards[name] = true
+	guard := &anchorGuard{fd: -1, name: name}
+	guard.onClose = func() {
+		s.guardsMu.Lock()
+		delete(s.guards, name)
+		s.guardsMu.Unlock()
+	}
+	return guard, nil
+}
+
+func (s *linuxCaptureSeams) probeGuard(name string) (bool, error) {
+	s.guardsMu.Lock()
+	defer s.guardsMu.Unlock()
+	return s.guards[name] || s.forceGuardBusy, nil
+}
+
+func (s *linuxCaptureSeams) fenceTransport() (fenceTransport, error) {
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	if s.fence == nil {
+		s.fence = &fakeFenceTransport{port: 0x40000001, reply: validFenceReply}
+	}
+	return s.fence, nil
+}
+
+func (s *linuxCaptureSeams) setFenceReply(reply func(request enqueueFenceRequest, port uint32) ([]byte, *unix.SockaddrNetlink, error)) {
+	s.fenceMu.Lock()
+	defer s.fenceMu.Unlock()
+	if s.fence == nil {
+		s.fence = &fakeFenceTransport{port: 0x40000001}
+	}
+	s.fence.reply = reply
+}
+
+// installLinuxCaptureSeams swaps the native and anchor seams for one test and
+// restores them afterwards. The queue-report path is missing on purpose:
+// absence of the kernel report must never be read as a collision. The
+// namespace NFQUEUE report is an empty regular file so an available proc read
+// is modelled separately from an unavailable one.
+func installLinuxCaptureSeams(t *testing.T, queue *fakeNFQueueConn) *linuxCaptureSeams {
 	t.Helper()
 	kernel := newFakeQueueKernel()
-	previousOpen := openNFQueueConn
-	previousWriter := newLinuxRuleWriter
+	previousGet := getThreadNetns
+	previousSet := setThreadNetns
+	previousOpen := openQueueTransport
+	previousSession := openAnchorSession
+	previousFence := openFenceTransport
+	previousGuardBind := bindAnchorGuardSocket
+	previousGuardProbe := probeAnchorGuardAddress
+	previousProcess := readProcessIdentity
+	previousObserve := observeOwnerProcess
 	previousReport := linuxQueueReportPath
-	seams := &linuxCaptureSeams{kernel: kernel}
+	previousNamespaceReport := namespaceQueueReportPath
+	seams := &linuxCaptureSeams{kernel: kernel, anchors: newFakeNftNamespace(), guards: make(map[string]bool)}
 	if queue != nil {
 		queue.kernel = kernel
 		seams.first = queue
 	}
-	openNFQueueConn = seams.dial
-	newLinuxRuleWriter = func() linuxRuleWriter { return rules }
+	setThreadNetns = func(netns.NsHandle) error { return nil }
+	openQueueTransport = seams.dial
+	openAnchorSession = func() (anchorSession, error) {
+		return &fakeAnchorSession{namespace: seams.anchors, port: 0x40000002}, nil
+	}
+	openFenceTransport = seams.fenceTransport
+	bindAnchorGuardSocket = seams.bindGuard
+	probeAnchorGuardAddress = seams.probeGuard
+	readProcessIdentity = func() (processIdentity, error) {
+		return processIdentity{pidns: anchorPidNamespace{dev: 1, ino: 2}, tgid: 4242, startTicks: 99}, nil
+	}
+	observeOwnerProcess = func(anchorRecord) (anchorOwnerObservation, error) {
+		return anchorOwnerObservation{verdict: anchorOwnerDead, reason: "model: not observed"}, nil
+	}
 	linuxQueueReportPath = filepath.Join(t.TempDir(), "missing-nfnetlink_queue")
+	queueReport := filepath.Join(t.TempDir(), "nfnetlink_queue")
+	if err := os.WriteFile(queueReport, nil, 0o644); err != nil {
+		t.Fatalf("write fake NFQUEUE report: %v", err)
+	}
+	namespaceQueueReportPath = queueReport
+	kernel.reportPath = queueReport
 	t.Cleanup(func() {
-		openNFQueueConn = previousOpen
-		newLinuxRuleWriter = previousWriter
+		getThreadNetns = previousGet
+		setThreadNetns = previousSet
+		openQueueTransport = previousOpen
+		openAnchorSession = previousSession
+		openFenceTransport = previousFence
+		bindAnchorGuardSocket = previousGuardBind
+		probeAnchorGuardAddress = previousGuardProbe
+		readProcessIdentity = previousProcess
+		observeOwnerProcess = previousObserve
 		linuxQueueReportPath = previousReport
+		namespaceQueueReportPath = previousNamespaceReport
+		anchorOwnerRegistry.Lock()
+		for key, owner := range anchorOwnerRegistry.owners {
+			owner.mu.Lock()
+			owner.closed = true
+			owner.mu.Unlock()
+			_ = owner.guard.close()
+			if owner.nsFD >= 0 {
+				_ = unix.Close(owner.nsFD)
+				owner.nsFD = -1
+			}
+			delete(anchorOwnerRegistry.owners, key)
+		}
+		anchorOwnerRegistry.Unlock()
 		seams.mu.Lock()
 		extras := append([]*fakeNFQueueConn(nil), seams.extra...)
+		if seams.first != nil {
+			extras = append(extras, seams.first)
+		}
 		seams.mu.Unlock()
 		for _, extra := range extras {
 			_ = extra.Close()
@@ -785,8 +1054,7 @@ func TestFakeKernelModelsBindingIdentity(t *testing.T) {
 // answered with a verdict on the same connection.
 func TestLinuxCaptureBindsQueuesOnReceivingSocket(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	_, lease := newLinuxCaptureLease(t, 15010)
 
 	capture, err := openLinuxCapture(lease)
@@ -841,8 +1109,7 @@ func TestLinuxCaptureBindsQueuesOnReceivingSocket(t *testing.T) {
 // unbind exchange on that same connection.
 func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	_, lease := newLinuxCaptureLease(t, 15000)
 
 	capture, err := openLinuxCapture(lease)
@@ -863,8 +1130,8 @@ func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	}
 
 	executed := data.executedMessages()
-	if got := countQueueCommand(t, executed, 15000, nfqCfgCmdUnbind); got != 1 {
-		t.Fatalf("outbound queue unbinds = %d, want 1 (messages %d)", got, len(executed))
+	if got := countQueueCommand(t, executed, 15000, nfqCfgCmdUnbind); got != 0 {
+		t.Fatalf("outq unbinds = %d, want 0 (the witness is released by its owning socket)", got)
 	}
 	if got := countQueueCommand(t, executed, linux.inQueue, nfqCfgCmdUnbind); got != 1 {
 		t.Fatalf("inbound queue unbinds = %d, want 1", got)
@@ -872,11 +1139,13 @@ func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	if bound := seams.kernel.boundQueues(); len(bound) != 0 {
 		t.Fatalf("queues still bound after Close: %v", bound)
 	}
-	if got := len(rules.deletedTables()); got != 1 || rules.deletedTables()[0] != linuxTableName(linux) {
-		t.Fatalf("deleted tables = %v", rules.deletedTables())
+	// The fixed anchors outlive the capture: the table, both base chains, the
+	// a/t markers and the empty base chains are validated after close.
+	if err := readFakeAnchors(t, seams, FamilyIPv4); err != nil {
+		t.Fatalf("anchor validation after close: %v", err)
 	}
-	if rules.flushCount() != 2 { // one install transaction, one table removal
-		t.Fatalf("table flushes = %d, want 2", rules.flushCount())
+	if records := fakeCaptureRecords(t, seams, FamilyIPv4); len(records) != 0 {
+		t.Fatalf("capture records after close: %v", records)
 	}
 	if data.closings() != 1 {
 		t.Fatalf("connection closes = %d, want 1", data.closings())
@@ -885,10 +1154,10 @@ func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	// refuses to run Execute while a receive holds the lock, so reaching this
 	// point already proves it, and the recorded order documents it.
 	unbindIndex := seams.kernel.eventIndex(func(event fakeKernelEvent) bool {
-		return event.kind == "unbind" && event.queue == 15000
+		return event.kind == "unbind" && event.queue == linux.inQueue
 	})
 	if unbindIndex < 0 {
-		t.Fatal("no recorded unbind of the outbound queue")
+		t.Fatal("no recorded unbind of the inbound observation queue")
 	}
 
 	// Repeated close is a no-op: it must not repeat any native side effect.
@@ -898,8 +1167,8 @@ func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	if got := len(data.executedMessages()); got != len(executed) {
 		t.Fatalf("repeated Close sent %d extra control messages", got-len(executed))
 	}
-	if got := len(rules.deletedTables()); got != 1 {
-		t.Fatalf("repeated Close deleted %d tables", got)
+	if err := readFakeAnchors(t, seams, FamilyIPv4); err != nil {
+		t.Fatalf("repeated Close disturbed the fixed anchors: %v", err)
 	}
 	if data.closings() != 1 {
 		t.Fatal("repeated Close re-closed the native connection")
@@ -909,36 +1178,57 @@ func TestLinuxCaptureCloseReleasesIdleBlockingReceive(t *testing.T) {
 	}
 }
 
+// teardownDeliverConn injects one already-enqueued packet of the owned flow at
+// the teardown interrupt: the first read deadline a capture arms with a
+// non-zero deadline is the one stopReceive uses to stop the receive loop.
+// Delivery, deadlines, queue identity and verdicts stay entirely with the
+// shipped fake transport; this wrapper only decides WHEN the packet reaches it,
+// so the interleaving is deterministic instead of timing-dependent.
+type teardownDeliverConn struct {
+	*fakeNFQueueConn
+	deliver func()
+	once    sync.Once
+}
+
+func (c *teardownDeliverConn) SetReadDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		c.once.Do(c.deliver)
+	}
+	return c.fakeNFQueueConn.SetReadDeadline(deadline)
+}
+
 // TestLinuxCaptureCloseDrainsPacketsQueuedDuringTeardown covers the interleaved
-// packet/control/teardown case: a packet that is still queued when the owned
-// table is removed is answered by the loop before the queue is unbound, and the
+// packet/control/teardown case: a packet of the owned flow that is still queued
+// when the capture stops its receive loop is answered by the teardown drain
+// before the owned table - and with it the base-chain hook that feeds the
+// queue - is removed, so the kernel's hook drop never discards it, and the
 // unbind exchange on the same connection then passes reply validation.
 func TestLinuxCaptureCloseDrainsPacketsQueuedDuringTeardown(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	_, lease := newLinuxCaptureLease(t, 15011)
+
+	packet := buildIPv4TCP(t, nil, 1000, tcpFlagACK|tcpFlagPSH)
+	queued := uint32(77)
+	var linux *linuxCapture
+	conn := &teardownDeliverConn{fakeNFQueueConn: data, deliver: func() {
+		if !seams.kernel.deliver(linux.queue, fakePacketMessage(linux.queue, queued, packet.Raw), queued) {
+			t.Errorf("owned queue refused the packet queued during teardown")
+		}
+	}}
+	data.portid = 0x51a00003
+	openQueueTransport = func(port uint32) (nfqueueTransport, error) { return conn, nil }
 
 	capture, err := openLinuxCapture(lease)
 	if err != nil {
 		t.Fatalf("open capture: %v", err)
 	}
-	linux := capture.(*linuxCapture)
+	linux = capture.(*linuxCapture)
 	select {
 	case <-data.receiving:
 	case <-time.After(5 * time.Second):
 		t.Fatal("capture loop never entered Receive")
 	}
-
-	packet := buildIPv4TCP(t, nil, 1000, tcpFlagACK|tcpFlagPSH)
-	queued := uint32(77)
-	rules.setDeleteHook(func() {
-		// Exactly the teardown window: the table is gone, the queues are still
-		// bound and the receive loop has not been stopped yet.
-		if !seams.kernel.deliver(linux.queue, fakePacketMessage(linux.queue, queued, packet.Raw), queued) {
-			t.Errorf("owned queue refused the packet queued during teardown")
-		}
-	})
 
 	closed := make(chan error, 1)
 	go func() { closed <- capture.Close() }()
@@ -950,22 +1240,40 @@ func TestLinuxCaptureCloseDrainsPacketsQueuedDuringTeardown(t *testing.T) {
 	if len(verdicts) != 1 {
 		t.Fatalf("verdicts for the packet queued during teardown = %d, want 1 (dropped instead of drained)", len(verdicts))
 	}
-	// Ordering: answered before the queue was unbound.
+	// Ordering: answered while its kernel entry is still valid, i.e. before the
+	// table removal flushed the instance, and before the queue was unbound.
 	verdictIndex := seams.kernel.eventIndex(func(event fakeKernelEvent) bool {
 		return event.kind == "verdict" && event.id == queued
 	})
 	unbindIndex := seams.kernel.eventIndex(func(event fakeKernelEvent) bool {
-		return event.kind == "unbind" && event.queue == linux.queue
+		return event.kind == "unbind" && event.queue == linux.inQueue
 	})
 	if verdictIndex < 0 || unbindIndex < 0 || verdictIndex > unbindIndex {
 		t.Fatalf("event order verdict=%d unbind=%d, want the drain to answer before the unbind", verdictIndex, unbindIndex)
 	}
+	if drops := countKernelEvents(seams.kernel, "drop"); drops != 0 {
+		t.Fatalf("kernel dropped %d queued packets at teardown, want 0", drops)
+	}
 	if bound := seams.kernel.boundQueues(); len(bound) != 0 {
 		t.Fatalf("queues still bound after Close: %v", bound)
 	}
-	if len(rules.deletedTables()) != 1 || data.closings() != 1 {
-		t.Fatalf("table deletions = %d, connection closes = %d, want 1/1", len(rules.deletedTables()), data.closings())
+	if err := readFakeAnchors(t, seams, FamilyIPv4); err != nil {
+		t.Fatalf("anchor validation after close: %v", err)
 	}
+	if data.closings() != 1 {
+		t.Fatalf("connection closes = %d, want 1", data.closings())
+	}
+}
+
+// countKernelEvents counts recorded kernel events of one kind.
+func countKernelEvents(kernel *fakeQueueKernel, kind string) int {
+	count := 0
+	for _, event := range kernel.eventList() {
+		if event.kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 // TestLinuxCaptureCloseWithoutDeadlineSupportDoesNotHang pins the failure path
@@ -974,8 +1282,7 @@ func TestLinuxCaptureCloseDrainsPacketsQueuedDuringTeardown(t *testing.T) {
 func TestLinuxCaptureCloseWithoutDeadlineSupportDoesNotHang(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
 	data.deadlineDisabled = true
-	rules := &fakeRuleWriter{}
-	installLinuxCaptureSeams(t, data, rules)
+	installLinuxCaptureSeams(t, data)
 	_, lease := newLinuxCaptureLease(t, 15012)
 
 	capture, err := openLinuxCapture(lease)
@@ -1000,9 +1307,6 @@ func TestLinuxCaptureCloseWithoutDeadlineSupportDoesNotHang(t *testing.T) {
 	if data.closings() != 1 {
 		t.Fatalf("connection closes = %d, want 1", data.closings())
 	}
-	if got := len(rules.deletedTables()); got != 1 {
-		t.Fatalf("owned table deletions = %d, want 1", got)
-	}
 }
 
 // TestLinuxCaptureConcurrentLeaseAndEngineClose verifies exact-once teardown
@@ -1010,8 +1314,7 @@ func TestLinuxCaptureCloseWithoutDeadlineSupportDoesNotHang(t *testing.T) {
 // completion while its lease still owns native resources.
 func TestLinuxCaptureConcurrentLeaseAndEngineClose(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	engine, lease := newLinuxCaptureLease(t, 15001)
 	if err := lease.StartCapture(); err != nil {
 		t.Fatalf("start capture: %v", err)
@@ -1073,8 +1376,8 @@ func TestLinuxCaptureConcurrentLeaseAndEngineClose(t *testing.T) {
 	if engine.ActiveLeases() != 0 {
 		t.Fatal("engine still tracks a lease after Close")
 	}
-	if got := countQueueCommand(t, data.executedMessages(), 15001, nfqCfgCmdUnbind); got != 1 {
-		t.Fatalf("outbound unbinds = %d, want 1", got)
+	if got := countQueueCommand(t, data.executedMessages(), 15001, nfqCfgCmdUnbind); got != 0 {
+		t.Fatalf("outq unbinds = %d, want 0 (witness released by its owning socket)", got)
 	}
 	if bound := seams.kernel.boundQueues(); len(bound) != 0 {
 		t.Fatalf("queues still bound after Close: %v", bound)
@@ -1085,8 +1388,7 @@ func TestLinuxCaptureConcurrentLeaseAndEngineClose(t *testing.T) {
 // verdicts only for its own queue identities and never widens ownership.
 func TestLinuxCaptureLoopIgnoresForeignQueues(t *testing.T) {
 	data := newFakeNFQueueConn("queue", 0, nil)
-	rules := &fakeRuleWriter{}
-	seams := installLinuxCaptureSeams(t, data, rules)
+	seams := installLinuxCaptureSeams(t, data)
 	_, lease := newLinuxCaptureLease(t, 15002)
 	capture, err := openLinuxCapture(lease)
 	if err != nil {
@@ -1103,7 +1405,11 @@ func TestLinuxCaptureLoopIgnoresForeignQueues(t *testing.T) {
 	packet := buildIPv4TCP(t, nil, 1000, tcpFlagACK|tcpFlagPSH)
 	// A message of a queue this capture does not own, delivered to its socket.
 	data.incoming <- fakePacketMessage(linux.inQueue+7, 11, packet.Raw)
-	data.incoming <- fakePacketMessage(linux.queue, 12, packet.Raw)
+	// The owned packet goes through the kernel entry model, so its verdict is a
+	// real dequeue of a queued entry instead of an unknown id.
+	if !seams.kernel.deliver(linux.queue, fakePacketMessage(linux.queue, 12, packet.Raw), 12) {
+		t.Fatal("owned queue refused the packet")
+	}
 
 	waitForCondition(t, "verdict for the owned packet", func() bool {
 		return len(data.sentMessages()) > 0
@@ -1128,8 +1434,7 @@ func TestLinuxCaptureLoopIgnoresForeignQueues(t *testing.T) {
 func TestLinuxCaptureOpenRollsBackAfterFirstSideEffect(t *testing.T) {
 	t.Run("bind failure", func(t *testing.T) {
 		data := newFakeNFQueueConn("queue", 0, nil)
-		rules := &fakeRuleWriter{}
-		seams := installLinuxCaptureSeams(t, data, rules)
+		seams := installLinuxCaptureSeams(t, data)
 		data.setExecuteHook(func(call int, message netlink.Message) error {
 			if call == 1 {
 				return errors.New("bind rejected")
@@ -1150,9 +1455,6 @@ func TestLinuxCaptureOpenRollsBackAfterFirstSideEffect(t *testing.T) {
 		if data.closings() != 1 {
 			t.Fatal("failed open leaked the queue connection")
 		}
-		if rules.flushCount() != 0 {
-			t.Fatal("failed open touched the owned table")
-		}
 		if seams.extraConnections() != 0 {
 			t.Fatal("failed open opened an extra connection")
 		}
@@ -1160,8 +1462,7 @@ func TestLinuxCaptureOpenRollsBackAfterFirstSideEffect(t *testing.T) {
 
 	t.Run("queue parameter failure unbinds", func(t *testing.T) {
 		data := newFakeNFQueueConn("queue", 0, nil)
-		rules := &fakeRuleWriter{}
-		seams := installLinuxCaptureSeams(t, data, rules)
+		seams := installLinuxCaptureSeams(t, data)
 		data.setExecuteHook(func(call int, message netlink.Message) error {
 			if call == 2 {
 				return errors.New("parameter rejected")
@@ -1178,32 +1479,34 @@ func TestLinuxCaptureOpenRollsBackAfterFirstSideEffect(t *testing.T) {
 		if bound := seams.kernel.boundQueues(); len(bound) != 0 {
 			t.Fatalf("queues still bound after the failed open: %v", bound)
 		}
-		if rules.flushCount() != 0 {
-			t.Fatal("failed open touched the owned table")
-		}
 	})
 
 	t.Run("rule installation failure unbinds both queues", func(t *testing.T) {
 		data := newFakeNFQueueConn("queue", 0, nil)
-		rules := &fakeRuleWriter{}
-		seams := installLinuxCaptureSeams(t, data, rules)
-		rules.setFlushError(errors.New("nftables transaction failed"))
+		seams := installLinuxCaptureSeams(t, data)
+		seams.anchors.failRuleSubstring = ":entry-o"
 		_, lease := newLinuxCaptureLease(t, 15006)
 		if _, err := openLinuxCapture(lease); err == nil {
 			t.Fatal("capture opened although rule installation failed")
 		}
 		executed := data.executedMessages()
-		if got := countQueueCommand(t, executed, 15006, nfqCfgCmdUnbind); got != 1 {
-			t.Fatalf("outbound rollback unbinds = %d, want 1", got)
+		if got := countQueueCommand(t, executed, 15006, nfqCfgCmdUnbind); got != 0 {
+			t.Fatalf("outq rollback unbinds = %d, want 0 (the owning socket release is the witness path)", got)
 		}
-		if got := len(rules.deletedTables()); got != 1 {
-			t.Fatalf("table deletions after failed install = %d, want 1", got)
+		if got := countQueueCommand(t, executed, uint16(0), nfqCfgCmdUnbind); got != 0 {
+			t.Fatalf("unexpected queue-0 unbind = %d", got)
 		}
 		if data.closings() != 1 {
 			t.Fatal("failed install leaked the queue connection")
 		}
 		if bound := seams.kernel.boundQueues(); len(bound) != 0 {
 			t.Fatalf("queues still bound after the failed install: %v", bound)
+		}
+		if err := readFakeAnchors(t, seams, FamilyIPv4); err != nil {
+			t.Fatalf("failed install damaged the fixed anchors: %v", err)
+		}
+		if records := fakeCaptureRecords(t, seams, FamilyIPv4); len(records) != 0 {
+			t.Fatalf("failed install left capture records: %v", records)
 		}
 	})
 }

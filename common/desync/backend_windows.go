@@ -3,13 +3,16 @@
 package desync
 
 import (
-	"crypto/sha256"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync"
+	"time"
+	"unsafe"
 
 	"github.com/sagernet/sing-box/common/windivert"
+	E "github.com/sagernet/sing/common/exceptions"
 	"golang.org/x/sys/windows"
 )
 
@@ -20,67 +23,104 @@ func NewNativeBackend() Backend { return windowsBackend{} }
 func (windowsBackend) Name() string { return "windows-windivert" }
 
 func (windowsBackend) Open(lease *Lease) (Capture, error) {
+	capture, err := openWindowsCapture(lease)
+	if capture == nil {
+		return nil, err // never return a typed-nil retained owner
+	}
+	return capture, err
+}
+
+// openWindowsCapture composes one capture's whole native lifetime: the admitted
+// lease is charged before the first native resource exists, every opened
+// handle is released only after the kernel proved device/event retirement, and
+// a partial open tears down exactly what it created.
+func openWindowsCapture(lease *Lease) (*windowsCapture, error) {
 	endpoint := lease.Endpoint()
-	outFilter, err := openCaptureFilter(lease, true)
+	// The existing admission budget is the owner of this capture. Acquiring the
+	// native hold before the first handle means a delayed retirement keeps the
+	// charged slot (MaxLeases=1 cannot admit a replacement) until the real
+	// terminal receipt, instead of a live Go reference being mistaken for
+	// admission.
+	release, err := lease.AcquireNativeHold()
 	if err != nil {
 		return nil, err
+	}
+	capture := &windowsCapture{
+		lease:       lease,
+		done:        make(chan struct{}),
+		dispatch:    newCaptureDispatchGate(),
+		releaseHold: release,
+	}
+	if err = capture.open(endpoint); err != nil {
+		// teardown closes every handle that was opened, joins nothing that was
+		// never started, and releases the hold only when retirement is proven.
+		// Preserve the same rollback owner for Lease.Close as well as its
+		// activation diagnostic. A late native receipt must reach the Lease.
+		return capture, E.Errors(err, capture.abortOpen())
+	}
+	return capture, nil
+}
+
+// open acquires every native resource before any receive loop starts. A
+// failure at any position therefore has no loop to join and no unowned
+// receiver; the unified teardown still handles every position identically.
+func (c *windowsCapture) open(endpoint Endpoint) error {
+	outFilter, err := openCaptureFilter(c.lease, true)
+	if err != nil {
+		return err
 	}
 	// The filter dump is the explicit --wf-save equivalent: it happens when
 	// the capture is actually activated, only for a configured path, and its
 	// failure is a real activation error (the operator asked for it).
-	if config := lease.Engine().Config().Capture; config.windows != nil {
+	if config := c.lease.Engine().Config().Capture; config.windows != nil {
 		if err = config.windows.writeFilterDump(endpoint); err != nil {
-			return nil, err
+			return err
 		}
 	}
-	outbound, err := windivert.Open(outFilter, windivert.LayerNetwork, 0, windivert.FlagSniff)
+	outbound, err := windivert.Open(outFilter, windivert.LayerNetwork, 0, captureDivertFlags)
 	if err != nil {
-		return nil, err
+		return c.recordRetainedOpen(err)
 	}
+	c.outbound = outbound
 	// The reply side is a second, explicitly inbound handle scoped to the
 	// reverse of the owned tuple. Direction is carried by the handle/filter and
 	// by each captured address; it is never inferred from payload shape.
-	capture := &windowsCapture{lease: lease, outbound: outbound, done: make(chan struct{}),
-		injected: make(map[[sha256.Size]byte]int)}
 	if endpoint.Destination.IsValid() {
-		inFilter, filterErr := openCaptureFilter(lease, false)
+		inFilter, filterErr := openCaptureFilter(c.lease, false)
 		if filterErr != nil {
-			outbound.Close()
-			return nil, filterErr
+			return filterErr
 		}
-		inbound, openErr := windivert.Open(inFilter, windivert.LayerNetwork, 0, windivert.FlagSniff)
+		inbound, openErr := windivert.Open(inFilter, windivert.LayerNetwork, 0, captureDivertFlags)
 		if openErr != nil {
-			outbound.Close()
-			return nil, openErr
+			return c.recordRetainedOpen(openErr)
 		}
-		capture.inbound = inbound
-	} else if endpoint.Transport != TransportUDP {
-		// A TCP listener has no peer to observe yet; an outbound-only capture
-		// is the complete ownership for it.
+		c.inbound = inbound
 	}
-	capture.wg.Add(1)
-	go capture.loop()
-	if capture.inbound != nil {
-		capture.wg.Add(1)
-		go capture.inboundLoop()
-	}
-	if lease.Engine().Config().Capture.filterTTLExpiredICMP {
-		icmpFilter, filterErr := icmpErrorFilter(lease)
+	if c.lease.Engine().Config().Capture.filterTTLExpiredICMP {
+		icmpFilter, filterErr := icmpErrorFilter(c.lease)
 		if filterErr != nil {
-			capture.closePartial()
-			return nil, filterErr
+			return filterErr
 		}
-		icmpHandle, openErr := windivert.Open(icmpFilter, windivert.LayerNetwork, 0, windivert.FlagSniff)
+		icmpHandle, openErr := windivert.Open(icmpFilter, windivert.LayerNetwork, 0, captureDivertFlags)
 		if openErr != nil {
-			capture.closePartial()
-			return nil, openErr
+			return c.recordRetainedOpen(openErr)
 		}
-		capture.icmp = icmpHandle
-		capture.wg.Add(1)
-		go capture.icmpLoop()
+		c.icmp = icmpHandle
 	}
-	return capture, nil
+	// Only now, with every handle the loops observe already owned, may a receive
+	// user start. No partial-open position can leave a loop running behind a
+	// failed activation.
+	c.startUsers()
+	return nil
 }
+
+// captureDivertFlags selects normal diverting handles: the driver hands the
+// packet to this capture and waits for exactly one terminal disposition from it.
+// FlagSniff is observation-only (the original is copied and always forwarded),
+// so it can neither hold, replace nor drop a packet and must never be used by a
+// capture that decides dispositions. FlagDrop/FlagSendOnly are equally wrong
+// here: the interceptor must decide, not the driver.
+const captureDivertFlags = windivert.Flag(0)
 
 // icmpErrorFilter builds the owned time-exceeded filter. The address narrowing
 // is used whenever the attempt's local address is concrete; otherwise the
@@ -123,7 +163,7 @@ func icmpErrorFilter(lease *Lease) (*windivert.Filter, error) {
 // openCaptureFilter builds the kernel filter for one direction. When
 // capture.windows is configured the filter is the composed envelope AND user
 // expression AND non-LAN exclusion; otherwise the plain owned envelope is
-// used, which is the pre-existing behaviour.
+// used. Both directions come from the single owned envelope builder.
 func openCaptureFilter(lease *Lease, outbound bool) (*windivert.Filter, error) {
 	endpoint := lease.Endpoint()
 	config := lease.Engine().Config().Capture
@@ -133,33 +173,11 @@ func openCaptureFilter(lease *Lease, outbound bool) (*windivert.Filter, error) {
 	return windowsFilter(endpoint, outbound)
 }
 
-func windowsFilter(endpoint Endpoint, outbound bool) (*windivert.Filter, error) {
-	if !endpoint.Source.IsValid() || endpoint.Source.Port() == 0 {
-		return nil, fmt.Errorf("desync: capture requires an owned local endpoint")
-	}
-	if endpoint.Transport == TransportUDP {
-		if endpoint.Destination.IsValid() {
-			if outbound {
-				return windivert.OutboundUDP(endpoint.Source, endpoint.Destination)
-			}
-			return windivert.InboundUDPFlow(endpoint.Destination, endpoint.Source)
-		}
-		if outbound {
-			return windivert.OutboundUDPLocalPort(endpoint.Source)
-		}
-		return nil, fmt.Errorf("desync: inbound listener capture needs a peer")
-	}
-	if endpoint.Destination.IsValid() {
-		if outbound {
-			return windivert.OutboundTCP(endpoint.Source, endpoint.Destination)
-		}
-		return windivert.InboundTCPFlow(endpoint.Destination, endpoint.Source)
-	}
-	if outbound {
-		return windivert.OutboundTCPLocalPort(endpoint.Source)
-	}
-	return nil, fmt.Errorf("desync: inbound listener capture needs a peer")
-}
+// windowsFilter is the plain (unconfigured) capture path's filter builder. It is
+// deliberately a thin alias of the shared owned envelope so the plain and
+// configured paths cannot diverge. It lives with the shared builder (not in the
+// Windows-only backend file) so the shared-builder property is testable on every
+// platform.
 
 type windowsCapture struct {
 	lease    *Lease
@@ -168,184 +186,854 @@ type windowsCapture struct {
 	// icmp is the owned time-exceeded handle. It exists only when
 	// capture.filter_ttl_expired_icmp is enabled and an actual ownership fact
 	// (local address or interface index) can bound it.
-	icmp *windivert.Handle
-	done chan struct{}
-	wg   sync.WaitGroup
+	icmp        *windivert.Handle
+	done        chan struct{}
+	wg          sync.WaitGroup
+	startOnce   sync.Once
+	receiveOnce sync.Once
+	// Outbound storage is one capture-owned bounded ledger, not one per peer.
+	// A slot stays charged across dequeue and semantic Hold until both worker
+	// nonuse and a known terminal disposition. Publication is NOT dispatch.
+	rxMu                                sync.Mutex
+	rxCond                              *sync.Cond
+	records                             [windowsReceiveRecords]windowsReceiveRecord
+	queue                               [windowsReceiveRecords]uint16
+	queueHead, queueCount               int
+	usedRecords, usedRawBytes           int
+	sequence                            uint64
+	readerDone, receiveHalt, sendUnsafe bool
+	capacityErr                         error
+	scratch                             windowsReceiveRecord
+	receiveBuffer                       []byte
+
+	// dispatch is the ordered close gate: it fences new semantic dispatch,
+	// waits for the records already being handled, and holds records captured
+	// after the fence until the lease released the older held originals.
+	dispatch *captureDispatchGate
+
+	// stopOnce records the single receive-shutdown attempt and its result. The
+	// shutdown is issued by StopReceive only after the lease paused the endpoint
+	// producers, never by the semantic quiesce.
+	stopOnce sync.Once
+	stopErr  error
+
+	// drainMu guards the receive errors that made the queue non-drained. They
+	// are diagnostics of a failed drain, never a successful end of stream.
+	drainMu     sync.Mutex
+	drainErrors [3]windowsErrorSummary
+	drained     [3]bool
+	// A terminal send error is a delivery diagnostic, not a missing safe
+	// receipt. Unknown completion still owns native buffers and forbids Close.
+	sendErrors     [2]windowsErrorSummary
+	sendIncomplete bool
+	// Optional lanes have no new FIFO; on unknown progress retain their one
+	// existing buffer/address instead of losing it when the receive user exits.
+	optionalRetained [2]windowsReceiveRecord
 
 	closeOnce sync.Once
 	closeErr  error
+	retired   bool // read only after Close's once has joined teardown
 
-	mu       sync.Mutex
-	injected map[[sha256.Size]byte]int
+	// releaseHold discharges this capture's native admission reference exactly
+	// once, only after the receive users joined and every handle's Done proved
+	// that its device and events retired.
+	releaseHold func()
+	releaseOnce sync.Once
+
+	// retainedReceipts are the retirement receipts of failed inner Opens whose
+	// native resources could not be proven released when Open returned. They
+	// are not opened handles of this capture (no receive loop, no disposition
+	// path uses them), but their device/events still exist, so this capture's
+	// admission reference must stay charged until each receipt closes.
+	retainedReceipts []<-chan struct{}
 }
 
+// captureDrainGrace bounds the caller of a failed activation rollback. The
+// Lease supplies the ordinary Close bound; neither bound grants permission to
+// cancel a retained original or retire a handle before the receive users join.
+const captureDrainGrace = 2 * time.Second
+
+const (
+	windowsReceiveRecords  = 256
+	windowsReceiveRawBytes = 8 << 20
+)
+
+var (
+	errWindowsReceiveCapacity = errors.New("desync: Windows receive staging capacity exhausted")
+	errWindowsReceiveUnproven = errors.New("desync: Windows received storage/disposition unproven")
+)
+
+// Fixed descriptors/ring: no per-record channel, goroutine or error history.
+// Full address bytes include the blank union which struct comparison ignores.
+type windowsReceiveRecord struct {
+	raw                                        []byte
+	address                                    [80]byte
+	sequence                                   uint64
+	occupied, worker, claimed, terminal, ready bool
+}
+
+type windowsErrorSummary struct {
+	first error
+	count uint64
+}
+
+func (s *windowsErrorSummary) add(err error) bool {
+	first := s.first == nil
+	if first {
+		s.first = err
+	}
+	if s.count != ^uint64(0) {
+		s.count++
+	}
+	return first
+}
+
+func (s windowsErrorSummary) err() error {
+	if s.first == nil {
+		return nil
+	}
+	return fmt.Errorf("%w (occurrences: %d)", s.first, s.count)
+}
+
+func copyWindowsAddress(dst, src *windivert.Address) {
+	*(*[80]byte)(unsafe.Pointer(dst)) = *(*[80]byte)(unsafe.Pointer(src))
+}
+
+func (c *windowsCapture) initReceive() {
+	c.receiveOnce.Do(func() {
+		c.rxCond = sync.NewCond(&c.rxMu)
+		c.receiveBuffer = make([]byte, windivert.MTUMax)
+	})
+}
+
+// Normal start and partial-open rollback use exactly the same users. Register
+// every user before launching any; nothing fallible occurs between launches.
+func (c *windowsCapture) startUsers() {
+	c.startOnce.Do(func() {
+		c.initReceive()
+		users := 0
+		if c.outbound != nil {
+			users += 2
+		}
+		if c.inbound != nil {
+			users++
+		}
+		if c.icmp != nil {
+			users++
+		}
+		c.wg.Add(users)
+		if c.outbound != nil {
+			go c.outboundWorker()
+			go c.loop()
+		}
+		if c.inbound != nil {
+			go c.inboundLoop()
+		}
+		if c.icmp != nil {
+			go c.icmpLoop()
+		}
+	})
+}
+
+// Never wait for producers/callbacks here, including the public Close's bound.
+func (c *windowsCapture) failCapture(err error) {
+	if c.lease == nil {
+		return
+	}
+	c.lease.producers.fail(err)
+	c.FenceDispatch() // also covers an Open not yet attached to its Lease
+	c.lease.startClose(err)
+}
+
+// Charge copy-in-progress before allocation. Subtraction avoids overflow;
+// invalid counters cannot admit another record. Dequeue/Hold return no credit.
+func (c *windowsCapture) reserveRecordLocked(n int) *windowsReceiveRecord {
+	if n <= 0 || n > windivert.MTUMax || c.usedRecords < 0 || c.usedRecords >= windowsReceiveRecords || c.usedRawBytes < 0 || c.usedRawBytes > windowsReceiveRawBytes || n > windowsReceiveRawBytes-c.usedRawBytes {
+		return nil
+	}
+	for i := range c.records {
+		r := &c.records[i]
+		if !r.occupied {
+			*r = windowsReceiveRecord{occupied: true, worker: true, sequence: c.sequence}
+			c.usedRecords++
+			c.usedRawBytes += n
+			return r
+		}
+	}
+	return nil
+}
+
+// In-budget this reader only receives, validates, reserves, copies and publishes.
+// Failed-mode scratch rendezvous is the explicit saturation boundary, NOT a
+// claim of losslessness for packets still below native receive.
 func (c *windowsCapture) loop() {
 	defer c.wg.Done()
 	defer close(c.done)
-	buffer := make([]byte, windivert.MTUMax)
+	c.initReceive()
+	defer func() { c.rxMu.Lock(); c.readerDone = true; c.rxCond.Broadcast(); c.rxMu.Unlock() }()
+	buffer := c.receiveBuffer
 	for {
-		length, address, err := c.outbound.Recv(buffer)
-		if err != nil {
+		c.rxMu.Lock()
+		halt := c.receiveHalt
+		exhausted := c.sequence == ^uint64(0)
+		c.rxMu.Unlock()
+		if halt {
 			return
 		}
-		packet := append([]byte(nil), buffer[:length]...)
-		if c.consumeInjected(packet) {
-			// A replacement produced by this engine must not be transformed or
-			// counted again. Re-inject it unchanged and continue.
-			_, _ = c.outbound.Send(packet, &address)
+		if exhausted {
+			c.recordDrainError("outbound", errors.New("desync: Windows receive sequence exhausted"))
+			return
+		}
+		length, address, err := c.outbound.Recv(buffer)
+		if err != nil && windivert.IsDrained(err) {
+			c.markDrained(0)
+			return
+		}
+		if err != nil || length <= 0 || length > len(buffer) {
+			// Invalid/unknown lengths never index a slice. Keep the one scratch.
+			c.rxMu.Lock()
+			c.scratch = windowsReceiveRecord{raw: buffer, occupied: true, address: *(*[80]byte)(unsafe.Pointer(&address))}
+			c.rxMu.Unlock()
+			if err == nil {
+				err = fmt.Errorf("desync: invalid Windows receive length %d", length)
+			}
+			c.recordDrainError("outbound", err)
+			return
+		}
+		c.rxMu.Lock()
+		c.sequence++ // checked before receive; only this reader advances it
+		if c.sendUnsafe {
+			c.scratch = windowsReceiveRecord{raw: buffer[:length], occupied: true, sequence: c.sequence, address: *(*[80]byte)(unsafe.Pointer(&address))}
+			c.rxMu.Unlock()
+			return
+		}
+		var record *windowsReceiveRecord
+		if c.capacityErr == nil {
+			record = c.reserveRecordLocked(length)
+		}
+		if record == nil {
+			c.scratch = windowsReceiveRecord{raw: buffer[:length], occupied: true, worker: true, ready: true, sequence: c.sequence, address: *(*[80]byte)(unsafe.Pointer(&address))}
+			first := c.capacityErr == nil
+			if first {
+				c.capacityErr = errWindowsReceiveCapacity
+				// Staging -> producer leaf is the only extra lock edge. This is
+				// admission linearization, NOT a retrospective packet credit.
+				c.lease.producers.fail(c.capacityErr)
+			}
+			c.rxCond.Broadcast()
+			c.rxMu.Unlock()
+			if first {
+				c.failCapture(errWindowsReceiveCapacity)
+			}
+			c.rxMu.Lock()
+			for c.scratch.occupied && !c.sendUnsafe {
+				c.rxCond.Wait()
+			}
+			halt = c.receiveHalt
+			c.rxMu.Unlock()
+			if halt {
+				return
+			}
 			continue
 		}
-		addressCopy := address
-		complete := func(verdict Verdict, reason string, modified []byte) {
-			// A held disposition carries its own in-place bytes; the shared
-			// lease slot is only for the immediate path below.
-			c.sendDisposition(c.outbound, packet, &addressCopy, verdict, modified)
+		c.rxMu.Unlock()
+		packet := make([]byte, length) // exact backing capacity, never append
+		copy(packet, buffer[:length])
+		addressBytes := *(*[80]byte)(unsafe.Pointer(&address))
+		c.rxMu.Lock()
+		record.raw, record.address = packet, addressBytes
+		index := uint16(0)
+		for &c.records[index] != record {
+			index++
 		}
-		verdict := c.lease.HandlePacket(packet, DirectionOutbound, func(replacement []byte) error {
-			c.rememberInjected(replacement)
-			sendAddress := address
-			materializeChecksums(&sendAddress)
-			_, err := c.outbound.Send(replacement, &sendAddress)
-			return err
-		}, complete)
-		if verdict == VerdictHold {
-			// The completer owns the terminal disposition.
-			continue
-		}
-		var modified []byte
-		if verdict == VerdictModify {
-			modified = c.lease.TakeModified(DirectionOutbound)
-		}
-		c.sendDisposition(c.outbound, packet, &address, verdict, modified)
+		c.queue[(c.queueHead+c.queueCount)%windowsReceiveRecords] = index
+		c.queueCount++
+		c.rxCond.Broadcast()
+		c.rxMu.Unlock()
 	}
 }
 
-// inboundLoop observes replies. A reply is only ever re-injected unchanged on
-// the inbound handle: it is never passed to the packet planner and never sent
-// through the outbound injection path.
+// This worker alone owns dispatch and the immediate outbound modified slot.
+// Queued publication has no dispatch count: Quiesce cannot join a tail that
+// needs AllowPassThrough, which is released only after the held drain.
+func (c *windowsCapture) outboundWorker() {
+	defer c.wg.Done()
+	for {
+		c.rxMu.Lock()
+		for c.queueCount == 0 && !c.scratch.ready && !c.readerDone && !c.sendUnsafe {
+			c.rxCond.Wait()
+		}
+		if c.sendUnsafe {
+			c.rxMu.Unlock()
+			return
+		}
+		var r *windowsReceiveRecord
+		scratch := false
+		if c.queueCount != 0 {
+			r = &c.records[c.queue[c.queueHead]]
+			c.queueHead = (c.queueHead + 1) % windowsReceiveRecords
+			c.queueCount-- // dequeue is NOT a credit
+		} else if c.scratch.ready {
+			r = &c.scratch
+			r.ready = false
+			scratch = true
+		} else {
+			c.rxMu.Unlock()
+			return
+		}
+		sequence := r.sequence
+		c.rxMu.Unlock()
+		if scratch || !c.dispatch.beginDispatch() {
+			c.dispatch.awaitPassThrough()
+			c.disposeRecord(r, sequence, VerdictPass, nil)
+		} else {
+			verdict, modified, held := c.handleOutboundRecord(r, sequence)
+			c.dispatch.endDispatch()
+			if !held {
+				preFence := c.dispatch.beginSend()
+				if !preFence {
+					c.dispatch.awaitPassThrough()
+				}
+				c.disposeRecord(r, sequence, verdict, modified)
+				if preFence {
+					c.dispatch.endSend()
+				}
+			}
+		}
+		c.finishRecord(r, sequence, false, true)
+	}
+}
+
+// A worker pin covers synchronous completion-before-Hold-return. Sequence
+// validation rejects stale callbacks after reuse; both transitions are idempotent.
+func (c *windowsCapture) finishRecord(r *windowsReceiveRecord, sequence uint64, terminal, workerDone bool) {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	if !r.occupied || r.sequence != sequence {
+		return
+	}
+	r.terminal = r.terminal || terminal
+	if workerDone {
+		r.worker = false
+	}
+	if !r.terminal || r.worker {
+		return
+	}
+	if r != &c.scratch {
+		c.usedRecords--
+		c.usedRawBytes -= cap(r.raw)
+	}
+	*r = windowsReceiveRecord{}
+	c.rxCond.Broadcast()
+}
+
+func (c *windowsCapture) disposeRecord(r *windowsReceiveRecord, sequence uint64, verdict Verdict, modified []byte) {
+	c.rxMu.Lock()
+	if !r.occupied || r.sequence != sequence || r.claimed || c.sendUnsafe {
+		c.rxMu.Unlock()
+		return
+	}
+	r.claimed = true
+	c.rxMu.Unlock()
+	var address windivert.Address
+	*(*[80]byte)(unsafe.Pointer(&address)) = r.address
+	err := c.sendDisposition(c.outbound, r.raw, &address, verdict, modified)
+	if err != nil {
+		c.recordSendError(err)
+	}
+	c.finishRecord(r, sequence, !errors.Is(err, errCaptureSendIncomplete), false)
+}
+
+func (c *windowsCapture) handleOutboundRecord(r *windowsReceiveRecord, sequence uint64) (verdict Verdict, modified []byte, held bool) {
+	complete := func(verdict Verdict, _ string, modified []byte) { c.disposeRecord(r, sequence, verdict, modified) }
+	verdict = c.lease.HandlePacket(r.raw, DirectionOutbound, func(replacement []byte) error {
+		c.rxMu.Lock()
+		usable := r.occupied && r.sequence == sequence && !c.sendUnsafe
+		c.rxMu.Unlock()
+		if !usable {
+			return errCaptureSendIncomplete
+		}
+		var address windivert.Address
+		*(*[80]byte)(unsafe.Pointer(&address)) = r.address
+		suppliedChecksums(&address)
+		err := sendCaptured(c.outbound, replacement, &address)
+		if err != nil {
+			c.recordSendError(err)
+		}
+		return err
+	}, complete)
+	if verdict == VerdictHold {
+		return verdict, nil, true
+	}
+	if verdict == VerdictModify {
+		modified = c.lease.TakeModified(DirectionOutbound)
+	}
+	return verdict, modified, false
+}
+
+// inboundLoop observes replies. Inbound records never reach the outbound
+// planner: a reply is re-injected once on the inbound handle, with its captured
+// direction, interface and offload metadata preserved. In-place reply
+// transformations (window rewrite) replace the bytes and are therefore
+// re-checksummed.
 func (c *windowsCapture) inboundLoop() {
 	defer c.wg.Done()
 	buffer := make([]byte, windivert.MTUMax)
 	for {
+		if c.receivesHalted() {
+			return
+		}
 		length, address, err := c.inbound.Recv(buffer)
-		if err != nil {
+		if err != nil && windivert.IsDrained(err) {
+			c.markDrained(1)
+			return
+		}
+		if err != nil || length <= 0 || length > len(buffer) {
+			c.retainOptional(0, buffer, &address)
+			if err == nil {
+				err = fmt.Errorf("desync: invalid inbound receive length %d", length)
+			}
+			c.recordDrainError("inbound", err)
 			return
 		}
 		packet := append([]byte(nil), buffer[:length]...)
-		_ = c.lease.HandlePacket(packet, DirectionInbound, nil, nil)
-		// In-place reply transformations (window rewrite) are delivered on the
-		// same inbound handle with the original direction/IfIdx preserved.
+		var sendAddress windivert.Address
+		copyWindowsAddress(&sendAddress, &address)
+		if c.sendsUnsafe() {
+			c.retainOptional(0, packet, &address)
+			return
+		}
+		if c.dispatch.beginDispatch() {
+			// Inbound verdicts are Pass/Modify only; a reply is never replanned
+			// on the outbound path.
+			_ = c.lease.HandlePacket(packet, DirectionInbound, nil, nil)
+			c.dispatch.endDispatch()
+		} else {
+			// A quiesced capture only forwards already-captured traffic, and
+			// only after the lease released the held originals of earlier
+			// captures.
+			c.dispatch.awaitPassThrough()
+		}
 		sendPacket := packet
-		if modified := c.lease.TakeModified(DirectionInbound); modified != nil {
-			sendPacket = modified
+		if replacement := c.lease.TakeModified(DirectionInbound); replacement != nil {
+			sendPacket = replacement
+			recomputeChecksums(&sendAddress)
 		}
-		sendAddress := address
-		materializeChecksums(&sendAddress)
-		_, _ = c.inbound.Send(sendPacket, &sendAddress)
-	}
-}
-
-func (c *windowsCapture) sendDisposition(handle *windivert.Handle, packet []byte, address *windivert.Address, verdict Verdict, modified []byte) {
-	if verdict == VerdictDrop {
-		return
-	}
-	if verdict == VerdictModify && len(modified) > 0 {
-		packet = modified
-	}
-	sendAddress := *address
-	materializeChecksums(&sendAddress)
-	_, _ = handle.Send(packet, &sendAddress)
-}
-
-// materializeChecksums clears the checksum-valid metadata so the driver
-// recomputes IPv4/TCP/UDP checksums from the bytes actually sent. Captured
-// originals may come from a checksum-offload path where the on-wire checksum was
-// not materialized, and replacements have rewritten headers. Fragmented
-// originals are never parsed or rewritten (ParsePacket rejects them), so this
-// never runs on a fragment.
-func materializeChecksums(address *windivert.Address) {
-	address.SetIPChecksum(false)
-	address.SetTCPChecksum(false)
-	address.SetUDPChecksum(false)
-}
-
-func (c *windowsCapture) rememberInjected(packet []byte) {
-	digest := sha256.Sum256(packet)
-	c.mu.Lock()
-	if len(c.injected) >= 256 {
-		for key := range c.injected {
-			delete(c.injected, key)
-			break
+		if err = sendCaptured(c.inbound, sendPacket, &sendAddress); err != nil {
+			c.recordSendError(err)
+			if errors.Is(err, errCaptureSendIncomplete) {
+				c.retainOptional(0, packet, &address)
+				return
+			}
 		}
 	}
-	c.injected[digest]++
-	c.mu.Unlock()
 }
 
-func (c *windowsCapture) consumeInjected(packet []byte) bool {
-	digest := sha256.Sum256(packet)
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	count, loaded := c.injected[digest]
-	if !loaded {
-		return false
+// sendDisposition applies the one terminal disposition of a captured outbound
+// record. A pass re-injects the original exactly once; a modify re-injects
+// exactly one modified packet and never the unmodified original; a drop sends
+// nothing. Hold is not a disposition here: the stored completer performs the
+// terminal send later.
+func (c *windowsCapture) sendDisposition(handle *windivert.Handle, packet []byte, address *windivert.Address, verdict Verdict, modified []byte) error {
+	switch verdict {
+	case VerdictDrop, VerdictHold:
+		return nil
+	case VerdictModify:
+		if len(modified) > 0 {
+			var sendAddress windivert.Address
+			copyWindowsAddress(&sendAddress, address)
+			recomputeChecksums(&sendAddress)
+			return sendCaptured(handle, modified, &sendAddress)
+		}
 	}
-	if count <= 1 {
-		delete(c.injected, digest)
-	} else {
-		c.injected[digest] = count - 1
+	return sendCaptured(handle, packet, address)
+}
+
+var errCaptureSendIncomplete = errors.New("desync: capture send completion unproven")
+
+// sendCaptured submits one packet and requires a complete native receipt. A
+// short write is not a stream prefix to retry; it is a visible failure.
+func sendCaptured(handle *windivert.Handle, packet []byte, address *windivert.Address) error {
+	n, err := handle.Send(packet, address)
+	if n < 0 {
+		// The wrapper's unknown-progress result is not a terminal failed send.
+		return E.Errors(errCaptureSendIncomplete, err)
 	}
-	return true
+	if err != nil {
+		return fmt.Errorf("desync: windivert reinjection of %d bytes failed: %w", len(packet), err)
+	}
+	if n != len(packet) {
+		return fmt.Errorf("desync: windivert reinjection wrote %d of %d bytes", n, len(packet))
+	}
+	return nil
 }
 
 // icmpLoop observes the owned time-exceeded capture. A validated owned low-hop
-// error is dropped (never re-injected); every other error — foreign tuple,
-// malformed/truncated quote, reply-side quote, parameter-problem — is passed
-// unchanged. It never reaches the packet planner.
+// error is dropped (never re-injected); every other error - foreign tuple,
+// malformed/truncated quote, reply-side quote, parameter-problem - is passed
+// unchanged exactly once. It never reaches the packet planner.
 func (c *windowsCapture) icmpLoop() {
 	defer c.wg.Done()
 	buffer := make([]byte, windivert.MTUMax)
 	for {
+		if c.receivesHalted() {
+			return
+		}
 		length, address, err := c.icmp.Recv(buffer)
-		if err != nil {
+		if err != nil && windivert.IsDrained(err) {
+			c.markDrained(2)
+			return
+		}
+		if err != nil || length <= 0 || length > len(buffer) {
+			c.retainOptional(1, buffer, &address)
+			if err == nil {
+				err = fmt.Errorf("desync: invalid ICMP receive length %d", length)
+			}
+			c.recordDrainError("icmp", err)
 			return
 		}
 		packet := append([]byte(nil), buffer[:length]...)
-		if c.lease.HandleICMPTimeExceeded(packet) {
+		if c.sendsUnsafe() {
+			c.retainOptional(1, packet, &address)
+			return
+		}
+		preFence := false
+		if c.dispatch.beginDispatch() {
+			suppressed := c.lease.HandleICMPTimeExceeded(packet)
+			c.dispatch.endDispatch()
+			if suppressed {
+				// Suppressing the validated owned error is its terminal
+				// disposition.
+				continue
+			}
+			preFence = c.dispatch.beginSend()
+			if !preFence {
+				c.dispatch.awaitPassThrough()
+			}
+		} else {
+			c.dispatch.awaitPassThrough()
+		}
+		var sendAddress windivert.Address
+		copyWindowsAddress(&sendAddress, &address)
+		if err = sendCaptured(c.icmp, packet, &sendAddress); err != nil {
+			c.recordSendError(err)
+		}
+		if preFence {
+			c.dispatch.endSend()
+		}
+		if errors.Is(err, errCaptureSendIncomplete) {
+			c.retainOptional(1, packet, &address)
+			return
+		}
+	}
+}
+
+func (c *windowsCapture) receivesHalted() bool {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	return c.receiveHalt
+}
+
+func (c *windowsCapture) sendsUnsafe() bool {
+	c.rxMu.Lock()
+	defer c.rxMu.Unlock()
+	return c.sendUnsafe
+}
+
+func (c *windowsCapture) retainOptional(index int, raw []byte, address *windivert.Address) {
+	c.drainMu.Lock()
+	c.optionalRetained[index] = windowsReceiveRecord{raw: raw, occupied: true, address: *(*[80]byte)(unsafe.Pointer(address))}
+	c.drainMu.Unlock()
+}
+
+// FenceDispatch publishes the ordered-close fence without waiting for the
+// records already inside the engine or shutting the driver receives down. The
+// lease calls it while publishing its own closed flag, so no record can take the
+// closed-lease fast-pass and still be sent before the held originals are
+// flushed. Quiesce performs the same publication plus the ordered wait, so the
+// two can be called in either order.
+func (c *windowsCapture) FenceDispatch() {
+	c.dispatch.fence()
+}
+
+// Quiesce fences new dispositions and waits for the records already inside the
+// engine. It deliberately performs NO driver call: the carried D§4.2 order puts
+// semantic quiesce before the held drain, and the receive shutdown
+// (ShutdownRecv) only after the producers are paused. A quiesce that stopped
+// receives here would let a post-fence caller write overtake the older held
+// original - the demonstrated F2 failure.
+func (c *windowsCapture) Quiesce() error {
+	c.dispatch.quiesce()
+	return nil
+}
+
+// StopReceive performs the once-only receive shutdown on every opened handle.
+// It is called after the producer pause, so no new covered socket operation can
+// exploit the bypass it enables. The inbound reply handle and the TTL-expired
+// ICMP handle are optional: they are opened only when the owned endpoint and
+// the configuration require them, so their slots are legitimately nil and own
+// neither a receive user nor a device. Every handle that was actually opened is
+// still shut down and its error still reported. The call is idempotent - a
+// second call (Close runs it again) neither re-issues the shutdown ioctl nor
+// changes the recorded result.
+func (c *windowsCapture) StopReceive() error {
+	c.stopOnce.Do(func() {
+		var errs []error
+		for _, handle := range c.handles() {
+			if handle == nil {
+				continue
+			}
+			if err := handle.ShutdownRecv(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		c.stopErr = E.Errors(errs...)
+		c.lease.ReportNativeFailure(c.stopErr)
+		if c.stopErr != nil {
+			c.failCapture(c.stopErr)
+		}
+	})
+	return c.stopErr
+}
+
+// AllowPassThrough releases records captured after the fence. The lease calls it
+// after it flushed the held originals of earlier captures, so those records can
+// no longer overtake held data on the wire. It is idempotent.
+func (c *windowsCapture) AllowPassThrough() {
+	c.dispatch.allowPassThrough()
+}
+
+func (c *windowsCapture) handles() []*windivert.Handle {
+	return []*windivert.Handle{c.outbound, c.inbound, c.icmp}
+}
+
+// recordDrainError keeps a receive failure visible even after the fence: it
+// means the queue was not proven drained, so Close must not report a successful
+// lossless shutdown.
+func (c *windowsCapture) recordDrainError(direction string, err error) {
+	index := 0
+	if direction == "inbound" {
+		index = 1
+	} else if direction == "icmp" {
+		index = 2
+	}
+	wrapped := fmt.Errorf("desync: windows %s capture receive: %w", direction, err)
+	c.drainMu.Lock()
+	first := c.drainErrors[index].add(wrapped)
+	c.drainMu.Unlock()
+	c.rxMu.Lock()
+	c.receiveHalt = true
+	if c.rxCond != nil {
+		c.rxCond.Broadcast()
+	}
+	c.rxMu.Unlock()
+	if first {
+		c.lease.ReportNativeFailure(wrapped)
+		c.failCapture(wrapped)
+	}
+}
+
+func (c *windowsCapture) markDrained(index int) {
+	c.drainMu.Lock()
+	c.drained[index] = true
+	c.drainMu.Unlock()
+}
+
+func (c *windowsCapture) recordSendError(err error) {
+	unknown := errors.Is(err, errCaptureSendIncomplete)
+	index := 0
+	if unknown {
+		index = 1
+	}
+	c.drainMu.Lock()
+	first := c.sendErrors[index].add(err)
+	c.sendIncomplete = c.sendIncomplete || unknown
+	c.drainMu.Unlock()
+	if unknown {
+		c.rxMu.Lock()
+		c.sendUnsafe, c.receiveHalt = true, true
+		if c.rxCond != nil {
+			c.rxCond.Broadcast()
+		}
+		c.rxMu.Unlock()
+	}
+	// One report per fixed category, never an ever-growing per-send error list.
+	if first {
+		c.lease.ReportNativeFailure(err)
+	}
+	if unknown {
+		c.failCapture(err)
+	}
+}
+
+// captureRetirementError separates the safety receipt from delivery/Close
+// diagnostics. Called only after Close joined the one teardown owner.
+func (c *windowsCapture) captureRetirementError() error {
+	if c.retired {
+		return nil
+	}
+	return c.closeErr
+}
+
+// releaseNative discharges the capture's admission reference exactly once.
+func (c *windowsCapture) releaseNative() {
+	c.releaseOnce.Do(func() {
+		if c.releaseHold != nil {
+			c.releaseHold()
+		}
+	})
+}
+
+// recordRetainedOpen keeps the cleanup ownership of a failed inner Open. When
+// windivert.Open could not prove that the resources it acquired were released,
+// its error carries the handle's retirement receipt; storing it here is what
+// makes the original admission charge stay charged, because teardown discharges
+// that charge only after every receipt closed. An ordinary activation failure
+// (no receipt) changes nothing: its rollback already completed.
+func (c *windowsCapture) recordRetainedOpen(err error) error {
+	if receipt, retained := windivert.RetainedRetirement(err); retained {
+		c.retainedReceipts = append(c.retainedReceipts, receipt)
+	}
+	return err
+}
+
+// retirementReceipts returns every receipt this capture must await before its
+// admission reference may be discharged: the opened handles' Done channels plus
+// the retained receipts of failed inner Opens.
+func (c *windowsCapture) retirementReceipts() []<-chan struct{} {
+	receipts := make([]<-chan struct{}, 0, 3+len(c.retainedReceipts))
+	for _, handle := range c.handles() {
+		if handle == nil {
 			continue
 		}
-		sendAddress := address
-		materializeChecksums(&sendAddress)
-		_, _ = c.icmp.Send(packet, &sendAddress)
+		receipts = append(receipts, handle.Done())
+	}
+	receipts = append(receipts, c.retainedReceipts...)
+	return receipts
+}
+
+// releaseWhenRetired keeps the native ownership charged until the kernel proves
+// that the receive users stopped and every device/event retired. It is the
+// late-retirement bridge for a caller that hit its bound before that proof; it
+// never frees anything and never reuses a handle number.
+func (c *windowsCapture) releaseWhenRetired(loopsDone <-chan struct{}) {
+	<-loopsDone
+	for _, receipt := range c.retirementReceipts() {
+		<-receipt
+	}
+	c.releaseNative()
+}
+
+// teardown is the one capture destruction path, used both by Close and by a
+// failed open. It fences dispatch, stops receives, forwards queued records,
+// joins every started receive user, closes each opened handle and releases the
+// admission reference only when loops and the handles' Done both prove
+// retirement.
+func (c *windowsCapture) teardown() error {
+	var errs []error
+	if err := c.Quiesce(); err != nil {
+		errs = append(errs, err)
+	}
+	// No semantic users exist in a partial-open rollback. Opened diverting
+	// handles nevertheless need real readers and ERROR_NO_DATA, not wg==0.
+	c.AllowPassThrough()
+	c.startUsers()
+	if err := c.StopReceive(); err != nil {
+		errs = append(errs, err)
+	}
+	// A direct capture close has no lease-ordered held flush to wait for; the
+	// lease path has already released the gate before calling Close.
+	c.AllowPassThrough()
+	// Lease.Close already bounds its caller. This single teardown owner keeps
+	// the copied tail and its native hold alive for however long actual drain
+	// takes. Handle.Close cancels I/O: it is not a drain timeout fallback.
+	c.wg.Wait()
+	loopsDone := make(chan struct{})
+	close(loopsDone)
+	c.drainMu.Lock()
+	incomplete := c.sendIncomplete
+	for index, summary := range c.drainErrors {
+		errs = append(errs, summary.err())
+		if summary.first != nil || (c.handles()[index] != nil && !c.drained[index]) {
+			incomplete = true
+		}
+	}
+	for _, summary := range c.sendErrors {
+		errs = append(errs, summary.err())
+	}
+	c.drainMu.Unlock()
+	c.rxMu.Lock()
+	errs = append(errs, c.capacityErr)
+	incomplete = incomplete || c.usedRecords != 0 || c.usedRawBytes != 0 || c.scratch.occupied
+	c.rxMu.Unlock()
+	if c.stopErr != nil || incomplete {
+		// Receive-user exit is not ERROR_NO_DATA, and a failed completion query
+		// is not terminal disposition. Closing here could discard originals.
+		// No retry or fabricated late success: keep the same capture charge.
+		return E.Errors(append(errs, errWindowsReceiveUnproven)...)
+	}
+	for _, handle := range c.handles() {
+		if handle == nil {
+			continue
+		}
+		if err := handle.Close(); err != nil {
+			errs = append(errs, err)
+			c.lease.ReportNativeFailure(err)
+		}
+	}
+	// Done, not Close's return/error, is the native retirement receipt. Keep
+	// this same owner waiting for late retirement; the Lease caller is bounded
+	// independently and no second cleanup service or retry is needed.
+	c.releaseWhenRetired(loopsDone)
+	c.retired = true
+	return E.Errors(errs...)
+}
+
+// handlesRetired waits inside one bound for every opened handle's Done. Done is
+// closed only after the device and events were actually released, so a failed
+// CloseHandle attempt leaves it open and this reports false. A failed inner Open
+// that retained its cleanup keeps the same charge: its receipt is part of the
+// same proof, so an invisible hidden device can no longer be discharged early.
+func (c *windowsCapture) handlesRetired(grace time.Duration) bool {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	for _, receipt := range c.retirementReceipts() {
+		select {
+		case <-receipt:
+		case <-timer.C:
+			return false
+		}
+	}
+	return true
+}
+
+// abortOpen destroys the resources of an activation that never became visible
+// to the lease. It uses the same teardown path, so a partially opened capture
+// joins whatever loops started (none in the current open order), closes each
+// opened handle and releases the admission reference only after retirement.
+func (c *windowsCapture) abortOpen() error {
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	timer := time.NewTimer(captureDrainGrace)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf("desync: windows activation rollback still owns native resources: %w", ErrLeaseCloseIncomplete)
 	}
 }
 
-// closePartial releases the handles opened before a later activation failure.
-func (c *windowsCapture) closePartial() {
-	_ = c.outbound.Close()
-	if c.inbound != nil {
-		_ = c.inbound.Close()
-	}
-	if c.icmp != nil {
-		_ = c.icmp.Close()
-	}
-}
-
+// Close runs the capture phase order: fence and stop new receive enqueues, let
+// the receive loops deliver every already-queued record as pass-through, join
+// them, then retire the handles only after their proven terminal retirement. A
+// caller is bounded by Lease.Close (abortOpen bounds failed activation). This
+// teardown itself keeps waiting for actual drain/retirement; elapsed time is
+// never permission to cancel an original. Diagnostics and the safe receipt
+// remain separate, and the native reference stays charged until proven safe.
 func (c *windowsCapture) Close() error {
 	c.closeOnce.Do(func() {
-		err := c.outbound.Close()
-		if c.inbound != nil {
-			if inboundErr := c.inbound.Close(); err == nil {
-				err = inboundErr
-			}
-		}
-		if c.icmp != nil {
-			if icmpErr := c.icmp.Close(); err == nil {
-				err = icmpErr
-			}
-		}
-		c.wg.Wait()
-		c.closeErr = err
+		c.closeErr = c.teardown()
 	})
 	return c.closeErr
 }

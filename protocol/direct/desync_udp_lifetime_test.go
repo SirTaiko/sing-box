@@ -427,6 +427,9 @@ func TestPacketUDPReturnedCloseRetiresPeerState(t *testing.T) {
 		Network: []string{"udp"},
 		Port:    []uint16{9999},
 		Methods: []string{"fake"},
+		// The probe payload is unclassified, so the fixture carries the
+		// explicit desync_any_proto permission (contract §5 / F3).
+		AnyProtocol: true,
 		Fake: &option.DirectDesyncFakeOptions{
 			Repeats:  1,
 			Payloads: []option.DirectDesyncPayload{{Protocol: "unknown", Hex: "0001"}},

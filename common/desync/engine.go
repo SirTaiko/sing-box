@@ -497,11 +497,13 @@ func (e *Engine) NewAttempt(intent Intent) (*Lease, error) {
 		return nil, admissionRefused(fmt.Errorf("desync: active lease limit reached (%d)", e.limits.MaxLeases))
 	}
 	lease := &Lease{
-		engine:     e,
-		intent:     intent,
-		closeDone:  make(chan struct{}),
-		udpFlows:   make(map[string]*flowState),
-		generation: leaseGenerations.Add(1),
+		engine:         e,
+		intent:         intent,
+		closeDone:      make(chan struct{}),
+		udpFlows:       make(map[string]*flowState),
+		generation:     leaseGenerations.Add(1),
+		producers:      newEndpointProducerGate(),
+		captureRetired: make(chan struct{}),
 	}
 	if intent.Transport == TransportTCP {
 		lease.tcpFlow = newFlowState(e.limits, &e.heldBytes, e.currentTime)
@@ -538,11 +540,11 @@ func (e *Engine) releaseNativeHold(lease *Lease) {
 // finished. The charged slot is removed here only when no native reference
 // still owns resources of this attempt; otherwise the lease remains a charged
 // tombstone whose own release callback performs the final removal.
-func (e *Engine) finishLeaseTeardown(lease *Lease) {
+func (e *Engine) finishLeaseTeardown(lease *Lease, retained bool) {
 	e.mu.Lock()
 	lease.teardownDone = true
 	e.retireLeasePeerStateLocked(lease)
-	if lease.nativeHolds == 0 && !lease.retired {
+	if lease.nativeHolds == 0 && !lease.retired && !retained {
 		lease.retired = true
 		delete(e.leases, lease)
 	}
@@ -609,11 +611,16 @@ type Lease struct {
 	engine *Engine
 	intent Intent
 
-	mu                sync.Mutex
-	closed            bool
-	closedFlag        atomic.Bool
-	closeDone         chan struct{}
-	capture           Capture
+	mu         sync.Mutex
+	closed     bool
+	closedFlag atomic.Bool
+	closeDone  chan struct{}
+	closeErr   error
+	capture    Capture
+	// An in-flight activation owns native effects even before capture is
+	// published. Close joins it before issuing any no-capture safe receipt.
+	captureOpening    chan struct{}
+	captureOpenErr    error
 	local             netip.AddrPort
 	tcpFlow           *flowState
 	udpFlows          map[string]*flowState
@@ -665,6 +672,22 @@ type Lease struct {
 	// teardownDone reports that capture/flow teardown finished. The charged
 	// entry is removed only when this is true and nativeHolds is zero.
 	teardownDone bool
+	// producers is the endpoint socket-production gate of this attempt. It is
+	// the real barrier the caller's connected UDP Write, listener WriteTo and
+	// cached RawConn.Write pass through; the semantic dispatch gate cannot
+	// cover a caller syscall. It is a leaf lock: no Engine/Lease/flow lock is
+	// held while it waits.
+	producers *endpointProducerGate
+	// captureRetired is the positive capture-safe receipt of this attempt. It
+	// is closed exactly once at the end of teardown with the retirement result:
+	// nil only when the native capture proved device/event retirement. Endpoint
+	// release waits for this receipt; an error alone does not open it.
+	captureRetired     chan struct{}
+	captureRetiredOnce sync.Once
+	captureRetiredErr  error
+	// One returned wrapper's actual endpoint stays rooted after final unsafe
+	// retirement. Guarded by mu; never invoked without positive safety.
+	retainedEndpoint func() error
 	// retired reports that the map entry was already removed exactly once.
 	retired bool
 }
@@ -840,15 +863,29 @@ func (l *Lease) Endpoint() Endpoint {
 // connect/send.
 func (l *Lease) StartCapture() error {
 	l.mu.Lock()
+	if opening := l.captureOpening; opening != nil {
+		l.mu.Unlock()
+		<-opening
+		return l.StartCapture()
+	}
 	if l.closed {
 		l.mu.Unlock()
 		return errLeaseClosed
 	}
 	if l.capture != nil {
+		err := l.captureOpenErr
 		l.mu.Unlock()
-		return nil
+		return err
 	}
+	l.captureOpening = make(chan struct{})
+	opening := l.captureOpening
 	l.mu.Unlock()
+	defer func() {
+		l.mu.Lock()
+		l.captureOpening = nil
+		close(opening)
+		l.mu.Unlock()
+	}()
 	// The portable capture selector is enforced before any native resource is
 	// acquired, for every backend (test seams included). It can only narrow
 	// the owned envelope: an excluding selector is a configuration error.
@@ -869,16 +906,25 @@ func (l *Lease) StartCapture() error {
 	}
 	capture, err := l.engine.backend.Open(l)
 	if err != nil {
-		return fmt.Errorf("desync: open %s capture: %w", l.engine.backend.Name(), err)
+		err = fmt.Errorf("desync: open %s capture: %w", l.engine.backend.Name(), err)
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		capture.Close()
-		return errLeaseClosed
-	}
+	// A failed Open may return its retained rollback owner as well as an
+	// error. Keep it for the same teardown instead of losing its safe receipt
+	// behind an activation error. No failed capture becomes usable.
 	l.capture = capture
-	return nil
+	l.captureOpenErr = err
+	if l.closed {
+		if fencer, ok := capture.(interface{ FenceDispatch() }); ok {
+			fencer.FenceDispatch()
+		}
+		l.mu.Unlock()
+		// The existing Close owner is waiting on opening. It, not this
+		// activation goroutine, performs the ordered drain and retirement.
+		return E.Errors(errLeaseClosed, err)
+	}
+	l.mu.Unlock()
+	return err
 }
 
 // PrepareSocket establishes the exclusive local port and capture ownership from
@@ -927,6 +973,7 @@ func (l *Lease) acquireUDPFlow(packet *Packet) (*flowState, bool) {
 			engine.udpPeerConstruct()
 		}
 		flow = newFlowState(engine.limits, &engine.heldBytes, engine.currentTime)
+		flow.udpFlow = true
 		flow.closed = &l.closedFlag
 		flow.attachEngineState(engine.conntrack, engine.ipcache, engine.learning, l.peerIntent(packet))
 		l.udpFlows[key] = flow
@@ -1092,8 +1139,24 @@ func (l *Lease) HandlePacket(raw []byte, direction Direction, inject Injector, c
 		return VerdictPass
 	}
 	defer l.releaseUDPUser()
-	batch, err := flow.handleUDP(l.engine.Config(), packet)
-	if err != nil || batch == nil {
+	verdict, batch, err := flow.handleUDP(l.engine.Config(), packet, inject, complete)
+	if verdict == VerdictHold {
+		// The completer owns this captured record's single terminal
+		// disposition. A replay diagnostic is recorded here, after the flow
+		// lock was released, and never becomes a second Pass for a record that
+		// is already owned.
+		if err != nil {
+			l.failFlow(packet, err)
+		}
+		return VerdictHold
+	}
+	if err != nil {
+		// A terminal planning failure stops transforming this flow and fails
+		// open: the caller delivers the captured datagram unchanged.
+		l.failFlow(packet, err)
+		return VerdictPass
+	}
+	if batch == nil {
 		return VerdictPass
 	}
 	for index, replacement := range batch.Packets {
@@ -1141,8 +1204,16 @@ func (l *Lease) failFlow(packet *Packet, err error) {
 
 func (l *Lease) Err() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.failed
+	err := l.failed
+	l.mu.Unlock()
+	return E.Errors(err, l.endpointFailure())
+}
+
+func (l *Lease) endpointFailure() error {
+	if l == nil || l.producers == nil {
+		return nil
+	}
+	return l.producers.err()
 }
 
 // ReportNativeFailure records one native-retirement failure of a retained
@@ -1201,13 +1272,122 @@ func (l *Lease) AcquireNativeHold() (func(), error) {
 	}, nil
 }
 
+// leaseCloseGrace bounds the whole caller-visible close of one lease: the
+// capture fence (including the records already inside the engine), the held
+// completions, the receive join and the native retirement. A close that cannot
+// reach retirement inside it reports a non-success result, keeps the native
+// ownership charged, and finishes the teardown in the background.
+const leaseCloseGrace = 2 * time.Second
+
+// BeginEndpointWrite enters one real socket-production operation of this
+// attempt. The returned end must run on the actual terminal return of that
+// operation (success or error); it is idempotent. Admission blocks while the
+// capture is pausing its producers but never fails merely because the semantic
+// lease closed: the post-fence original is still a legitimate caller write.
+//
+// The gate carries synchronization metadata only. It stores no payload, adds no
+// native hold and never copies the caller's bytes, so it cannot become an
+// admission budget or a packet queue.
+func (l *Lease) BeginEndpointWrite() (func(), error) {
+	if l == nil || l.producers == nil {
+		return func() {}, nil
+	}
+	return l.producers.begin()
+}
+
+// pauseEndpointWrites publishes the producer pause and waits for every already
+// admitted endpoint operation to reach its terminal return. The caller must
+// hold no Engine/Lease/flow lock across it; teardown calls it exactly where the
+// capture is about to stop its receive path.
+func (l *Lease) pauseEndpointWrites() *endpointProducerToken {
+	if l == nil || l.producers == nil {
+		return nil
+	}
+	return l.producers.pause()
+}
+
+// resumeEndpointWrites releases the producer pause. It is only called after the
+// positive capture-retired receipt, so a writer that waited out the pause runs
+// its real socket operation on the still-owned endpoint instead of failing.
+func (l *Lease) resumeEndpointWrites(token *endpointProducerToken) {
+	if l == nil || l.producers == nil {
+		return
+	}
+	l.producers.resume(token)
+}
+
+// publishCaptureRetired records the one positive capture-safe receipt of this
+// attempt. A nil result means the native capture proved its retirement; an
+// error is a real teardown failure and stays visible to WaitCaptureRetired.
+func (l *Lease) publishCaptureRetired(err error) {
+	if l == nil || l.captureRetired == nil {
+		return
+	}
+	l.captureRetiredOnce.Do(func() {
+		l.captureRetiredErr = err
+		close(l.captureRetired)
+	})
+}
+
+// WaitCaptureRetired is the positive capture-safe receipt. It returns nil only
+// when the capture's native retirement was proved. An endpoint owner releases
+// the exclusive endpoint after this receipt and not before: an error result (or
+// a still-running teardown) keeps the endpoint owned rather than detaching it
+// on the strength of an error alone. A stream-only or capture-less attempt
+// publishes the receipt immediately at teardown.
+func (l *Lease) WaitCaptureRetired() error {
+	if l == nil {
+		return nil
+	}
+	if l.captureRetired != nil {
+		<-l.captureRetired
+	}
+	return l.captureRetiredErr
+}
+
+// ReleaseEndpoint is the existing endpoint owner's final close step. It is
+// separate from Lease.Close: a raw lease retirement must leave its caller's
+// socket open and resume pending writes. Only an owner actually releasing that
+// socket calls this after Close; admitted bypass operations finish first.
+// The caller owns exactly-once invocation of endpoint (the direct wrappers do).
+func (l *Lease) ReleaseEndpoint(endpoint func() error) error {
+	if err := l.WaitCaptureRetired(); err != nil {
+		l.mu.Lock()
+		if l.retainedEndpoint == nil {
+			l.retainedEndpoint = endpoint
+		}
+		l.mu.Unlock()
+		return err
+	}
+	if l != nil && l.producers != nil {
+		l.producers.closeAndWait()
+	}
+	return endpoint()
+}
+
+// ErrLeaseCloseIncomplete marks the bounded non-success result of a lease close
+// that could not prove its teardown inside leaseCloseGrace. The teardown keeps
+// running under the retained native ownership; the endpoint owner must not treat
+// this result as a completed fence, and must keep the native endpoint together
+// with the capture until WaitClosed reports the teardown. It is a sentinel so an
+// owner can distinguish "not proven yet" from a real teardown failure without
+// parsing text.
+var ErrLeaseCloseIncomplete = E.New("desync: lease close did not prove its teardown within the caller bound")
+
 // Close is idempotent and available immediately after the first side effect.
 // Held originals are released in capture order before the native registration
-// is torn down, so teardown never silently drops buffered user data. A
-// concurrent second Close waits for the first teardown to finish, so a
-// concurrent Engine.Close cannot report completion while native resources of
-// this lease are still being released.
+// is torn down, so teardown never silently drops buffered user data. The caller
+// bound covers the entire path, including the synchronous fence and the held
+// completions; when it expires the teardown keeps running under the retained
+// native ownership instead of being reported as complete.
 func (l *Lease) Close(reason error) error {
+	return l.waitClose(l.startClose(reason))
+}
+
+// startClose publishes the existing once-owned teardown without waiting. A
+// native reader may enter it without joining held callbacks or active writers,
+// including while StartCapture is still attaching this capture.
+func (l *Lease) startClose(reason error) <-chan struct{} {
 	// Close the admission gate first, under the engine lock that also owns the
 	// charged map and the native references: a later AcquireNativeHold must
 	// refuse even while capture teardown is still running. Lock order is
@@ -1221,10 +1401,22 @@ func (l *Lease) Close(reason error) error {
 	if l.closed {
 		done := l.closeDone
 		l.mu.Unlock()
-		if done != nil {
-			<-done
+		return done
+	}
+	// Publish the capture dispatch fence before the closed lease becomes
+	// visible. The capture loop claims a dispatch slot under the gate lock and
+	// only then asks the lease for a verdict, so a record that observes
+	// l.closed has necessarily passed the fence as well: the pass-through it
+	// receives is ordered behind the held flush of earlier captures instead of
+	// overtaking them as a closed-lease fast-pass. FenceDispatch only publishes
+	// the fence, so the caller bound is unchanged - the ordered wait, the held
+	// flush and the native receive shutdown stay in teardown. Lock order is
+	// Engine.mu -> Lease.mu -> capture gate, and the gate is a leaf lock: no
+	// capture path holds it while acquiring the lease lock.
+	if l.capture != nil {
+		if fencer, ok := l.capture.(interface{ FenceDispatch() }); ok {
+			fencer.FenceDispatch()
 		}
-		return nil
 	}
 	l.closed = true
 	l.closedFlag.Store(true)
@@ -1233,6 +1425,7 @@ func (l *Lease) Close(reason error) error {
 	}
 	closeDone := l.closeDone
 	capture := l.capture
+	opening := l.captureOpening
 	l.capture = nil
 	tcpFlow := l.tcpFlow
 	udpFlows := make([]*flowState, 0, len(l.udpFlows))
@@ -1240,9 +1433,86 @@ func (l *Lease) Close(reason error) error {
 		udpFlows = append(udpFlows, flow)
 	}
 	l.mu.Unlock()
-	defer close(closeDone)
 	if reason == nil {
 		reason = errLeaseClosed
+	}
+	go l.teardown(closeDone, reason, capture, opening, tcpFlow, udpFlows)
+	return closeDone
+}
+
+// waitClose bounds one caller's observation of the teardown. It never returns
+// before the teardown is either proven complete or explicitly reported as
+// incomplete: no caller can mistake a still-running native teardown for a
+// successful close, and no ownership is released by this timeout.
+func (l *Lease) waitClose(done <-chan struct{}) error {
+	timer := time.NewTimer(leaseCloseGrace)
+	defer timer.Stop()
+	select {
+	case <-done:
+		l.mu.Lock()
+		err := l.closeErr
+		l.mu.Unlock()
+		return E.Errors(err, l.endpointFailure())
+	case <-timer.C:
+		return E.Errors(fmt.Errorf("desync: lease close did not complete within %s; native ownership retained: %w", leaseCloseGrace, ErrLeaseCloseIncomplete), l.endpointFailure())
+	}
+}
+
+// WaitClosed blocks until this lease's teardown finished and reports its result.
+// It has no caller bound: it is the completion receipt for an owner that already
+// observed the bounded non-success of Close. A lease that was never closed has
+// nothing to wait for and reports nil. The endpoint owner uses it to keep the
+// native socket together with the capture admission boundary instead of
+// releasing the exclusive endpoint while the teardown is still unproven.
+func (l *Lease) WaitClosed() error {
+	l.mu.Lock()
+	if !l.closed || l.closeDone == nil {
+		l.mu.Unlock()
+		return nil
+	}
+	done := l.closeDone
+	l.mu.Unlock()
+	<-done
+	l.mu.Lock()
+	err := l.closeErr
+	l.mu.Unlock()
+	return E.Errors(err, l.endpointFailure())
+}
+
+// teardown is the single ordered close path. The capture fence runs before the
+// held originals are flushed, so records captured after the fence create no new
+// semantic state; records queued during the fence are released only after the
+// flush, so they cannot overtake held data. The native capture keeps its own
+// retirement ownership: its admission reference is discharged only after the
+// kernel proved device/event retirement.
+func (l *Lease) teardown(closeDone chan struct{}, reason error, capture Capture, opening <-chan struct{}, tcpFlow *flowState, udpFlows []*flowState) {
+	var teardownErr error
+	captureRetained := false
+	defer func() {
+		l.mu.Lock()
+		l.closeErr = teardownErr
+		l.mu.Unlock()
+		close(closeDone)
+	}()
+	var errs []error
+	if opening != nil {
+		<-opening
+		l.mu.Lock()
+		if capture == nil {
+			capture = l.capture
+		}
+		l.capture = nil
+		l.mu.Unlock()
+	}
+	// Fence the capture before flushing held originals: a quiesced capture asks
+	// for no new engine verdict and waits for the records already dispatched,
+	// so no record received from this point on can add a hold and the flushed
+	// set is complete. Backends that need no early hook (non-Windows) simply do
+	// not implement it.
+	if quiescer, ok := capture.(interface{ Quiesce() error }); ok {
+		if err := quiescer.Quiesce(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if tcpFlow != nil {
 		tcpFlow.flushHeld(reason.Error())
@@ -1250,15 +1520,64 @@ func (l *Lease) Close(reason error) error {
 	for _, flow := range udpFlows {
 		flow.flushHeld(reason.Error())
 	}
-	var err error
+	// Only now may a record captured during the fence pass through: every held
+	// original of an earlier capture was already delivered by the flush above.
+	if releaser, ok := capture.(interface{ AllowPassThrough() }); ok {
+		releaser.AllowPassThrough()
+	}
 	if capture != nil {
-		err = capture.Close()
+		// Producer pause (carried D§4.2 steps 5-6): after the held drain and
+		// the pass-through release, no new covered socket operation may enter;
+		// only then is the receive path actually shut down. The pause waits
+		// with no Engine/Lease/flow lock held, and a genuine caller write keeps
+		// running to its terminal return instead of being cancelled.
+		var token *endpointProducerToken
+		if producerQuiescer, ok := capture.(interface{ StopReceive() error }); ok {
+			token = l.pauseEndpointWrites()
+			if err := producerQuiescer.StopReceive(); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		// Capture.Close owns the rest of the order: drain the already-owned
+		// native queues as pass-through, join the receive users, then retire
+		// the native handles only after their terminal receipts.
+		captureErr := capture.Close()
+		if captureErr != nil {
+			errs = append(errs, captureErr)
+		}
+		// Windows can prove safe native retirement despite a terminal delivery
+		// error. Close/WaitClosed retain that diagnostic; only this distinct
+		// proof permits producer resume and discharge of the capture charge.
+		retirementErr := captureErr
+		if receipt, ok := capture.(interface{ captureRetirementError() error }); ok {
+			retirementErr = receipt.captureRetirementError()
+		}
+		captureRetained = retirementErr != nil
+		if captureRetained {
+			// A charged tombstone alone does not root lane-owned native memory.
+			// Keep the capture owner reachable for unproven completion; all
+			// receive users may have exited without releasing those resources.
+			l.mu.Lock()
+			l.capture = capture
+			l.mu.Unlock()
+		}
+		l.publishCaptureRetired(retirementErr)
+		if retirementErr == nil {
+			l.resumeEndpointWrites(token)
+		}
+	} else {
+		// A capture-less attempt (stream-only admission, plain UDP) has nothing
+		// to retire: its no-capture receipt is immediate and positive.
+		l.publishCaptureRetired(nil)
 	}
 	// closeDone reports that this teardown finished, not that native receipts
 	// arrived. A retained native reference keeps the original charged slot
-	// alive until its own release callback; Close never waits for it.
+	// alive until its own release callback; Close never waits for it. An
+	// unproven capture retirement is a retained native effect: the charged
+	// slot stays with its owner/identity instead of being discharged by the
+	// goroutine's return.
 	if l.engine != nil {
-		l.engine.finishLeaseTeardown(l)
+		l.engine.finishLeaseTeardown(l, captureRetained)
 	}
-	return err
+	teardownErr = E.Errors(errs...)
 }

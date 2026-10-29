@@ -78,7 +78,13 @@ func (r *Rule) Matches(facts MatchFacts) bool {
 			return false
 		}
 	}
-	if !r.IPs.wildcard() && (r.IPs.restricts() || r.ipRestrict) {
+	// A positive-IP restriction exists only while the compiled union of every
+	// configured include source holds at least one entry. Pinned zapret v72.9
+	// (nfq/ipset.c:221-232) is explicit: "old behavior compat: all include
+	// lists are empty means check passes". A nonempty union keeps the OR
+	// membership test and its family behaviour; exclusions still win over an
+	// all-empty include set.
+	if r.IPs.restricts() {
 		if !r.IPs.contains(facts.Destination) {
 			return false
 		}
@@ -86,12 +92,29 @@ func (r *Rule) Matches(facts MatchFacts) bool {
 	if r.IPsExclude.wildcard() || r.IPsExclude.contains(facts.Destination) {
 		return false
 	}
-	if (!r.Domains.empty() || r.domainRestrict) && r.Learning == nil {
+	// Regular (non-auto) host filters decide reachability for an unknown
+	// hostname exactly like pinned zapret v72.9 dp_match: a profile with
+	// neither an auto hostlist nor a known hostname cannot win while either
+	// collection holds an entry, whatever its ipset result is (upstream skips
+	// that check for the profile, nfq/desync.c:253-256). The pinned emptiness
+	// predicate spans the positive and the exclusion collection alike
+	// (nfq/params.h:191), and a collected file counts only while it holds
+	// parsed entries (nfq/pools.c:263-273), which is what the compiled sets
+	// express. A known hostname keeps the HostlistCheck_ order
+	// (nfq/hostlist.c:234-254): exclusions win, an all-empty include
+	// collection passes, and a nonempty one requires membership.
+	// domainRestrict keeps the accepted candidate semantic for a configured
+	// positive domain source that resolves to no entries: it still matches
+	// nothing instead of removing the restriction.
+	if r.Learning == nil {
 		if !facts.HostKnown {
-			return false
-		}
-		if !r.Domains.matchesHost(facts.Host, facts.HostIsIP) {
-			return false
+			if !r.Domains.empty() || r.domainRestrict || !r.DomainsExclude.empty() {
+				return false
+			}
+		} else if !r.Domains.empty() || r.domainRestrict {
+			if !r.Domains.matchesHost(facts.Host, facts.HostIsIP) {
+				return false
+			}
 		}
 	}
 	if r.DomainsExclude.matches(facts.Host) {

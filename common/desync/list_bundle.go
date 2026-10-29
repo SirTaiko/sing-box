@@ -397,9 +397,11 @@ func (s *listBuildState) resolveSelection(selector *option.DirectDesyncListBundl
 	}, nil
 }
 
-// applyBundle appends the selected positive datasets to the rule's retained
-// bundle-derived entries and records that an explicit positive restriction
-// exists even when every selected dataset is empty.
+// applyBundle appends the selected positive and negative datasets to the
+// rule's retained bundle-derived entries. A selected positive domain dataset
+// records an explicit restriction even when it is empty; positive IP datasets
+// are unioned into the compiled positive IP set, whose aggregate emptiness
+// alone decides whether a positive-IP restriction exists.
 func (r *Rule) applyBundle(state *listBuildState) error {
 	if r.bundleSelection == nil {
 		return nil
@@ -434,7 +436,6 @@ func (r *Rule) applyBundle(state *listBuildState) error {
 			return readErr
 		}
 		r.ipBundle = append(r.ipBundle, entries...)
-		r.bundleIPRestrict = true
 	}
 	for _, id := range selection.ipExclude {
 		entries, readErr := state.dataset(view, id)

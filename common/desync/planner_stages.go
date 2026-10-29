@@ -33,6 +33,12 @@ func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, rando
 			protocol = ruleProtocol(rule, facts)
 		}
 		sent := 0
+		// Upstream DESYNC_FAKE transmits every fake at the captured packet's
+		// sequence (nfq/desync.c:1972 sequence0 = ntohl(dis->tcp->th_seq)) and
+		// repeats that exact packet (nfq/desync.c:2002 rawsend_rep). Only
+		// tcp_mod.seq advances the base, once per fake payload item, after all
+		// of that item's repeats (nfq/desync.c:2008).
+		sequence := packet.TCPSeq
 		for _, payload := range fake.Payloads {
 			if payload.Protocol != protocol {
 				continue
@@ -44,11 +50,7 @@ func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, rando
 					data = modified
 				}
 			}
-			sequence := packet.TCPSeq - uint32(len(data))
 			for repeat := 0; repeat < fake.Repeats; repeat++ {
-				if fake.Seq {
-					sequence = packet.TCPSeq + uint32(repeat*len(data))
-				}
 				id, _ := allocator.Value()
 				flags := mods.RewriteFlags(packet.TCPFlags)
 				spec := BuildSpec{
@@ -67,6 +69,9 @@ func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, rando
 					batch.Packets = append(batch.Packets, generated)
 				}
 				sent++
+			}
+			if fake.Seq {
+				sequence += uint32(len(data))
 			}
 		}
 		if sent == 0 {
@@ -1148,8 +1153,18 @@ func planZeroStage(rule *Rule, packet *Packet, batch *Batch, random RandSource) 
 	return batch, nil
 }
 
-// PlanUDP is the stage-aware UDP planner.
+// PlanUDP builds the packet-side UDP batch for one captured datagram with every
+// configured stage enabled. Fake-unit admission for a QUIC Initial is decided
+// by the flow's CRYPTO reassembly state (see planUDPStages).
 func PlanUDP(rule *Rule, packet *Packet) (*Batch, error) {
+	return planUDPStages(rule, packet, true)
+}
+
+// planUDPStages is PlanUDP with the pinned fake-unit admission decision.
+// fakeAllowed=false suppresses only the fake/fakeknown stage: pinned replays a
+// delayed QUIC Initial with a non-zero reassembly offset, which skips the fake
+// branch while every other configured stage keeps its behaviour.
+func planUDPStages(rule *Rule, packet *Packet, fakeAllowed bool) (*Batch, error) {
 	batch := &Batch{Original: VerdictPass}
 	if len(packet.Payload) == 0 || rule == nil {
 		return batch, nil
@@ -1177,6 +1192,14 @@ func PlanUDP(rule *Rule, packet *Packet) (*Batch, error) {
 		case MethodFake, MethodFakeKnown:
 			fake := rule.Fake
 			if fake == nil {
+				break
+			}
+			if !fakeAllowed {
+				// Pinned delayed-replay admission: this Initial belongs to an
+				// incomplete CRYPTO cycle (or a cancelled one) and owns no fake
+				// burst. The captured original still passes below, and every
+				// other configured stage keeps its own semantics.
+				batch.Reason = "no fake unit admitted for this QUIC CRYPTO reassembly state"
 				break
 			}
 			if first.Kind == MethodFakeKnown && protocol == ProtocolUnknown {

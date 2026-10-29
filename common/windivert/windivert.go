@@ -76,6 +76,17 @@ func (a *Address) SetIPChecksum(v bool) {
 	a.bits = setFlagBit(a.bits, addrBitIPChecksum, v)
 }
 
+// IPChecksum reports whether the address claims the IPv4 checksum is already
+// valid. A send with the flag set passes the packet bytes through unchanged; a
+// clear flag lets the driver compute the checksum.
+func (a *Address) IPChecksum() bool { return getFlagBit(a.bits, addrBitIPChecksum) }
+
+// TCPChecksum reports whether the address claims the TCP checksum is valid.
+func (a *Address) TCPChecksum() bool { return getFlagBit(a.bits, addrBitTCPChecksum) }
+
+// UDPChecksum reports whether the address claims the UDP checksum is valid.
+func (a *Address) UDPChecksum() bool { return getFlagBit(a.bits, addrBitUDPChecksum) }
+
 func (a *Address) SetTCPChecksum(v bool) {
 	a.bits = setFlagBit(a.bits, addrBitTCPChecksum, v)
 }

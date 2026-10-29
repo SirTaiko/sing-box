@@ -160,7 +160,7 @@ func TestIPCacheExplicitZeroLifetimeNeverExpires(t *testing.T) {
 }
 
 func TestQUICCrossDatagramCRYPTOReassembly(t *testing.T) {
-	hello := buildClientHello("spread.example")
+	hello := rawQUICClientHello("spread.example")
 	dcid := []byte{9, 8, 7, 6, 5, 4, 3, 2}
 	split := len(hello) / 2
 	first := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{hello[:split]}, 240), dcid, 1, 1)
@@ -188,8 +188,8 @@ func TestQUICCrossDatagramCRYPTOReassembly(t *testing.T) {
 
 	// A conflicting overlap is refused rather than guessed.
 	q3 := newQUICReassembler()
-	helloA := buildClientHello("aaaa.example")
-	helloB := buildClientHello("bbbb.example")
+	helloA := rawQUICClientHello("aaaa.example")
+	helloB := rawQUICClientHello("bbbb.example")
 	if _, ok := q3.add(sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{helloA[:split]}, 240), dcid, 1, 1)); ok {
 		t.Fatal("partial must not report")
 	}

@@ -29,6 +29,25 @@ func TestIoctlCodesMatchUpstream(t *testing.T) {
 	require.Equal(t, uint32(0x12E489), ioctlStartup)
 	require.Equal(t, uint32(0x12648E), ioctlRecv)
 	require.Equal(t, uint32(0x12E491), ioctlSend)
+	// The shutdown entry continues the same numbering; it is the ninth control
+	// case of the embedded v2.2.2 driver's dispatch.
+	require.Equal(t, uint32(0x12E49D), ioctlShutdown)
+}
+
+func TestBuildIoctlShutdown(t *testing.T) {
+	t.Parallel()
+	// WINDIVERT_SHUTDOWN values from windivert.h.
+	require.Equal(t, uint32(1), shutdownRecv)
+	require.Equal(t, uint32(2), shutdownSend)
+	require.Equal(t, uint32(3), shutdownBoth)
+	buf := buildIoctlShutdown(shutdownRecv)
+	require.Equal(t, shutdownRecv, binary.LittleEndian.Uint32(buf[0:4]))
+	// The rest of the 16-byte WINDIVERT_IOCTL union stays zero.
+	for _, value := range buf[4:] {
+		require.Zero(t, value)
+	}
+	both := buildIoctlShutdown(shutdownBoth)
+	require.Equal(t, shutdownBoth, binary.LittleEndian.Uint32(both[0:4]))
 }
 
 func TestBuildIoctlInitialize(t *testing.T) {

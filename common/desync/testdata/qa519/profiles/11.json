@@ -1,0 +1,282 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret",
+      "desync": {
+        "rules": [
+          {
+            "name": "rule-0",
+            "network": [
+              "udp"
+            ],
+            "methods": [
+              "fake"
+            ],
+            "port": [
+              443
+            ],
+            "domain_file": [
+              "lists/list-general.txt",
+              "lists/list-general-user.txt"
+            ],
+            "domain_exclude_file": [
+              "lists/list-exclude.txt",
+              "lists/list-exclude-user.txt"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                {
+                  "protocol": "quic",
+                  "file": "bin/quic_initial_www_google_com.bin"
+                }
+              ]
+            }
+          },
+          {
+            "name": "rule-1",
+            "network": [
+              "udp"
+            ],
+            "methods": [
+              "fake"
+            ],
+            "port_range": [
+              "19294-19344",
+              "50000-50100"
+            ],
+            "protocol": [
+              "discord",
+              "stun"
+            ],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                {
+                  "protocol": "discord",
+                  "file": "bin/ACTIVE_DISCORD_UDP.bin"
+                },
+                {
+                  "protocol": "stun",
+                  "file": "bin/ACTIVE_DISCORD_UDP.bin"
+                }
+              ]
+            }
+          },
+          {
+            "name": "rule-2",
+            "network": [
+              "tcp"
+            ],
+            "methods": [
+              "multisplit"
+            ],
+            "port": [
+              2053,
+              2083,
+              2087,
+              2096,
+              8443
+            ],
+            "domain": [
+              "discord.media"
+            ],
+            "multisplit": {
+              "split_pos": [
+                "2",
+                "sniext+1"
+              ],
+              "seqovl": 679,
+              "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin"
+            }
+          },
+          {
+            "name": "rule-3",
+            "network": [
+              "tcp"
+            ],
+            "methods": [
+              "multisplit"
+            ],
+            "port": [
+              443
+            ],
+            "domain_file": [
+              "lists/list-google.txt"
+            ],
+            "ip_id": "zero",
+            "multisplit": {
+              "split_pos": [
+                "2",
+                "sniext+1"
+              ],
+              "seqovl": 679,
+              "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin"
+            }
+          },
+          {
+            "name": "rule-4",
+            "network": [
+              "tcp"
+            ],
+            "methods": [
+              "multisplit"
+            ],
+            "port": [
+              80,
+              443
+            ],
+            "domain_file": [
+              "lists/list-general.txt",
+              "lists/list-general-user.txt"
+            ],
+            "domain_exclude_file": [
+              "lists/list-exclude.txt",
+              "lists/list-exclude-user.txt"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "multisplit": {
+              "split_pos": [
+                "2",
+                "sniext+1"
+              ],
+              "seqovl": 679,
+              "seqovl_pattern": "bin/tls_clienthello_www_google_com.bin"
+            }
+          },
+          {
+            "name": "rule-5",
+            "network": [
+              "udp"
+            ],
+            "methods": [
+              "fake"
+            ],
+            "port": [
+              443
+            ],
+            "domain_exclude_file": [
+              "lists/list-exclude.txt",
+              "lists/list-exclude-user.txt"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "fake": {
+              "repeats": 6,
+              "payloads": [
+                {
+                  "protocol": "quic",
+                  "file": "bin/quic_initial_www_google_com.bin"
+                }
+              ]
+            },
+            "ip_cidr_file": [
+              "lists/ipset-all.txt"
+            ]
+          },
+          {
+            "name": "rule-6",
+            "network": [
+              "tcp"
+            ],
+            "methods": [
+              "syndata"
+            ],
+            "port": [
+              80,
+              443,
+              8443
+            ],
+            "domain_exclude_file": [
+              "lists/list-exclude.txt",
+              "lists/list-exclude-user.txt"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "ip_cidr_file": [
+              "lists/ipset-all.txt"
+            ]
+          },
+          {
+            "name": "rule-7",
+            "network": [
+              "tcp"
+            ],
+            "methods": [
+              "syndata"
+            ],
+            "port_range": [
+              "1024-65535"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "cutoff": "n4",
+            "any_protocol": true,
+            "ip_cidr_file": [
+              "lists/ipset-all.txt"
+            ]
+          },
+          {
+            "name": "rule-8",
+            "network": [
+              "udp"
+            ],
+            "methods": [
+              "fake"
+            ],
+            "port_range": [
+              "1024-65535"
+            ],
+            "ip_cidr_exclude_file": [
+              "lists/ipset-exclude.txt",
+              "lists/ipset-exclude-user.txt"
+            ],
+            "cutoff": "n2",
+            "any_protocol": true,
+            "fake": {
+              "repeats": 12,
+              "payloads": [
+                {
+                  "protocol": "unknown",
+                  "file": "bin/ACTIVE_GAME_UDP.bin"
+                }
+              ]
+            },
+            "ip_cidr_file": [
+              "lists/ipset-all.txt"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "route": {
+    "final": "zapret"
+  }
+}

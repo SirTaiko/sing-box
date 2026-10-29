@@ -17,10 +17,13 @@ import (
 //	mode2 (second stage) runs after the first stage (split family, frag, udplen,
 //	                     tamper)
 //
-// A first stage without a second stage is valid; a zero stage requires a first
-// stage because upstream's grammar cannot express an empty middle slot. The
-// first stage is never "final" (`desync_only_first_stage` returns false), so the
-// second stage is always evaluated when present.
+// A first stage without a second stage is valid, and so are the sparse forms
+// upstream accepts: standalone zero (`syndata`, `synack`) and zero+second
+// (`syndata,multidisorder`). `nfqws.c` consumes an initial zero-stage token
+// before the remaining mode slots are parsed, so an absent first stage is a
+// legal gap in the middle of the list; the parser must not invent one. The
+// first stage is never "final" (`desync_only_first_stage` returns false), so
+// the second stage is always evaluated when present.
 type Stage uint8
 
 const (
@@ -149,9 +152,11 @@ func CompileMethods(names []string, network TransportMask) ([]Method, error) {
 		lastStage = info.stage
 		methods = append(methods, Method{Kind: info.kind, Name: info.name})
 	}
-	if byStage[StageZero] && !byStage[StageFirst] {
-		return nil, fmt.Errorf("zero stage method requires a first stage method")
-	}
+	// Upstream's grammar permits an empty middle slot: a zero stage may stand
+	// alone or be followed directly by a second stage (nfqws.c consumes the
+	// zero token, then parses the remaining mode slots independently). The
+	// remaining checks stay authoritative: duplicate stages, decreasing stage
+	// order and transport applicability are still rejected above and below.
 	for _, method := range methods {
 		if err := validateMethodTransport(method, network); err != nil {
 			return nil, err

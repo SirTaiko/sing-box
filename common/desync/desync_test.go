@@ -269,7 +269,11 @@ func TestFakePayloadMajorRepeatsAndSequence(t *testing.T) {
 		if string(parsed.Payload) != want {
 			t.Fatalf("packet %d payload = %q", index, parsed.Payload)
 		}
-		if parsed.TCPSeq != 1000-uint32(len(want)) {
+		if parsed.TCPSeq != 1000 {
+			// Upstream sends every fake at the captured packet's sequence
+			// (nfq/desync.c:1972 sequence0 = ntohl(th_seq)); the previous
+			// expectation 1000-len encoded a fork-local shift that QA417 F-3
+			// found on the wire against the pinned reference.
 			t.Fatalf("packet %d sequence = %d", index, parsed.TCPSeq)
 		}
 		verifyTCPChecksum(t, batch.Packets[index])

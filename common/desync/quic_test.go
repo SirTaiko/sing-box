@@ -4,9 +4,24 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+// testQUICInitialPayload builds one authenticated client Initial whose single
+// datagram carries a complete ClientHello. Tests that need the UDP fake stage
+// to run must use a datagram the repaired QUIC admission accepts: the
+// structural buildQUICInitial placeholder does not authenticate and is
+// therefore passed through untouched, exactly like pinned quic_reasm_cancel.
+func testQUICInitialPayload(t *testing.T, host string) []byte {
+	t.Helper()
+	return sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{rawQUICClientHello(host)}, 240),
+		[]byte{1, 2, 3, 4, 5, 6, 7, 8}, 1, 1)
+}
 
 // encodeQUICVarint16 encodes a value as a two-byte QUIC varint.
 func encodeQUICVarint16(value int) []byte {
@@ -84,8 +99,25 @@ func cryptoFrames(offsets []int, chunks [][]byte, padTo int) []byte {
 	return frames
 }
 
+// rawQUICClientHello builds the client Initial CRYPTO payload for host: the
+// bare TLS ClientHello handshake message without the TLS record header that
+// buildClientHello prepends. RFC 9001 §4.1.1 carries the handshake in CRYPTO
+// frames without the TLS record layer, so a faithful QUIC fixture must start
+// with HandshakeType 0x01, never with record type 0x16.
+func rawQUICClientHello(host string) []byte {
+	record := buildClientHello(host)
+	if len(record) < 6 || record[0] != 0x16 {
+		panic("buildClientHello no longer returns a TLS record")
+	}
+	recordLength := int(binary.BigEndian.Uint16(record[3:5]))
+	if recordLength != len(record)-5 {
+		panic("buildClientHello TLS record length mismatch")
+	}
+	return record[5:]
+}
+
 func TestQUICInitialDecryptsAndExtractsHost(t *testing.T) {
-	hello := buildClientHello("quic.example")
+	hello := rawQUICClientHello("quic.example")
 	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	packet := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{hello}, 240), dcid, 1, 2)
 	if !IsQUICInitial(packet) {
@@ -106,7 +138,7 @@ func TestQUICInitialDecryptsAndExtractsHost(t *testing.T) {
 }
 
 func TestQUICInitialSplitCryptoFrames(t *testing.T) {
-	hello := buildClientHello("split.example")
+	hello := rawQUICClientHello("split.example")
 	dcid := []byte{9, 9, 9, 9, 9, 9, 9, 9}
 	frames := cryptoFrames([]int{0, len(hello) / 2}, [][]byte{hello[:len(hello)/2], hello[len(hello)/2:]}, 240)
 	packet := sealQUICInitial(t, frames, dcid, 1, 7)
@@ -120,7 +152,7 @@ func TestQUICInitialSplitCryptoFrames(t *testing.T) {
 }
 
 func TestQUICInitialRejectsMalformed(t *testing.T) {
-	hello := buildClientHello("reject.example")
+	hello := rawQUICClientHello("reject.example")
 	dcid := []byte{4, 4, 4, 4}
 	frames := cryptoFrames([]int{0}, [][]byte{hello}, 200)
 	good := sealQUICInitial(t, frames, dcid, 1, 1)
@@ -175,6 +207,108 @@ func TestQUICInitialRejectsMalformed(t *testing.T) {
 	})
 }
 
+// TestQUICCapturedInitialFlightExtractsHost is the permanent regression for the
+// acceptance defect: two real captured client Initial flights (Linux and
+// Windows product runs, 10 authenticated 1280-byte datagrams each) carry a
+// ClientHello of 1512/1511 body bytes whose CRYPTO stream is a bare TLS
+// handshake, not a TLS record. The first datagram only holds the 67-byte
+// prefix; the second completes the stream and must yield the SNI.
+func TestQUICCapturedInitialFlightExtractsHost(t *testing.T) {
+	for _, platform := range []string{"linux", "windows"} {
+		t.Run(platform, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join("testdata", "quic-initial-"+platform+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var encoded []string
+			if err = json.Unmarshal(data, &encoded); err != nil {
+				t.Fatal(err)
+			}
+			if len(encoded) != 10 {
+				t.Fatalf("captured flight has %d datagrams, want 10", len(encoded))
+			}
+			q := newQUICReassembler()
+			firstHostIndex := -1
+			host := ""
+			for index, raw := range encoded {
+				payload, err := hex.DecodeString(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, ok := decryptQUICInitial(payload); !ok {
+					t.Fatalf("captured datagram %d does not authenticate", index)
+				}
+				name, ok := q.add(payload)
+				if ok && firstHostIndex < 0 {
+					firstHostIndex, host = index, name
+				}
+			}
+			if firstHostIndex != 1 {
+				t.Fatalf("first hostname reported on datagram %d, want the second (first carries only the partial prefix)", firstHostIndex)
+			}
+			if host != "www.youtube.com" {
+				t.Fatalf("captured host = %q, want www.youtube.com", host)
+			}
+			stream, contiguous := q.contiguous()
+			if !contiguous {
+				t.Fatal("captured CRYPTO stream is not contiguous")
+			}
+			if len(stream) < 4 || stream[0] != 0x01 {
+				t.Fatalf("CRYPTO stream starts with %#x, want HandshakeType 0x01 (no TLS record layer)", stream[0])
+			}
+			declared := int(stream[1])<<16 | int(stream[2])<<8 | int(stream[3])
+			if declared != len(stream)-4 {
+				t.Fatalf("captured ClientHello declares %d body bytes, stream carries %d", declared, len(stream)-4)
+			}
+			t.Logf("captured %s CRYPTO stream %d bytes prefix=%x declared_body=%d host=%q",
+				platform, len(stream), stream[:4], declared, host)
+		})
+	}
+}
+
+// TestQUICCryptoClientHelloIsNotTLSRecord pins the protocol boundary: the
+// CRYPTO stream of a QUIC Initial carries the bare TLS handshake message
+// (RFC 9001 §4.1.1). A TLS record-framed hello inside CRYPTO is malformed and
+// must not be interpreted by the TCP TLS record parser.
+func TestQUICCryptoClientHelloIsNotTLSRecord(t *testing.T) {
+	framed := buildClientHello("framed.example")
+	if framed[0] != 0x16 {
+		t.Fatal("fixture is not TLS record framed")
+	}
+	dcid := []byte{3, 3, 3, 3}
+	packet := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{framed}, 240), dcid, 1, 1)
+	if host, ok := quicInitialServerName(packet); ok {
+		t.Fatalf("TLS record framing in CRYPTO must not yield a host: %q", host)
+	}
+	q := newQUICReassembler()
+	if host, ok := q.add(packet); ok {
+		t.Fatalf("TLS record framing in CRYPTO must not yield a host: %q", host)
+	}
+}
+
+// TestQUICCryptoDeclaredBodyMustBeComplete proves the completeness bound: a
+// hello whose SNI can already be parsed is still not a fact while the declared
+// handshake body extends past the reassembled CRYPTO stream.
+func TestQUICCryptoDeclaredBodyMustBeComplete(t *testing.T) {
+	hello := rawQUICClientHello("complete.example")
+	truncated := append([]byte(nil), hello...)
+	putUint24(truncated[1:4], readUint24(truncated[1:4])+1)
+	dcid := []byte{8, 8, 8, 8}
+	packet := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{truncated}, 240), dcid, 1, 1)
+	if host, ok := quicInitialServerName(packet); ok {
+		t.Fatalf("incomplete declared handshake body must not yield a host: %q", host)
+	}
+	q := newQUICReassembler()
+	if host, ok := q.add(packet); ok {
+		t.Fatalf("incomplete declared handshake body must not yield a host: %q", host)
+	}
+	// The same bytes with the declared body restored are a complete hello.
+	packet = sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{hello}, 240), dcid, 1, 2)
+	if host, ok := q.add(packet); !ok || host != "complete.example" {
+		t.Fatalf("complete retransmission host = %q/%v", host, ok)
+	}
+}
+
 // TestQUICHostnameFeedsRuleMatching proves the decrypted hostname is the fact
 // used for rule selection: a domain-gated QUIC rule matches only when the
 // Initial authenticates and its CRYPTO ClientHello names that domain.
@@ -201,7 +335,7 @@ func TestQUICHostnameFeedsRuleMatching(t *testing.T) {
 	dcid := []byte{7, 7, 7, 7}
 	// Different host first: the rule must not match and the flow must not be
 	// latched to it.
-	other := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{buildClientHello("other.example")}, 240), dcid, 1, 2)
+	other := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{rawQUICClientHello("other.example")}, 240), dcid, 1, 2)
 	otherPacket := buildIPv4UDP(t, other, 443)
 	if verdict := lease.HandlePacket(otherPacket.Raw, DirectionOutbound, func([]byte) error {
 		t.Fatal("non-matching host must not inject")
@@ -209,7 +343,7 @@ func TestQUICHostnameFeedsRuleMatching(t *testing.T) {
 	}, nil); verdict != VerdictPass {
 		t.Fatalf("verdict = %d", verdict)
 	}
-	matching := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{buildClientHello("quic.example")}, 240), dcid, 1, 1)
+	matching := sealQUICInitial(t, cryptoFrames([]int{0}, [][]byte{rawQUICClientHello("quic.example")}, 240), dcid, 1, 1)
 	packet := buildIPv4UDP(t, matching, 443)
 	injected := 0
 	if verdict := lease.HandlePacket(packet.Raw, DirectionOutbound, func([]byte) error {

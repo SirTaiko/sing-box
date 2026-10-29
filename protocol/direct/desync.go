@@ -3,10 +3,12 @@ package direct
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/desync"
@@ -424,9 +426,64 @@ func (c *leaseConn) AcquireNativeHold() (func(), error) {
 // internal platform sender factory. It never creates, dials or adopts a socket.
 func (c *leaseConn) NativeStreamConn() net.Conn { return c.Conn }
 
+// closeLeasedEndpoint is the one ordered close of a returned transport that owns
+// both a packet lease and the exclusive native endpoint. The endpoint is
+// released only after the Lease's positive capture-retired receipt: while the
+// capture teardown is unproven the native filter can still admit the old tuple,
+// so closing the socket first would hand the exclusive port to a foreign socket
+// that the capture would then treat as this attempt's flow. A real teardown
+// error is not a detachment receipt. The existing endpoint owner joins actual
+// retirement and admitted producers even if its caller reaches the 2s bound.
+// Pure Lease.Close remains separate and does not release the caller's socket.
+func closeLeasedEndpoint(lease *desync.Lease, endpoint func() error) error {
+	if lease == nil {
+		return endpoint()
+	}
+	// Bound the complete caller observation, not just Lease.Close. A producer
+	// admitted in bypass mode can still own the socket after capture retired.
+	// The wrapper's closeOnce owns this one bridge; no retry/cleanup service.
+	done := make(chan error, 1)
+	go func() {
+		leaseErr := lease.Close(nil)
+		if errors.Is(leaseErr, desync.ErrLeaseCloseIncomplete) {
+			leaseErr = lease.WaitClosed()
+		}
+		endpointErr := retireEndpointAfterRetirement(lease, endpoint)
+		if endpointErr != nil {
+			lease.ReportNativeFailure(endpointErr)
+		}
+		done <- errors.Join(leaseErr, endpointErr)
+	}()
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return errors.Join(E.Cause(desync.ErrLeaseCloseIncomplete, "desync: endpoint close incomplete; ownership retained"), lease.Err())
+	}
+}
+
+// retireEndpointAfterRetirement is the single endpoint-release path. It waits
+// for the positive capture-safe receipt and releases the endpoint only when the
+// native retirement was proved. A receipt that carries an error is reported
+// through the lease's existing retained native-failure diagnostic owner and
+// keeps the endpoint owned: no second owner, budget or retry loop is
+// introduced, and no endpoint is closed to manufacture a successful receipt.
+func retireEndpointAfterRetirement(lease *desync.Lease, endpoint func() error) error {
+	// This seam also roots the actual endpoint on a final unsafe receipt.
+	// Returning before it would retain the charge but lose the socket owner.
+	return lease.ReleaseEndpoint(endpoint)
+}
+
 func (c *leaseConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closeErr = errors.Join(c.Conn.Close(), c.lease.Close(nil))
+		// The capture owns the owned tuple until it is fenced and retired. Closing
+		// the native connection first would release the exclusive endpoint while
+		// the capture still admits the old flow, so a reused local port could be
+		// captured as if it were this attempt. A lease close that cannot prove its
+		// teardown keeps the endpoint open and retires it after the receipt.
+		c.closeErr = closeLeasedEndpoint(c.lease, c.Conn.Close)
 	})
 	return c.closeErr
 }
@@ -449,17 +506,42 @@ type leaseUDPConn struct {
 // connection. TCP socket options and UDP socket controls treat this interface
 // as optional, so an underlying transport without a native descriptor keeps
 // returning the same error it would have returned itself.
+//
+// The returned RawConn routes its Write callback through the same endpoint
+// producer gate as Write. A cached raw write capability therefore stays inside
+// the owner instead of becoming an unguarded backdoor; read/control callbacks
+// are unchanged.
 func (c *leaseUDPConn) SyscallConn() (syscall.RawConn, error) {
 	syscallConn, isSyscallConn := c.Conn.(syscall.Conn)
 	if !isSyscallConn {
 		return nil, E.New("desync: UDP connection does not expose a native socket")
 	}
-	return syscallConn.SyscallConn()
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	return gatedRawConn{conn: raw, lease: c.lease}, nil
+}
+
+// Write performs the caller's real connected-UDP send under the endpoint
+// producer gate. The gate admits the operation before the syscall and the end
+// follows the syscall's terminal return, so a write can never be inside the
+// capture's receive-shutdown window while an older held original is pending.
+func (c *leaseUDPConn) Write(p []byte) (int, error) {
+	end, err := c.lease.BeginEndpointWrite()
+	if err != nil {
+		return 0, err
+	}
+	defer end()
+	return c.Conn.Write(p)
 }
 
 func (c *leaseUDPConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closeErr = errors.Join(c.Conn.Close(), c.lease.Close(nil))
+		// Same ownership order as leaseConn: the capture fence must precede the
+		// release of the exclusive endpoint, so a reused port cannot be admitted
+		// as this attempt's flow. An unproven teardown keeps the endpoint owned.
+		c.closeErr = closeLeasedEndpoint(c.lease, c.Conn.Close)
 	})
 	return c.closeErr
 }
@@ -476,18 +558,76 @@ type leasePacketConn struct {
 }
 
 // SyscallConn forwards the optional native socket capability of the wrapped
-// listener, exactly like leaseUDPConn.
+// listener, exactly like leaseUDPConn, including the gated Write callback: a
+// capability obtained through the listener cannot bypass the producer gate.
 func (c *leasePacketConn) SyscallConn() (syscall.RawConn, error) {
 	syscallConn, isSyscallConn := c.PacketConn.(syscall.Conn)
 	if !isSyscallConn {
 		return nil, E.New("desync: UDP listener does not expose a native socket")
 	}
-	return syscallConn.SyscallConn()
+	raw, err := syscallConn.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	return gatedRawConn{conn: raw, lease: c.lease}, nil
+}
+
+// WriteTo performs the listener's real send under the same endpoint producer
+// gate as the connected Write. A bound UDP listener has no destination in its
+// lease, but its socket production is covered identically.
+func (c *leasePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	end, err := c.lease.BeginEndpointWrite()
+	if err != nil {
+		return 0, err
+	}
+	defer end()
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+// Write forwards a listener used through io.Writer under the producer gate. A
+// PacketConn without Write keeps the standard "not supported" result of the
+// wrapped transport.
+func (c *leasePacketConn) Write(p []byte) (int, error) {
+	writer, ok := c.PacketConn.(io.Writer)
+	if !ok {
+		return 0, E.New("desync: UDP listener does not support Write")
+	}
+	end, err := c.lease.BeginEndpointWrite()
+	if err != nil {
+		return 0, err
+	}
+	defer end()
+	return writer.Write(p)
+}
+
+// gatedRawConn is the cached native capability of an endpoint owner. Every
+// Write callback is admitted through the Lease's producer gate; Read and
+// Control keep the underlying transport's behavior unchanged.
+type gatedRawConn struct {
+	conn  syscall.RawConn
+	lease *desync.Lease
+}
+
+func (c gatedRawConn) Control(f func(fd uintptr)) error { return c.conn.Control(f) }
+
+func (c gatedRawConn) Read(f func(fd uintptr) (done bool)) error { return c.conn.Read(f) }
+
+func (c gatedRawConn) Write(f func(fd uintptr) (done bool)) error {
+	end, err := c.lease.BeginEndpointWrite()
+	if err != nil {
+		return err
+	}
+	defer end()
+	return c.conn.Write(f)
 }
 
 func (c *leasePacketConn) Close() error {
 	c.closeOnce.Do(func() {
-		c.closeErr = errors.Join(c.PacketConn.Close(), c.lease.Close(nil))
+		// The listener's exclusive port must stay owned until the capture is
+		// fenced: a wildcard listener capture would otherwise remain live across
+		// the kernel handing the same port to a foreign socket. An unproven
+		// teardown keeps the listener owned and retires it after the receipt.
+		c.closeErr = closeLeasedEndpoint(c.lease, c.PacketConn.Close)
 	})
 	return c.closeErr
 }

@@ -176,6 +176,133 @@ func outboundLocal(src netip.AddrPort, tcp bool) (*Filter, error) {
 	return f, nil
 }
 
+// OwnedFlow is one owned packet attempt as the capture envelope sees it.
+//
+// Local must carry the exclusively bound local port (a zero port cannot
+// authorize capture). An unspecified local address (0.0.0.0 or ::) is the
+// default no-bind case: it removes only that address equality, never the
+// direction, family, protocol, local port, peer or interface facts. Peer is
+// empty for a TCP listener capture that has no peer yet; an inbound envelope
+// always needs the peer because the reverse tuple is the only ownership fact
+// it has.
+type OwnedFlow struct {
+	IPv6           bool
+	TCP            bool
+	Outbound       bool
+	Local          netip.AddrPort
+	Peer           netip.AddrPort
+	InterfaceIndex uint32
+}
+
+// OwnedFlowEnvelope builds the authoritative kernel envelope for one direction
+// of one owned flow. It is the single builder the desync capture uses for both
+// the plain and the configured capture paths; the generic exact-address
+// helpers above keep their meaning for other consumers.
+//
+// Ownership justification (the reason an unspecified local address may drop
+// its equality) is the exclusive native bind: the local port cannot be shared,
+// so port + family + protocol + direction + peer identify the attempt. A
+// concrete local address stays an equality restriction.
+func OwnedFlowEnvelope(flow OwnedFlow) (*Filter, error) {
+	if !flow.Local.IsValid() || flow.Local.Port() == 0 {
+		return nil, E.New("windivert: filter: owned flow needs a bound local port")
+	}
+	localAddress := flow.Local.Addr().Unmap()
+	concreteLocal := localAddress.IsValid() && !localAddress.IsUnspecified()
+	if concreteLocal && localAddress.Is6() != flow.IPv6 {
+		return nil, E.New("windivert: filter: local address family does not match the owned flow")
+	}
+	peer := flow.Peer
+	if peer.IsValid() {
+		if peer.Port() == 0 {
+			return nil, E.New("windivert: filter: owned peer has no port")
+		}
+		if peer.Addr().Unmap().Is6() != flow.IPv6 {
+			return nil, E.New("windivert: filter: peer address family does not match the owned flow")
+		}
+	} else if !flow.Outbound {
+		return nil, E.New("windivert: filter: an inbound owned flow needs a peer")
+	}
+	f := newFilterNode(0)
+	if flow.Outbound {
+		f.flags = filterFlagOutbound
+		f.add(fieldOutbound, testEQ, argUint32(1))
+	} else {
+		f.flags = filterFlagInbound
+		f.add(fieldInbound, testEQ, argUint32(1))
+	}
+	if flow.IPv6 {
+		f.flags |= filterFlagIPv6
+		f.add(fieldIPv6, testEQ, argUint32(1))
+	} else {
+		f.flags |= filterFlagIP
+		f.add(fieldIP, testEQ, argUint32(1))
+	}
+	if flow.TCP {
+		f.add(fieldTCP, testEQ, argUint32(1))
+	} else {
+		f.add(fieldUDP, testEQ, argUint32(1))
+	}
+	if flow.Outbound {
+		if concreteLocal {
+			f.add(srcAddressField(flow.IPv6), testEQ, addressArg(flow.IPv6, localAddress))
+		}
+		if peer.IsValid() {
+			f.add(dstAddressField(flow.IPv6), testEQ, addressArg(flow.IPv6, peer.Addr().Unmap()))
+		}
+		f.add(srcPortField(flow.TCP), testEQ, argUint32(uint32(flow.Local.Port())))
+		if peer.IsValid() {
+			f.add(dstPortField(flow.TCP), testEQ, argUint32(uint32(peer.Port())))
+		}
+	} else {
+		f.add(srcAddressField(flow.IPv6), testEQ, addressArg(flow.IPv6, peer.Addr().Unmap()))
+		if concreteLocal {
+			f.add(dstAddressField(flow.IPv6), testEQ, addressArg(flow.IPv6, localAddress))
+		}
+		f.add(srcPortField(flow.TCP), testEQ, argUint32(uint32(peer.Port())))
+		f.add(dstPortField(flow.TCP), testEQ, argUint32(uint32(flow.Local.Port())))
+	}
+	if flow.InterfaceIndex != 0 {
+		f.add(fieldIfIdx, testEQ, argUint32(flow.InterfaceIndex))
+	}
+	return f, nil
+}
+
+func srcAddressField(ipv6 bool) uint16 {
+	if ipv6 {
+		return fieldIPv6SrcAddr
+	}
+	return fieldIPSrcAddr
+}
+
+func dstAddressField(ipv6 bool) uint16 {
+	if ipv6 {
+		return fieldIPv6DstAddr
+	}
+	return fieldIPDstAddr
+}
+
+func addressArg(ipv6 bool, address netip.Addr) [4]uint32 {
+	if ipv6 {
+		return argIPv6(address)
+	}
+	return argIPv4(address)
+}
+
+func srcPortField(tcp bool) uint16 {
+	if tcp {
+		return fieldTCPSrcPort
+	}
+	return fieldUDPSrcPort
+}
+
+func dstPortField(tcp bool) uint16 {
+	if tcp {
+		return fieldTCPDstPort
+	}
+	return fieldUDPDstPort
+}
+
 func inboundTo(destinations []netip.Addr) (*Filter, error) {
 	if len(destinations) == 0 {
 		return nil, E.New("windivert: filter: no destination address")

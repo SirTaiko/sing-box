@@ -39,17 +39,15 @@ func planTCPLegacy(rule *Rule, packet *Packet, message []byte, offset int, facts
 				protocol = ruleProtocol(rule, facts)
 			}
 			sent := 0
+			// Same upstream placement as the staged planner: fakes ride the
+			// captured packet's sequence; tcp_mod.seq advances per payload item
+			// after its repeats (nfq/desync.c:1972, :2002-2008).
+			sequence := baseSeq
 			for _, payload := range fake.Payloads {
 				if payload.Protocol != protocol {
 					continue
 				}
 				for repeat := 0; repeat < fake.Repeats; repeat++ {
-					sequence := baseSeq - uint32(len(payload.Data))
-					if fake.Seq {
-						// Upstream seq mode advances the fake sequence so
-						// repeated fakes do not overlap each other.
-						sequence = baseSeq + uint32(repeat*len(payload.Data))
-					}
 					mods := TCPMods{Seq: &sequence, TTL: uint8(fake.TTL), IPIDSet: true, CorruptSum: fake.Fooling.BadChecksum}
 					if fake.Fooling.Timestamp {
 						mods.TSIncrement = fake.TSIncrement
@@ -76,6 +74,9 @@ func planTCPLegacy(rule *Rule, packet *Packet, message []byte, offset int, facts
 					}
 					batch.Packets = append(batch.Packets, generated)
 					sent++
+				}
+				if fake.Seq {
+					sequence += uint32(len(payload.Data))
 				}
 			}
 			if sent == 0 {

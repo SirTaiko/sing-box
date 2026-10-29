@@ -645,7 +645,7 @@ func TestUDPPeerQUICReassemblyAdmittedOnly(t *testing.T) {
 	fixture := newUDPPeerEngine(t, 1, "", udpPeerFakeRule())
 	lease := fixture.listener("192.0.2.1:40000")
 	source := netip.MustParseAddrPort("192.0.2.1:40000")
-	admitted := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.7:443"), buildQUICInitial())
+	admitted := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.7:443"), testQUICInitialPayload(t, "peer.example"))
 	injected := 0
 	if verdict := lease.HandlePacket(admitted.Raw, DirectionOutbound, func([]byte) error {
 		injected++
@@ -667,7 +667,7 @@ func TestUDPPeerQUICReassemblyAdmittedOnly(t *testing.T) {
 	}
 	reassembler := admittedFlow.quic
 
-	denied := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.8:443"), buildQUICInitial())
+	denied := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.8:443"), testQUICInitialPayload(t, "peer.example"))
 	if verdict := lease.HandlePacket(denied.Raw, DirectionOutbound, func([]byte) error {
 		t.Errorf("denied QUIC peer must not inject")
 		return nil
@@ -695,7 +695,7 @@ func TestUDPPeerRetirementWaitsForActiveUser(t *testing.T) {
 	fixture := newUDPPeerEngine(t, 1, "", udpPeerFakeRule())
 	lease := fixture.listener("192.0.2.1:40000")
 	source := netip.MustParseAddrPort("192.0.2.1:40000")
-	packet := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.7:443"), buildQUICInitial())
+	packet := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.7:443"), testQUICInitialPayload(t, "peer.example"))
 	injected := make(chan struct{})
 	unblock := make(chan struct{})
 	done := make(chan Verdict, 1)
@@ -713,7 +713,7 @@ func TestUDPPeerRetirementWaitsForActiveUser(t *testing.T) {
 
 	// Another datagram at capacity is still refused while the in-flight user
 	// holds the only charge.
-	other := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.8:443"), buildQUICInitial())
+	other := udpPeerPacket(t, source, netip.MustParseAddrPort("198.51.100.8:443"), testQUICInitialPayload(t, "peer.example"))
 	if verdict := lease.HandlePacket(other.Raw, DirectionOutbound, func([]byte) error {
 		t.Errorf("refused datagram must not inject")
 		return nil

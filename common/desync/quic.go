@@ -285,6 +285,29 @@ func defragQUICCrypto(plaintext []byte) ([]byte, bool) {
 	return buffer[:covered], true
 }
 
+// parseQUICCryptoClientHello extracts the SNI from a reassembled QUIC CRYPTO
+// stream. RFC 9001 §4.1.1 carries the TLS handshake in CRYPTO frames without
+// the TLS record layer, so the stream starts with the ClientHello handshake
+// message itself (HandshakeType 0x01) and not with a TLS record header 0x16.
+// The declared handshake body must be fully present before a hostname is
+// reported: a ClientHello split across Initial datagrams yields no fact until
+// its last byte arrives, and a truncated or differently framed stream is
+// refused instead of guessed.
+func parseQUICCryptoClientHello(handshake []byte) (string, bool) {
+	if len(handshake) < 4 || handshake[0] != 0x01 {
+		return "", false
+	}
+	handshakeLength := int(handshake[1])<<16 | int(handshake[2])<<8 | int(handshake[3])
+	if handshakeLength > len(handshake)-4 {
+		return "", false
+	}
+	host, _, _, _, ok := parseClientHelloBytes(handshake[:4+handshakeLength])
+	if !ok || host == "" {
+		return "", false
+	}
+	return host, true
+}
+
 // quicInitialServerName decrypts one Initial datagram, defragments its CRYPTO
 // stream and extracts the SNI of a complete ClientHello. The result is a fact,
 // not a guess: any failure in decryption, framing or hello parsing is reported
@@ -298,9 +321,5 @@ func quicInitialServerName(data []byte) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	host, _, _, _, complete := parseTLSClientHello(handshake)
-	if !complete || host == "" {
-		return "", false
-	}
-	return host, true
+	return parseQUICCryptoClientHello(handshake)
 }

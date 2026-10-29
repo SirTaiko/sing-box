@@ -119,7 +119,7 @@ func TestLearningReloadDetectsFileChange(t *testing.T) {
 	if err := os.WriteFile(path, []byte("a.example\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	config, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+path+`"},
+	config, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, path)+`},
 		"rules":[{"network":["tcp"],"port":[443],"learning":{}}]}`), "")
 	if err != nil {
 		t.Fatal(err)

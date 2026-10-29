@@ -338,18 +338,24 @@ type Config struct {
 }
 
 type Rule struct {
-	Name           string
-	Network        TransportMask
-	IPv4           bool
-	IPv6           bool
-	Ports          []PortRange
-	PortExclude    []PortRange
-	Protocols      []Protocol
-	AnyProtocol    bool
-	Domains        *domainSet
-	DomainsExclude *domainSet
-	IPs            *ipSet
-	IPsExclude     *ipSet
+	Name        string
+	Network     TransportMask
+	IPv4        bool
+	IPv6        bool
+	Ports       []PortRange
+	PortExclude []PortRange
+	Protocols   []Protocol
+	AnyProtocol bool
+	// DesyncAnyProtocol retains the profile's explicit desync_any_proto
+	// source bit. AnyProtocol above keeps its existing compiled meaning (the
+	// rule has no L7 selector, which an unrestricted match can imply); only
+	// this field permits the parser-refusal continuation of a QUIC Initial,
+	// so an omitted bit stays false even when matching is unrestricted.
+	DesyncAnyProtocol bool
+	Domains           *domainSet
+	DomainsExclude    *domainSet
+	IPs               *ipSet
+	IPsExclude        *ipSet
 
 	Methods   []Method
 	Start     Interval
@@ -403,11 +409,13 @@ type Rule struct {
 	domainExcludeFiles  []string
 	ipFiles             []string
 	ipExcludeFiles      []string
-	// domainRestrict/ipRestrict record that a positive list was configured,
-	// even when every configured source is empty. An empty positive snapshot
-	// matches nothing; it does not silently remove the restriction.
+	// domainRestrict records that a positive domain list was configured, even
+	// when every configured source is empty. An empty positive domain snapshot
+	// matches nothing; it does not silently remove the domain restriction.
+	// Positive IP includes have no such flag: the compiled union alone decides
+	// (see rebuildListSets), because pinned zapret v72.9 treats an all-empty
+	// include set as no restriction.
 	domainRestrict bool
-	ipRestrict     bool
 	// bundleSelection is the path-resolved provider bundle selector of this
 	// rule. domainBundle/... carry the entries read from that generation; they
 	// are rebuilt from the selector on every reload.
@@ -417,7 +425,6 @@ type Rule struct {
 	ipBundle             []string
 	ipExcludeBundle      []string
 	bundleDomainRestrict bool
-	bundleIPRestrict     bool
 }
 
 // IPIDMode is the upstream IPv4 ID handling mode of generated packets.
@@ -841,6 +848,10 @@ func compileRule(source *option.DirectDesyncRule, baseDir string, limits LimitSe
 	if source.AnyProtocol {
 		rule.AnyProtocol = true
 	}
+	// The explicit source bit is preserved separately: matching without an L7
+	// selector is not the same statement as "continue desync after a QUIC
+	// reassembly refusal".
+	rule.DesyncAnyProtocol = source.AnyProtocol
 	switch source.IPID {
 	case "":
 		// Upstream's zero-initialised profile defaults to IPID_SEQ: generated
@@ -1160,7 +1171,7 @@ func resolveListPath(baseDir string, path string) string {
 
 // readListFile reads one provider snapshot, accepts gzip with a bounded
 // expansion, and normalizes comments/CRLF. Multiple include files are unioned
-// by the caller; an empty file stays an empty positive snapshot.
+// by the caller; an empty file contributes no entries.
 //
 // The read is bounded before allocation: the regular-file size is checked
 // first and the byte stream is then limited, so an oversized snapshot is
@@ -1197,7 +1208,7 @@ func parseListContent(resolved string, content []byte) ([]string, error) {
 	lines := make([]string, 0, bytes.Count(content, []byte{'\n'})+1)
 	for _, line := range strings.Split(string(content), "\n") {
 		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
-		if line == "" || strings.HasPrefix(line, "#") {
+		if line == "" || isHostlistComment(line) {
 			continue
 		}
 		lines = append(lines, line)
@@ -1205,11 +1216,29 @@ func parseListContent(resolved string, content []byte) ([]string, error) {
 	return lines, nil
 }
 
+// isHostlistComment mirrors pinned nfq/hostlist.c: a record whose first byte is
+// '#', ';' or '/' is a comment line and contributes no host. The surrounding
+// whitespace was already removed by parseListContent, so the pinned prefix set
+// applies to the trimmed record; no other grammar is added.
+func isHostlistComment(line string) bool {
+	if line == "" {
+		return false
+	}
+	switch line[0] {
+	case '#', ';', '/':
+		return true
+	default:
+		return false
+	}
+}
+
 // rebuildListSets compiles the inline entries and every file union into fresh
 // sets. It is used by the initial compile and by the transactional reload, so
-// both paths apply exactly the same normalization. An empty positive list is
-// still a positive restriction: a configured-but-empty snapshot matches
-// nothing instead of silently matching everything.
+// both paths apply exactly the same normalization. Positive IP sources are
+// unioned, and that union alone decides the restriction: a union with no
+// entries imposes no positive-IP restriction, matching pinned zapret v72.9
+// ("old behavior compat: all include lists are empty means check passes"). An
+// empty positive domain snapshot keeps its own restriction and matches nothing.
 func (r *Rule) rebuildListSets(state *listBuildState) error {
 	if state == nil {
 		state = newListBuildState()
@@ -1308,7 +1337,6 @@ func (r *Rule) rebuildListSets(state *listBuildState) error {
 	r.Domains, r.DomainsExclude = domains, domainsExclude
 	r.IPs, r.IPsExclude = ips, ipsExclude
 	r.domainRestrict = len(r.domainInline) > 0 || len(r.domainFiles) > 0 || r.bundleDomainRestrict
-	r.ipRestrict = len(r.ipInline) > 0 || len(r.ipFiles) > 0 || r.bundleIPRestrict
 	return nil
 }
 

@@ -41,8 +41,10 @@ func TestStageGrammarAliasesAndValidation(t *testing.T) {
 	if _, err = CompileMethods([]string{"disorder", "fake"}, TransportMaskTCP); err == nil {
 		t.Fatal("out-of-order stages accepted")
 	}
-	if _, err = CompileMethods([]string{"synack", "multisplit"}, TransportMaskTCP); err == nil {
-		t.Fatal("zero stage without a first stage accepted")
+	if methods, err = CompileMethods([]string{"synack", "multisplit"}, TransportMaskTCP); err != nil {
+		t.Fatalf("zero+second (upstream-valid, ALT5 form) rejected: %v", err)
+	} else if len(methods) != 2 || methods[0].Name != "synack" || methods[1].Name != "multisplit" {
+		t.Fatalf("zero+second order not preserved: %+v", methods)
 	}
 	if _, err = CompileMethods([]string{"synack"}, TransportMaskUDP); err == nil {
 		t.Fatal("zero stage accepted on UDP")

@@ -19,7 +19,10 @@ type Facts struct {
 	// SLDStart/SLDEnd delimit the second-level domain inside the host value.
 	SLDStart int
 	SLDEnd   int
-	// SNIExtEnd is the offset just past the TLS server_name extension.
+	// SNIExtEnd is the offset of the TLS server_name extension BODY: the
+	// two-byte server name list length that follows the four-byte extension
+	// header. Upstream TLSPos anchors `sniext` on exactly that pointer
+	// (`ext-data`, nfq/protocol.c:462-470,549-554). Zero means no anchor.
 	SNIExtEnd int
 	// Host is the normalized host name, when known.
 	Host string
@@ -156,6 +159,12 @@ func (p Position) Resolve(facts Facts) (int, bool) {
 	case positionMidSLD:
 		base = (facts.SLDStart+facts.SLDEnd)/2 + p.Offset
 	case positionSNIExt:
+		// Upstream TLSPos returns no position at all when TLSFindExt did not
+		// find a server_name extension (nfq/protocol.c:549-554); the packet
+		// path uses zero as that "anchor absent" sentinel.
+		if facts.SNIExtEnd == 0 {
+			return 0, false
+		}
 		base = facts.SNIExtEnd + p.Offset
 	default:
 		return 0, false

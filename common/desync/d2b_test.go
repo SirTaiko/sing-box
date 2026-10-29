@@ -3,9 +3,11 @@ package desync
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -27,6 +29,18 @@ func (c *fakeClock) Advance(duration time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(duration)
 	c.mu.Unlock()
+}
+
+// jsonPath renders a filesystem path as a JSON string literal.  Concatenating
+// a raw Windows path (C:\\Users\\...) into a JSON document produces invalid
+// escape sequences, so the tests must encode the value instead.
+func jsonPath(t *testing.T, path string) string {
+	t.Helper()
+	encoded, err := json.Marshal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 func learningTestEngine(t *testing.T, learningJSON, rulesJSON string, clock *fakeClock) (*Engine, *testBackend) {
@@ -146,7 +160,7 @@ func TestLearningFailureThresholdWindowAndSnapshot(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "auto.txt")
 	clock := &fakeClock{now: time.Unix(1700000000, 0)}
-	engine, _ := learningTestEngine(t, `{"path":"`+path+`","max_hosts":8}`,
+	engine, _ := learningTestEngine(t, `{"path":`+jsonPath(t, path)+`,"max_hosts":8}`,
 		`[{"name":"learn","network":["tcp"],"any_protocol":true,"methods":["fake"],`+
 			`"fake":{"repeats":1,"payloads":[{"protocol":"unknown","hex":"00"}]},`+
 			`"learning":{"fail_threshold":3,"fail_time":"30s"}}]`, clock)
@@ -178,7 +192,11 @@ func TestLearningFailureThresholdWindowAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows has no POSIX permission bits: os.Chmod only toggles the read-only
+	// attribute, so any writable file reports 0666 and the product's Windows
+	// snapshot path (learning_windows.go) cannot express 0600 either.  The
+	// owner-private mode invariant is enforced and asserted on POSIX systems.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("snapshot mode = %04o, want 0600", info.Mode().Perm())
 	}
 	// The fail window expires: failures spread over more than 30 s never
@@ -301,9 +319,9 @@ func TestLearningSnapshotSafetyAndWriterClaims(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "auto.txt")
 	rules := learningRuleJSON(1, "")
-	engine, _ := learningTestEngine(t, `{"path":"`+path+`"}`, rules, nil)
+	engine, _ := learningTestEngine(t, `{"path":`+jsonPath(t, path)+`}`, rules, nil)
 	// Duplicate in-process writer is rejected before any file work.
-	config, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+path+`"},"rules":`+rules+`}`), "")
+	config, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, path)+`},"rules":`+rules+`}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +347,7 @@ func TestLearningSnapshotSafetyAndWriterClaims(t *testing.T) {
 	if err = os.Symlink(target, linkPath); err != nil {
 		t.Skipf("symlink unavailable: %v", err)
 	}
-	symlinkConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+linkPath+`"},"rules":`+rules+`}`), "")
+	symlinkConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, linkPath)+`},"rules":`+rules+`}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +364,7 @@ func TestLearningSnapshotSafetyAndWriterClaims(t *testing.T) {
 	if err = os.WriteFile(gzipPath, []byte{0x1f, 0x8b, 0x00}, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	gzipConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+gzipPath+`"},"rules":`+rules+`}`), "")
+	gzipConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, gzipPath)+`},"rules":`+rules+`}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +377,7 @@ func TestLearningSnapshotSafetyAndWriterClaims(t *testing.T) {
 	if err = os.WriteFile(largePath, []byte("a.example\nb.example\nc.example\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	boundedConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+largePath+`","max_hosts":2},"rules":`+rules+`}`), "")
+	boundedConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, largePath)+`,"max_hosts":2},"rules":`+rules+`}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +391,7 @@ func TestLearningSnapshotSafetyAndWriterClaims(t *testing.T) {
 	if err = os.WriteFile(debugPath, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	debugConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":"`+filepath.Join(directory, "debug-auto.txt")+`","debug_log":"`+debugPath+`"},"rules":`+rules+`}`), "")
+	debugConfig, err := Compile(enabledOption(`{"enabled":true,"learning":{"path":`+jsonPath(t, filepath.Join(directory, "debug-auto.txt"))+`,"debug_log":`+jsonPath(t, debugPath)+`},"rules":`+rules+`}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +406,7 @@ func TestLearningReloadKeepsLastGoodAndIsolatesOutbounds(t *testing.T) {
 	if err := os.WriteFile(path, []byte("initial.example\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	engine, _ := learningTestEngine(t, `{"path":"`+path+`"}`, learningRuleJSON(1, ""), nil)
+	engine, _ := learningTestEngine(t, `{"path":`+jsonPath(t, path)+`}`, learningRuleJSON(1, ""), nil)
 	if hosts := engine.LearnedHosts(); len(hosts) != 1 || hosts[0] != "initial.example" {
 		t.Fatalf("snapshot not loaded: %v", hosts)
 	}
@@ -419,7 +437,7 @@ func TestLearningReloadKeepsLastGoodAndIsolatesOutbounds(t *testing.T) {
 func TestLearningConcurrentObservationsReloadClose(t *testing.T) {
 	directory := t.TempDir()
 	path := filepath.Join(directory, "auto.txt")
-	engine, _ := learningTestEngine(t, `{"path":"`+path+`"}`, learningRuleJSON(2, ""), nil)
+	engine, _ := learningTestEngine(t, `{"path":`+jsonPath(t, path)+`}`, learningRuleJSON(2, ""), nil)
 	var workers sync.WaitGroup
 	for worker := 0; worker < 8; worker++ {
 		workers.Add(1)

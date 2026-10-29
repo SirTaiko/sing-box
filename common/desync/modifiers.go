@@ -512,13 +512,18 @@ func applyTLSMod(fake []byte, mod TLSMod, original []byte, random RandSource) ([
 		applied = true
 	}
 	if mod.DupSID && original != nil {
-		if len(original) < 44 || original[43] != out[layout.sessionIDLen] ||
-			len(original) < 44+int(original[43]) ||
-			layout.sessionID+int(out[layout.sessionIDLen]) > len(out) {
-			return fake, applied
+		// Upstream runtime_tls_mod only logs a refused dupsid: the session id
+		// is copied when the captured ClientHello carries one of the same
+		// length, otherwise the modifier is skipped and rnd/sni still apply
+		// (nfq/desync.c). Discarding the already-modified payload here would
+		// emit the unmodified fake on any client whose ClientHello has a
+		// different session-id length (e.g. schannel sends an empty one).
+		if len(original) >= 44 && original[43] == out[layout.sessionIDLen] &&
+			len(original) >= 44+int(original[43]) &&
+			layout.sessionID+int(out[layout.sessionIDLen]) <= len(out) {
+			copy(out[layout.sessionID:], original[44:44+int(original[43])])
+			applied = true
 		}
-		copy(out[layout.sessionID:], original[44:44+int(original[43])])
-		applied = true
 	}
 	if mod.RandomizeSNI || mod.SNI != "" {
 		if layout.sni == 0 {

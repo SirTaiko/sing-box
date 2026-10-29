@@ -1,0 +1,23 @@
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "zapret"
+    }
+  ],
+  "route": {
+    "final": "zapret"
+  }
+}

@@ -47,12 +47,12 @@ peer; a cutoff on one peer never affects another.
 | `ip_version` | `4`, `6` or both (listable) |
 | `port`, `port_range`, `port_exclude`, `port_range_exclude` | destination port predicates; ranges are `from-to` |
 | `protocol` | `http`, `tls`, `quic`, `wireguard`, `dht`, `discord`, `stun`, `unknown` |
-| `domain`, `domain_file`, `domain_exclude`, `domain_exclude_file` | zapret host/subdomain semantics: an entry matches the host and all subdomains; a `.example.com` entry matches subdomains only; exclusions win |
-| `ip_cidr`, `ip_cidr_file`, `ip_cidr_exclude`, `ip_cidr_exclude_file` | positive/negative IP prefixes. A positive `"any"` (inline or in a list file) removes the positive IP restriction only; a negative `"any"` excludes every destination; other predicates and exclusions still apply. An omitted positive source is unrestricted, while a configured but empty positive file or bundle dataset matches nothing |
+| `domain`, `domain_file`, `domain_exclude`, `domain_exclude_file` | zapret host/subdomain semantics: an entry matches the host and all subdomains; a `.example.com` entry matches subdomains only; exclusions win. While the hostname is unknown a rule whose positive or exclusion hostlist holds an effective entry cannot match (pinned `dp_match`/`PROFILE_HOSTLISTS_EMPTY`, where a file without entries contributes nothing); a rule whose hostlists stay empty is an ordinary catch-all, and `learning` rules are exempt |
+| `ip_cidr`, `ip_cidr_file`, `ip_cidr_exclude`, `ip_cidr_exclude_file` | positive/negative IP prefixes. A positive `"any"` (inline or in a list file) removes the positive IP restriction only; a negative `"any"` excludes every destination; other predicates and exclusions still apply. An omitted positive source is unrestricted, and a positive IP aggregate that resolves to no entries (empty or comment-only file, empty selected bundle dataset) also imposes no positive-IP restriction, as in pinned zapret v72.9 (`old behavior compat: all include lists are empty means check passes`). A positive domain list that resolves to no entries still matches nothing |
 | `methods` | ordered list of implemented stages: `fake`, `multisplit`, `multidisorder` (TCP); `fake` (UDP) |
 | `start`, `cutoff` | upstream spelling `nN` (packets), `dN` (data packets), `sN` (sequence span); zero/unset is unlimited |
 | `any_protocol` | disable protocol/SNI selection for this rule |
-| `skip_no_sni` | default `true`; a protocol/host rule does not match before L7 information exists |
+| `skip_no_sni` | default `true`; a protocol/host rule does not match before L7 information exists, and a completed QUIC ClientHello without a usable `server_name` extension is passed untouched even when this rule carries `any_protocol` |
 | `ip_id` | `zero` implements the ALT11 zero IPv4 ID contract; other upstream modes are rejected in this increment |
 | `fake` | `payloads`, `repeats`, `fooling`, `ts_increment`, `ttl`, `seq` |
 | `multisplit`, `multidisorder` | `split_pos`, `seqovl`, `seqovl_pattern` |
@@ -60,6 +60,10 @@ peer; a cutoff on one peer never affects another.
 `split_pos` accepts `N`, `-N` and marker forms `method`, `host`, `endhost`,
 `sld`, `endsld`, `midsld`, `sniext` with an optional `+N`/`-N` offset. Numeric
 zero is rejected. `seqovl` accepts an integer byte count or a position string.
+`sniext` anchors on the first byte of the `server_name` extension body (the
+two-byte name list length after the four-byte extension header), exactly like
+the pinned `TLSPos` (`nfq/protocol.c:462-470,549-554`); a ClientHello without
+that extension has no `sniext` position at all.
 
 Each fake payload sets exactly one byte source: `file`, `hex` or `base64`, plus
 an optional `offset`. Relative payload and list paths resolve through the
@@ -121,8 +125,11 @@ no packet backend) owns no peer state and no admission charge at all.
 ## Semantics implemented in this increment
 
 - Fake payloads are emitted payload-major: two payloads A, B with `repeats=2`
-  produce A, A, B, B. Fake packets carry `seq = original_seq - len(payload)`
-  and pass the original packet; split methods suppress it.
+  produce A, A, B, B. Every fake is sent at the captured packet's sequence and
+  the original packet passes; `seq` advances the sequence by a payload's length
+  only after all of that payload's repeats (upstream
+  `--dpi-desync-fake-tcp-mod=seq`, `nfq/desync.c:1972,2002-2008`). Split methods
+  suppress the original.
 - `multisplit` emits ascending real intervals. `seqovl` applies only to the
   first interval of the reassembled request (`i == 0 && reasm_offset == 0`): the
   overlap pattern is prefixed and the TCP sequence is reduced by the overlap.
@@ -162,19 +169,56 @@ no packet backend) owns no peer state and no admission charge at all.
   handshake/sequence/ack/window observations only; a Linux inbound packet is
   never re-egressed through the raw injection socket.
 - NFQUEUE delivery disables GSO (`NFQA_CFG_GSO` masked off) so captured packets
-  are wire-shaped before counters or transformations. Queue and table
-  identities are allocated from a bounded managed range, skip identities the
-  kernel report lists as bound, use the actual bind/config errors, and roll
-  back only their own bindings; a foreign queue or table is never bound,
-  deleted or unbound. On Windows the send path clears the checksum-valid
-  metadata so the driver materialises IPv4/TCP/UDP checksums from the bytes
-  actually sent.
+  are wire-shaped before counters or transformations. Linux uses the fixed
+  persistent anchors described below: at most two tables (`ip`/`ip6 sb_desync`)
+  and four base hooks (LOCAL_IN/LOCAL_OUT, filter, priority -150, policy accept)
+  per already-used network namespace, independent of capture count or restarts.
+  A capture owns only its regular chains, tagged entries and queue bindings;
+  queue sockets explicitly bind a nonzero high-bit netlink port and control
+  metadata sockets explicitly bind a nonzero low-bit port, so no class ever
+  autobinds or steals the other's port. A foreign queue, table or hook is never
+  bound, deleted, unbound, disabled or replaced. On Windows the send path clears
+  the checksum-valid metadata so the driver materialises IPv4/TCP/UDP checksums
+  from the bytes actually sent.
 - UDP protocol classification is a byte-exact port of the pinned upstream
   dissectors: QUIC Initial structure, WireGuard 148-byte handshake initiation,
   bencoded `d1:...e` DHT, Discord IP-discovery request and STUN. QUIC hostname
   facts come from decrypting the Initial (HKDF/AES-GCM/header protection) and
   defragmenting its CRYPTO frames; a datagram that does not authenticate yields
   no hostname. Media-port guesses are not used.
+- QUIC fake units follow the pinned delayed-replay admission
+  (`nfq/desync.c:2905-3044`), not one unit per datagram of the flow: while a
+  connection's CRYPTO ClientHello is incomplete the authenticated Initials are
+  held in the existing per-peer hold queue (bounded by the `max_held_*` budget
+  and the absolute `hold_timeout`) and the cycle owns no fake unit. When the
+  cycle completes, exactly one configured fake burst is emitted before the
+  oldest held original and the queued originals are then replayed in capture
+  order, each with its own single native disposition and its exact captured
+  bytes. The ordered selection at capture time is provisional only in the
+  hostname predicates: family, transport, address, port, protocol and limit
+  facts must already match, while a non-empty domain set or domain exclusion
+  cannot be evaluated before the ClientHello is decrypted. Such a profile owns
+  the bounded cycle; the validated hostname then re-runs the ordered selection
+  from the top of the profile list, and a higher-priority rule, an exclusion or
+  no final rule flushes the whole cycle without the provisional rule's burst.
+  Traffic that is definitively ineligible on its non-host facts is never held.
+  A datagram the QUIC session refuses cancels the reassembly: the queued
+  originals are flushed unchanged, and only a rule with the explicit
+  `any_protocol` bit (`desync_any_proto`) continues to tampering with the
+  refused datagram. Reassembly-resource exhaustion, exclusions, `skip_no_sni`,
+  an ended limit interval and a closed lease are not that permission and pass
+  the originals. A completed ClientHello whose `server_name` extension is
+  absent yields no hostname fact and honours `skip_no_sni` (default `true`)
+  even for an `any_protocol` rule; a present extension with an empty
+  `host_name` entry is a known-empty hostname. Only CRYPTO fragments are
+  deduplicated; captured duplicate datagrams are always distinct originals.
+- A fake stage reachable for UDP that has no QUIC payload gets the pinned
+  `dp_fake_defaults` payload: exactly 620 bytes, `0x40` followed by 619 zero
+  bytes (`params.c:265-271`). An explicitly configured QUIC payload replaces
+  the default, and the existing payload order, multiplicity and repeats are
+  kept. The unknown-payload path is unchanged (`fakeknown` still requires a
+  recognized protocol). These defaults are source-derived from the pinned
+  reference, not measured from a live run.
 - A narrowly scoped reply path observes reverse packets of the owned tuple. It
   feeds bounded handshake/window/hop facts, and applies the two reply-side
   transformations the pinned source performs before its reverse-direction
@@ -193,13 +237,20 @@ no packet backend) owns no peer state and no admission charge at all.
   flow and reports a reason; it never holds unrelated traffic.
 - A failed replacement batch releases the original packet and latches the flow,
   so user bytes are never lost. Cancellation, socket close and engine shutdown
-  release captures, queues and tables idempotently.
+  release the capture's own queues and tagged rules idempotently; the fixed
+  persistent anchors and their `a`/`t` markers remain for every later capture
+  of that namespace.
 
 ## Stage grammar and packet modifiers
 
 `methods` is the upstream `<mode0>,<mode>[,<mode2>]` stage list. Aliases are
 accepted with their upstream meaning (`split`/`disorder` → `fakedsplit`/
-`fakeddisorder`, `split2`/`disorder2` → `multisplit`/`multidisorder`).
+`fakeddisorder`, `split2`/`disorder2` → `multisplit`/`multidisorder`). A zero
+stage may stand alone (`syndata`) or be followed directly by a second stage
+(`syndata,multidisorder`): upstream consumes the zero token first and parses the
+remaining mode slots independently, so the first stage is optional between them.
+Invalid order, duplicate stages, unknown methods and unsupported transports stay
+rejected.
 
 | Stage | Names | Transport | Planned behaviour |
 |---|---|---|---|
@@ -307,21 +358,22 @@ capture start, never a silent no-op.
   dispatch in addition to the ownership envelope.
 - `linux.qnum` is the explicit NFQUEUE identity (`--qnum`, upstream range
   0..65535). It is range-validated at compile time, refused if another listener
-  already owns it or another live capture of this process reserved it, and
-  released on close. Absent keeps the managed allocator.
+  already owns it or another live capture of this process reserved it, and its
+  in-process reservation is released only after the retirement receipts below
+  prove the queue is gone. Absent keeps the managed allocator.
 - `linux.packet_limits.{tcp_out,tcp_in,udp_out,udp_in}` mirror upstream
   `NFQWS_*_PKT_*`. Absent is unlimited capture of that direction, an explicit
   `0` disables capture of that direction, and `N` keeps the first `N` packets
   as counted inclusively by the kernel conntrack (`ct ... packets 1-N`), not by
-  the semantic rule `cutoff`. The limit is part of the owned queue rule, so
-  ownership and cleanup are unchanged. Outgoing bounds use `ct original
-  packets`; a positive `tcp_in`/`udp_in` bound uses `ct reply packets 1-N`, the
-  actual reply-direction kernel counter, and is never replaced by the original
-  direction. The reply rule is emitted as one owned nftables batch because the
-  pinned `github.com/sagernet/nftables v0.3.0-mod.4` omits the direction
-  attribute for packet/byte counters; every other expression of that rule still
-  comes from the pinned library. A batch the kernel rejects is an activation
-  error, never a silently unlimited reply direction.
+  the semantic rule `cutoff`. The limit lives in the capture-owned dispatch or
+  queue rule of the fixed table, so anchor ownership and cleanup are unchanged.
+  Outgoing bounds use `ct original packets`; a positive `tcp_in`/`udp_in` bound
+  uses `ct reply packets 1-N`, the actual reply-direction kernel counter, and
+  is never replaced by the original direction. The reply rule is encoded with
+  the pinned expression encoders plus the one direction attribute the pinned
+  `github.com/sagernet/nftables v0.3.0-mod.4` omits for packet/byte counters; a
+  batch the kernel rejects is an activation error, never a silently unlimited
+  reply direction.
 - `filter_ttl_expired_icmp` (default `false`) mirrors upstream
   `FILTER_TTL_EXPIRED_ICMP` with the accepted ownership narrowing: an
   ICMP/ICMPv6 time-exceeded error is suppressed only when its quoted inner
@@ -330,12 +382,13 @@ capture start, never a silent no-op.
   complete L4 ports); a foreign tuple, a truncated/malformed quote, a reply-side
   quote and any parameter-problem/PMTU message pass unchanged. The lease must be
   live (its generation) and must actually have injected a replacement. Linux
-  installs an additional owned NFQUEUE rule in the capture's own table (family,
-  time-exceeded type, owned interface and, when the local address is concrete,
-  the quoted inner source address at its fixed offset); Windows opens an
-  additional owned WinDivert time-exceeded handle scoped by the local address or
-  the owned interface index. Neither platform ever installs a global ICMP drop
-  rule: unmatched packets are re-injected/accepted.
+  installs an additional tagged NFQUEUE entry in the fixed table's input base
+  chain that jumps to the capture-owned ICMP chain (family, time-exceeded type,
+  owned interface and, when the local address is concrete, the quoted inner
+  source address at its fixed offset); Windows opens an additional owned
+  WinDivert time-exceeded handle scoped by the local address or the owned
+  interface index. Neither platform ever installs a global ICMP drop rule:
+  unmatched packets are re-injected/accepted.
 - `linux.tcp_keepalive_port_range`/`linux.udp_keepalive_port_range` mirror
   `NFQWS_PORTS_*_KEEPALIVE` with the existing port-range grammar. A destination
   port in the range removes only the outgoing packet bound, exactly like the
@@ -351,6 +404,50 @@ capture start, never a silent no-op.
   owned native attempt (`SO_BINDTODEVICE` on Linux, the interface index on
   Windows), taken from the socket and used for both the IP cache key and the
   capture rule/isolation.
+
+### Linux persistent-anchor lifecycle
+
+Linux captures share one fixed set of nftables anchors per already-used network
+namespace (the ordinary process namespace plus the configured, actually used
+`netns` targets, deduplicated by pinned `(st_dev,st_ino)`):
+
+| Object | Exact shape |
+| --- | --- |
+| table | `ip sb_desync` and `ip6 sb_desync` |
+| base chains | `input`/`output`, type `filter`, hooks LOCAL_IN/LOCAL_OUT, priority `-150`, policy `accept` |
+| marker chain | `__sbds_v1`, regular and unreferenced by any packet path |
+| fixed markers | one RETURN rule `sbds:1:a:<family>:<epoch>` and one `sbds:1:t:<epoch>:<nexttag>` per family |
+| capture objects | regular chains `c_<capture>_o/i/e`, tagged `entry-*`/`inject` rules in the base chains, tagged `queue-*` rules in the capture chains, and `m`/`p` records in the marker chain |
+
+First enable creates the table, marker chain, `a` and `t` atomically with
+`NLM_F_EXCL` before any hook; each missing base chain is then created in its own
+EXCL transaction. The only rollback is the kernel-internal abort of the
+currently uncommitted initial hook creation. A committed anchor is never
+deleted, disabled, replaced or made dormant by ordinary operation, and
+`Close`, process exit or an empty queue are never permission to remove it.
+Full anchor removal stays separate external maintenance. Initialization errors
+are explicit and no per-flow rule is attached before the anchors are READY.
+
+A capture publishes a tagged manifest and a transient port record (`o`) before
+its private queue socket exists, binds an explicit high-bit queue port under
+the process-wide fork lock, binds `outq`, and durably publishes the `w` witness
+before releasing that lock. Retirement is ordered and receipt-driven: exact
+tagged entries are detached and read back; a separate zero-mutation
+BEGIN/GETGEN/END batch yields the only accepted negated-`EINVAL` enqueue fence
+(a lost reply repeats the no-mutation operation); the receive lane is joined,
+drained, a no-attribute CONFIG on each own queue returns its ACK0, non-witness
+queues are unbound explicitly, and only then is the owning socket closed with
+`outq` still bound. A fresh kernel absence query plus a fresh
+`nfnetlink_queue` read (or a genuine different-port row) is the witness
+release-scan receipt. Exact own chains and `m`/`p` are removed last, before the
+positive capture-retired receipt; the irreversible per-family tag high-water
+stays. An unproven effect keeps the same record, queue/port reservation, lease
+charge and endpoint and reports an incomplete close; it never becomes a silent
+success. The last owner also closes its owner-liveness socket and proves the
+exact abstract name is free before its final record is erased. When recovery
+observes a matching live process it leaves that owner untouched; unknown
+process visibility, an orphan guard or a busy inherited guard retains the
+record and refuses a new generation instead of appending one.
 
 ### Windows capture (`capture.windows`)
 
@@ -449,9 +546,12 @@ are scoped to one direct outbound:
   feed `autottl`, `orig.autottl` and `dup.autottl` before the current flow sees
   a reply. Nothing is persisted.
 - Domain/IP list files are read as unions. Plain text and gzip snapshots are
-  accepted (bounded expansion), with comments/blank lines/CRLF ignored and
-  case/trailing dots normalized. A configured positive list that resolves to
-  no entries matches nothing. `Engine.ReloadLists` re-reads every source
+  accepted (bounded expansion), with `#`, `;` and `/` comment lines (pinned
+  `nfq/hostlist.c`), blank lines and CRLF ignored and case/trailing dots
+  normalized. A positive IP aggregate that resolves to no
+  entries imposes no positive-IP restriction (pinned zapret v72.9
+  compatibility), while an empty positive domain list still matches nothing.
+  `Engine.ReloadLists` re-reads every source
   transactionally: packet lists, stream lists and the configured learned-file
   state are staged and published as one new selection snapshot. On any
   read/format/gzip/hash/budget error the last-good snapshot (all three parts and
@@ -516,8 +616,10 @@ packet rules and stream matches:
   stream rule of that outbound. Only the immutable generation directory it
   points at is read; no network, DNS or watcher participates.
 - Every referenced dataset is verified (manifest, shard names, hashes, entry and
-  byte limits) before publication. An explicitly selected empty dataset is a
-  positive restriction that matches nothing.
+  byte limits) before publication. An explicitly selected empty domain dataset
+  is a positive restriction that matches nothing; an all-empty positive IP
+  aggregate (bundle datasets and/or `ip_cidr` files) adds no positive-IP
+  restriction.
 - A provisioned nonempty exclusion dataset (`exclude_hosts`, `exclude_ip4`,
   `exclude_ip6`) that is relevant to a selected positive must be selected in the
   matching negative array; otherwise the configuration is rejected instead of
@@ -568,7 +670,8 @@ conntrack/ipcache; configuration loading itself stays read-only.
   first, a known host that is neither explicitly listed nor learned keeps the
   original untouched while failures are counted, and once learned the host is
   eligible like a positive hostlist entry. `domain_exclude` always wins and is
-  never learned.
+  never learned. An auto profile is exempt from the unknown-hostname hostlist
+  gate, so it stays selectable before any hostname is visible.
 - Thresholds are the source ones: `fail_threshold` 1..20 (default 3),
   `fail_time` 1..255 s (default 60 s), `retrans_threshold` 2..10 (default 3).
   Explicit zeros are rejected; absent values keep the defaults. Fail windows
@@ -679,6 +782,64 @@ keeps its slot: `active_leases` counts charged attempts, not open connections.
 The bound is per Engine instance/generation, not process-global, and it bounds
 retained attempts/events/waiters rather than bytes. Admission refusal matches
 `desync.ErrAdmissionRefused` and never falls back to plain I/O.
+
+### Windows receive progress and saturation
+
+Each Windows packet capture has one independent outbound native reader and one
+serial disposition worker. A synchronous held-original release can block that
+worker without blocking the next native receive. The worker preserves outbound
+receive-order dispatch and fake-before-original ordering. This is not a global
+wire-order guarantee across independent peer timers or inbound/ICMP handles.
+
+The private staging limits are **256 records and 8 MiB of raw bytes per capture**,
+plus one **65,575-byte receive scratch** and full 80-byte addresses. Reservation
+precedes an exact-capacity packet copy. Copy-in-progress, queued, in-service,
+semantic-held and unknown-completion records all share the same limits: dequeue
+or `Hold` does not release a reservation. Both a known terminal disposition and
+the worker's final nonuse are needed. This storage is separate from the existing
+semantic held-byte budgets (including UDP's semantic copies).
+
+Exhaustion is an explicit, sticky capture failure, not normal backpressure or a
+silent drop. The already-received overflow record stays in the single scratch;
+further endpoint operations through connected UDP, listener and cached
+`RawConn.Write` gates fail without entering the underlying call. Already-admitted
+operations keep their actual return values and completion responsibilities. One
+RawConn callback can emit many packets; a returned Write is not a matched native
+receive receipt. **Lossless delivery is not promised for traffic still below
+native receive at saturation.** After failure the same worker drains the older
+records, then borrows the same scratch one record at a time. There is no recovery
+to ordinary service, allocation of another overflow queue, packet retry or
+replacement endpoint on that lease.
+
+Close still fences semantic dispatch, joins old dispatch and held completions,
+releases ordered pass-through, joins endpoint producers, issues once-only
+`ShutdownRecv`, and requires `ERROR_NO_DATA` for every opened lane plus all
+reader/worker/callback joins and native `Done` receipts. A partial open drains
+each successfully opened handle too; zero started users is not proof of an empty
+native queue. The caller's two-second bound reports `ErrLeaseCloseIncomplete`
+without cancelling an original. A later proven safe retirement can release the
+endpoint while the capacity/delivery error remains nonnil. Unknown completion
+instead retains records, native resources, the charged lease and the actual
+endpoint reference. Ordinary resume never clears the sticky failure.
+
+Allocation is lazy: an idle capture owns descriptors and scratch, not 8 MiB of
+packet data. The new logical staging allowance is at most
+`8 MiB + 65,575 + 257*512 + 16 KiB = 8,602,151 bytes` per capture (512 bytes per
+record includes descriptors/ring/callback metadata; 16 KiB covers fixed
+bookkeeping). The existing outbound native receive shadow adds another 65,575
+bytes. Existing optional-lane/native buffers, semantic/parser state, goroutine
+stacks, allocator rounding, garbage awaiting collection and kernel queues are
+additional; this is **not an RSS bound**. With the default 4096 `max_leases`, raw
+staging alone could reach **32 GiB per Engine** if every capture fills its budget.
+Multiple Engines add their ceilings; this is not an 8 MiB process cap. Retained
+unsafe captures continue to consume the existing lease allowance.
+
+The permanent offline regression uses the actual Windows reader/worker, Lease,
+QUIC release and returned direct wrappers with scripted native boundaries. Its
+reversible overlay generator is
+`common/desync/testdata/windows_receive_model.py`; tests require the
+`desync_windows_model` build tag on Linux. Those results are source/model
+evidence, not native Windows, downstream PCAP or public-application acceptance.
 
 ## Provenance and licenses
 

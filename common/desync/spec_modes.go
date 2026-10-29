@@ -43,6 +43,14 @@ func compileStages(rule *Rule, source *option.DirectDesyncRule, baseDir string, 
 				return fakeErr
 			}
 			compiled.Fooling = mergeFooling(compiled.Fooling, mods.Fooling)
+			// Pinned startup runs dp_fake_defaults (nfqws.c:3509): fill
+			// missing UDP protocol collections, never append a default to
+			// an explicitly configured collection. Selection stays typed;
+			// Unknown's configured payload is not a recognized fallback.
+			if rule.Network&TransportMaskUDP != 0 {
+				addDefaultQUICPayload(compiled)
+				addDefaultRecognizedUDPPayloads(compiled)
+			}
 			rule.Fake = compiled
 			if first.Kind == MethodFakeKnown {
 				rule.FakeKnown = compiled
@@ -67,11 +75,17 @@ func compileStages(rule *Rule, source *option.DirectDesyncRule, baseDir string, 
 				return E.New("multisplit requires a multisplit object")
 			}
 			rule.MultiSplit, err = compileSplit(source.MultiSplit, baseDir, limits)
+			if err != nil {
+				return err
+			}
 		case MethodMultiDisorder:
 			if source.MultiDisorder == nil {
 				return E.New("multidisorder requires a multidisorder object")
 			}
 			rule.MultiDisorder, err = compileSplit(source.MultiDisorder, baseDir, limits)
+			if err != nil {
+				return err
+			}
 		case MethodFakeDSplit, MethodFakeDDisorder:
 			object := source.FakeDSplit
 			if second.Kind == MethodFakeDDisorder {
@@ -205,6 +219,63 @@ func validateSecondStageObjects(source *option.DirectDesyncRule, second *Method)
 		}
 	}
 	return nil
+}
+
+// pinnedQUICDefaultPayload is the source-derived dp_fake_defaults QUIC payload:
+// exactly 620 bytes, 0x40 followed by 619 zero bytes (zapret v72.9
+// params.c:265-271, reached from nfqws.c:3509). It is a source constant, not a
+// native observation; SHA256
+// 6e996949e69b2e99dba41b83660f43268527b8b4434f1ab33d61b4cfa1c89d1b.
+var pinnedQUICDefaultPayload = func() []byte {
+	payload := make([]byte, 620)
+	payload[0] = 0x40
+	return payload
+}()
+
+// addDefaultQUICPayload appends the pinned default QUIC payload to a compiled
+// fake stage that is reachable for UDP and has no QUIC payload of its own. An
+// explicit QUIC payload replaces the default; the default is protocol-specific
+// and independent of the explicit desync_any_proto bit.
+func addDefaultQUICPayload(fake *FakeSpec) {
+	if fake == nil {
+		return
+	}
+	for _, payload := range fake.Payloads {
+		if payload.Protocol == ProtocolQUIC {
+			return
+		}
+	}
+	fake.Payloads = append(fake.Payloads, Payload{
+		Protocol: ProtocolQUIC,
+		Data:     pinnedQUICDefaultPayload,
+		Source:   "pinned:dp_fake_defaults",
+	})
+}
+
+// Pinned v72.9 params.c:272-280 fills each absent recognized UDP collection
+// with one 64-zero-byte payload. desync.c:3198-3218 selects that collection,
+// not fake_unknown_udp. Preserve explicit items (including duplicates) and
+// their order; repeats/admission/cutoffs remain the existing stage's concern.
+func addDefaultRecognizedUDPPayloads(fake *FakeSpec) {
+	if fake == nil {
+		return
+	}
+	for _, protocol := range [...]Protocol{ProtocolWireGuard, ProtocolDHT, ProtocolDiscord, ProtocolSTUN} {
+		configured := false
+		for _, payload := range fake.Payloads {
+			if payload.Protocol == protocol {
+				configured = true
+				break
+			}
+		}
+		if !configured {
+			fake.Payloads = append(fake.Payloads, Payload{
+				Protocol: protocol,
+				Data:     make([]byte, 64),
+				Source:   "pinned:dp_fake_defaults",
+			})
+		}
+	}
 }
 
 func mergeFooling(a, b Fooling) Fooling {

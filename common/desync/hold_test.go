@@ -305,7 +305,7 @@ func TestUDPOriginalDeliveredAtMostOnce(t *testing.T) {
 	if err = lease.StartCapture(); err != nil {
 		t.Fatal(err)
 	}
-	payload := buildQUICInitial()
+	payload := testQUICInitialPayload(t, "udp-delivery.example")
 	packet := buildIPv4UDP(t, payload, 443)
 	attempts := 0
 	verdict := lease.HandlePacket(packet.Raw, DirectionOutbound, func([]byte) error {

@@ -1,6 +1,7 @@
 package desync
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 	"sync"
@@ -99,6 +100,24 @@ type flowState struct {
 	heldBytes    int
 	holdDeadline time.Time
 	holdTimer    *time.Timer
+	// holdGen guards the autonomous deadline callback: a timer armed for an
+	// older cycle can never release the records of a newer one.
+	holdGen uint64
+	// holdRelease joins the one detached synchronous release while callbacks
+	// run without mu. Outbound handlers, timers and teardown wait without mu
+	// before touching the next cycle. It carries no packets or extra ownership:
+	// the existing release keeps each reservation until its completer returns.
+	holdRelease chan struct{}
+
+	// udpFlow marks this state as one owned outbound UDP peer. The held-packet
+	// release is then the QUIC queue/replay implementation instead of the TCP
+	// range replay, and no flow-lifetime latch may be set by a cancelled cycle.
+	udpFlow bool
+	// udpRequestSeen records that this flow already completed one validated
+	// QUIC request cycle. Pinned calls process_retrans_fail only for a later
+	// completed request (replay offset zero), so the first request must not be
+	// counted as a retransmission and pending/refused fragments never are.
+	udpRequestSeen bool
 
 	// A released-incomplete message latches transformations off for the rest
 	// of that message. The latch is cleared by a later structured message
@@ -355,6 +374,25 @@ func (f *flowState) selectRule(config *Config, facts MatchFacts) *Rule {
 	if f.rule != nil {
 		return f.rule
 	}
+	for _, rule := range config.Rules {
+		if rule.Matches(facts) {
+			f.rule = rule
+			return rule
+		}
+	}
+	return nil
+}
+
+// reselectRule re-runs the ordered first-match selection from the top of the
+// configuration instead of keeping a provisional selection. It ports the
+// upstream dp_find() re-evaluation that runs when L7 facts are revealed
+// (nfq/desync.c, "desync profile changed by revealed l7 protocol or hostname"):
+// a host-scoped rule that could not match a SYN/datagram-time flow because the
+// hostname was unknown wins as soon as the first eligible message carries it.
+// No rule now matching clears the selection; the caller then delivers the
+// original unchanged, exactly like reasm_orig_cancel + send_orig.
+func (f *flowState) reselectRule(config *Config, facts MatchFacts) *Rule {
+	f.rule = nil
 	for _, rule := range config.Rules {
 		if rule.Matches(facts) {
 			f.rule = rule
@@ -727,7 +765,7 @@ func (f *flowState) needsAssembly() bool {
 // VerdictHold the caller must not issue a native disposition: the held original
 // is released exactly once through its Completer.
 func (f *flowState) handleTCP(config *Config, packet *Packet, intent Intent, inject Injector, complete Completer) (Verdict, *Batch) {
-	f.mu.Lock()
+	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
 	if f.failed {
 		return VerdictPass, nil
@@ -798,9 +836,11 @@ func (f *flowState) handleTCP(config *Config, packet *Packet, intent Intent, inj
 		return VerdictPass, nil
 	}
 	protocol, host, facts := protocolFacts(message)
+	protocolDiscovered := protocol != ProtocolUnknown && f.protocol == ProtocolUnknown
 	if protocol != ProtocolUnknown {
 		f.protocol = protocol
 	}
+	hostDiscovered := host != "" && f.host == ""
 	if host != "" {
 		f.host = host
 		// Hostname facts are cached only after validated L7 parsing, keyed by
@@ -810,7 +850,21 @@ func (f *flowState) handleTCP(config *Config, packet *Packet, intent Intent, inj
 	}
 	f.facts = facts
 	f.facts.MessageLength = len(message)
-	if f.rule != nil && !f.validateSelection(f.factsFor(packet)) {
+	if protocolDiscovered || hostDiscovered {
+		// The revealed L7 facts re-run the ordered selection from the top, so
+		// a provisional SYN-time rule cannot lock a host-scoped flow. The
+		// limiter latches keep upstream's OR semantics and the counters are
+		// untouched; a configuration with no matching rule passes the message
+		// unchanged, exactly like reasm_orig_cancel + send_orig.
+		previous := f.rule
+		if f.reselectRule(config, f.factsFor(packet)) == nil {
+			f.releaseHoldsLocked("no matching rule")
+			return VerdictPass, nil
+		}
+		if f.rule != previous {
+			f.prepareLearning()
+		}
+	} else if f.rule != nil && !f.validateSelection(f.factsFor(packet)) {
 		f.selectRule(config, f.factsFor(packet))
 		f.prepareLearning()
 	}
@@ -961,29 +1015,61 @@ func (f *flowState) holdLocked(packet *Packet, inject Injector, complete Complet
 		origModCutoff: latches.origMod, wssizeCutoff: latches.wssize, counters: f.counters})
 	f.heldBytes += len(packet.Raw)
 	if f.holdTimer == nil {
-		f.holdDeadline = f.now().Add(f.limits.HoldTimeout)
-		f.holdTimer = time.AfterFunc(f.limits.HoldTimeout, f.expire)
+		f.armHoldTimerLocked()
 	}
+}
+
+// armHoldTimerLocked arms the absolute deadline of the first held record. The
+// deadline is never refreshed by a later hold, a retransmission or a duplicate
+// frame; the generation captured by the callback prevents a timer of an older
+// cycle from releasing a newer one.
+func (f *flowState) armHoldTimerLocked() {
+	f.holdDeadline = f.now().Add(f.limits.HoldTimeout)
+	f.holdGen++
+	gen := f.holdGen
+	f.holdTimer = time.AfterFunc(f.limits.HoldTimeout, func() { f.expireGen(gen) })
 }
 
 // expire is the autonomous deadline release. It never waits for a later
 // packet: held originals are released in capture order even when the initial
 // flight will never be completed.
 func (f *flowState) expire() {
-	f.mu.Lock()
+	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
+	f.expireLocked(f.holdGen)
+}
+
+// expireGen is the timer-callback entry. A callback armed before the last
+// re-arm is a no-op: it can only return a long-finished cycle.
+func (f *flowState) expireGen(gen uint64) {
+	f.lockAfterHoldRelease()
+	defer f.mu.Unlock()
+	if gen != f.holdGen {
+		return
+	}
+	f.expireLocked(gen)
+}
+
+func (f *flowState) expireLocked(gen uint64) {
+	if gen != f.holdGen {
+		return
+	}
 	if len(f.holds) == 0 {
 		return
 	}
 	if f.now().Before(f.holdDeadline) {
 		// Fake clock (hermetic tests): retry at the real deadline offset.
-		f.holdTimer = time.AfterFunc(f.holdDeadline.Sub(f.now()), f.expire)
+		f.holdTimer = time.AfterFunc(f.holdDeadline.Sub(f.now()), func() { f.expireGen(gen) })
 		return
 	}
 	f.releaseHoldsLocked("incomplete message hold deadline exceeded")
-	f.holdDisabled = true
-	f.resumeCheck = true
-	f.resumeSeq = f.posOrig
+	if !f.udpFlow {
+		// A cancelled TCP message is latched off for the rest of that
+		// message; a UDP cycle is independent and must not disable the flow.
+		f.holdDisabled = true
+		f.resumeCheck = true
+		f.resumeSeq = f.posOrig
+	}
 }
 
 // releaseHoldsLocked releases every held original in capture order. reason
@@ -991,7 +1077,25 @@ func (f *flowState) expire() {
 // unchanged, transformations for that message are latched off and no replay is
 // counted. reason empty means the message completed and a whole batch is
 // planned for all held originals before any original is suppressed.
+//
+// Each held original still receives exactly one terminal disposition. A record
+// whose whole payload range is already carried by an earlier held original of
+// the same release is the exception: it is a captured retransmission of bytes
+// this release is already delivering, so it is released as a drop instead of
+// replaying those bytes a second time. Range coverage alone is not enough to
+// discard a captured record: a drop also requires that the record add no TCP
+// control effect of its own (a FIN must reach the peer) and that every payload
+// byte equal the value this release already delivers. A covered record that
+// fails either test passes unchanged, because a repeated range is harmless for
+// TCP while a lost flag or a substituted byte is not recoverable.
 func (f *flowState) releaseHoldsLocked(reason string) {
+	if f.udpFlow {
+		// UDP datagrams are never deduplicated or range-replayed: the queued
+		// records are one QUIC CRYPTO cycle whose replay is planned from the
+		// selected rule and delivered in capture order.
+		f.releaseUDPHoldsLocked(reason)
+		return
+	}
 	if len(f.holds) == 0 {
 		if f.holdTimer != nil {
 			f.holdTimer.Stop()
@@ -1005,10 +1109,8 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 	}
 	holds := f.holds
 	f.holds = nil
-	if f.budget != nil && f.limits.MaxHeldBytesTotal > 0 {
-		f.budget.Add(-int64(f.heldBytes))
-	}
-	f.heldBytes = 0
+	f.beginHoldReleaseLocked()
+	defer f.endHoldReleaseLocked()
 	start, message := f.reassembler.Contiguous()
 	plan := reason == "" && f.rule != nil && !f.holdDisabled && messageComplete(f.protocol, message)
 
@@ -1016,6 +1118,14 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 		entry  *holdEntry
 		batch  *Batch
 		failed bool
+		// covered is set when every payload byte of this captured original is
+		// already carried by an earlier held original of the same release and
+		// the record adds no control effect or different byte of its own.
+		covered bool
+		// coveredPass is set when the payload range is already released but the
+		// record still owns a control flag or a byte value the release has not
+		// delivered. It holds the reason it must pass unchanged instead.
+		coveredPass string
 	}
 	planned := make([]plannedHold, 0, len(holds))
 	// Phase 1: plan every held packet. A planning error suppresses nothing.
@@ -1042,6 +1152,46 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 		}
 		planned = append(planned, item)
 	}
+	// Phase 1b: a native retransmission of pending bytes is captured while the
+	// message is still held and therefore becomes a second pending original for
+	// a range an earlier pending original already owns. Releasing it would put
+	// exactly the same stream bytes on the wire a second time (the flush replay
+	// QA478 measured as extra held-prefix records). Every earlier original is
+	// dispositioned exactly once and always carries its payload - as the
+	// original, as an in-place modification, or as replacement packets that
+	// partition the payload - so a later record whose whole range is inside
+	// those already released ranges carries no new byte of its own.
+	//
+	// The range stays the only coverage authority. It is not sufficient to drop
+	// the record: a captured retransmission may own a TCP control effect (FIN
+	// while the prefix is still unacknowledged) or genuinely different bytes
+	// for the same range, and neither is reconstructible from coverage. Such a
+	// record passes unchanged; only an exact byte copy with no control flags of
+	// its own is released as the covered drop.
+	released := make([]payloadInterval, 0, len(planned))
+	releasedBytes := make([]releasedPayload, 0, len(planned))
+	covered := make([]bool, len(planned))
+	for index := range planned {
+		packet := planned[index].entry.packet
+		interval := payloadInterval{start: packet.TCPSeq, length: len(packet.Payload)}
+		if interval.length <= 0 {
+			continue
+		}
+		if payloadIntervalCovered(released, interval) {
+			switch {
+			case packet.TCPFlags&^(tcpFlagACK|tcpFlagPSH) != 0:
+				planned[index].coveredPass = "covered retransmission carries TCP control flags"
+			case !payloadReleasedExactly(releasedBytes, packet.TCPSeq, packet.Payload):
+				planned[index].coveredPass = "covered retransmission carries bytes not released by an earlier held original"
+			default:
+				planned[index].covered = true
+				covered[index] = true
+			}
+			continue
+		}
+		released = append(released, interval)
+		releasedBytes = appendReleasedPayload(releasedBytes, packet.TCPSeq, packet.Payload)
+	}
 	// Phase 2: send every replacement batch. If any send fails, the original
 	// of that packet and of every packet after it still pass, so no real byte
 	// is ever dropped after a partial failure (TCP treats the duplicates as
@@ -1049,6 +1199,14 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 	// original: the terminal disposition must always be safe on its own.
 	terminal := make([]bool, len(planned))
 	for index, item := range planned {
+		if covered[index] || item.coveredPass != "" {
+			// Its bytes are already carried by an earlier original of this
+			// release, so its own planned replacements must not be sent either:
+			// that is the same replay through the replacement path. A covered
+			// record that passes unchanged delivers its own captured bytes, so
+			// its planned split must equally not be injected.
+			continue
+		}
 		if item.batch == nil || item.failed {
 			continue
 		}
@@ -1064,7 +1222,7 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 				ok = false
 				break
 			}
-			if injectErr := item.entry.inject(replacement); injectErr != nil {
+			if injectErr := f.injectHeldLocked(item.entry.inject, replacement); injectErr != nil {
 				f.failed = true
 				ok = false
 				item.batch.Reason = "partial replacement failure: " + injectErr.Error()
@@ -1087,121 +1245,264 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 	// order. A Modify always carries the exact bytes belonging to this captured
 	// packet; there is no shared slot that another release could consume.
 	for index, item := range planned {
+		if covered[index] {
+			// One disposition for this captured record: it is dropped because
+			// an earlier original of the same release already carries exactly
+			// these bytes. The drop is terminal for the record, not a decision
+			// to stop delivering the stream: that obligation was discharged
+			// above.
+			f.completeTCPHoldLocked(item.entry, VerdictDrop, "duplicate of bytes released by an earlier held original", nil)
+			continue
+		}
+		if item.coveredPass != "" {
+			// The range is already carried by an earlier original, but this
+			// record owns a control effect or a different byte value that a
+			// drop would erase. It passes unchanged exactly once.
+			f.completeTCPHoldLocked(item.entry, VerdictPass, item.coveredPass, nil)
+			continue
+		}
 		if terminal[index] {
 			modified := item.batch.Modified
 			if item.batch.Original != VerdictModify {
 				modified = nil
 			}
-			item.entry.complete(item.batch.Original, item.batch.Reason, modified)
+			f.completeTCPHoldLocked(item.entry, item.batch.Original, item.batch.Reason, modified)
 			continue
 		}
 		reasonText := reason
 		if item.batch != nil && item.batch.Reason != "" {
 			reasonText = item.batch.Reason
 		}
-		item.entry.complete(VerdictPass, reasonText, nil)
+		f.completeTCPHoldLocked(item.entry, VerdictPass, reasonText, nil)
 	}
+}
+
+// lockAfterHoldRelease returns with mu held only after an earlier detached
+// release is terminal. Merely dropping mu around I/O would let a timer, Close
+// or a new cycle overtake that release and retire/reuse its ownership early.
+func (f *flowState) lockAfterHoldRelease() {
+	f.mu.Lock()
+	for f.holdRelease != nil {
+		done := f.holdRelease
+		f.mu.Unlock()
+		<-done
+		f.mu.Lock()
+	}
+}
+
+// begin/end are called under mu by the release owner. The entrypoints above
+// already joined any preceding release; UDP's empty-reason arm delegates to
+// replayUDPCycleLocked instead of starting a second release.
+func (f *flowState) beginHoldReleaseLocked() {
+	f.holdRelease = make(chan struct{})
+}
+
+func (f *flowState) endHoldReleaseLocked() {
+	close(f.holdRelease)
+	f.holdRelease = nil
+}
+
+// These callbacks can synchronously enter a pinned namespace helper or send a
+// native disposition. They receive only the detached plan/record, never mu.
+// Reacquire mu before updating state or returning to the locked caller.
+func (f *flowState) injectHeldLocked(inject Injector, raw []byte) error {
+	f.mu.Unlock()
+	defer f.mu.Lock()
+	return inject(raw)
+}
+
+func (f *flowState) completeHeldLocked(entry *holdEntry, verdict Verdict, reason string, modified []byte) {
+	f.mu.Unlock()
+	defer f.mu.Lock()
+	entry.complete(verdict, reason, modified)
+}
+
+// completeTCPHoldLocked retains the detached record's reservation through its
+// synchronous terminal disposition. The release receipt joins Close/timers;
+// removing a record from holds alone does not return its byte-budget capacity.
+func (f *flowState) completeTCPHoldLocked(entry *holdEntry, verdict Verdict, reason string, modified []byte) {
+	size := len(entry.packet.Raw)
+	f.completeHeldLocked(entry, verdict, reason, modified)
+	f.heldBytes -= size
+	if f.budget != nil && f.limits.MaxHeldBytesTotal > 0 {
+		f.budget.Add(-int64(size))
+	}
+}
+
+// payloadInterval is one TCP payload range in stream coordinates.
+type payloadInterval struct {
+	start  uint32
+	length int
+}
+
+// payloadIntervalCovered reports whether every byte of want is already inside
+// the union of the disjoint intervals in released. The held-prefix release uses
+// it to recognise a captured retransmission of pending bytes exactly, without a
+// payload digest and without refusing any record that carries a new byte.
+func payloadIntervalCovered(released []payloadInterval, want payloadInterval) bool {
+	if want.length <= 0 {
+		return false
+	}
+	position := want.start
+	end := want.start + uint32(want.length)
+	for sequenceBefore(position, end) {
+		next := position
+		found := false
+		for _, have := range released {
+			haveEnd := have.start + uint32(have.length)
+			if sequenceInside(position, have.start, haveEnd) {
+				next = haveEnd
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+		position = next
+	}
+	return true
+}
+
+// releasedPayload is one disjoint run of payload bytes an earlier held original
+// of the same release delivers on the wire, in capture order.
+type releasedPayload struct {
+	start uint32
+	data  []byte
+}
+
+// appendReleasedPayload records only the bytes of payload that no earlier
+// released record already carries, so the authority stays disjoint, bounded by
+// the held payload bytes of this release, and byte-exact for later comparisons.
+func appendReleasedPayload(released []releasedPayload, sequence uint32, payload []byte) []releasedPayload {
+	covered := make([]payloadInterval, 0, len(released))
+	for _, entry := range released {
+		covered = append(covered, payloadInterval{start: entry.start, length: len(entry.data)})
+	}
+	for _, piece := range uncoveredPayload(sequence, payload, covered) {
+		released = append(released, releasedPayload{start: piece.start, data: piece.data})
+	}
+	return released
+}
+
+// payloadReleasedExactly reports whether every byte of payload at sequence is
+// already carried with the same value by an earlier held original of this
+// release. A gap or a different byte means the record still owns information
+// this release has not delivered, so dropping it would substitute or erase
+// captured bytes.
+func payloadReleasedExactly(released []releasedPayload, sequence uint32, payload []byte) bool {
+	position := sequence
+	remaining := payload
+	for len(remaining) > 0 {
+		matched := false
+		for _, entry := range released {
+			end := entry.start + uint32(len(entry.data))
+			if !sequenceInside(position, entry.start, end) {
+				continue
+			}
+			offset := int(position - entry.start)
+			count := len(entry.data) - offset
+			if count > len(remaining) {
+				count = len(remaining)
+			}
+			if !bytes.Equal(entry.data[offset:offset+count], remaining[:count]) {
+				return false
+			}
+			position += uint32(count)
+			remaining = remaining[count:]
+			matched = true
+			break
+		}
+		if !matched {
+			return false
+		}
+	}
+	return true
 }
 
 // flushHeld releases held originals for flow teardown without counting replay.
 func (f *flowState) flushHeld(reason string) {
-	f.mu.Lock()
+	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
 	f.releaseHoldsLocked(reason)
 }
 
-func (f *flowState) handleUDP(config *Config, packet *Packet) (*Batch, error) {
-	f.mu.Lock()
+// udpAdmission is the pinned fake-unit admission decision for one outbound UDP
+// datagram. Pinned nfq/desync.c admits a QUIC fake unit per completed CRYPTO
+// reassembly cycle (delayed queue replay, reasm_offset == 0), not per datagram
+// that happens to share the flow: a retransmission or a cached-host match is
+// not by itself fake-eligible.
+type udpAdmission uint8
+
+const (
+	// udpAdmitStages: non-QUIC datagram; every configured UDP stage applies.
+	udpAdmitStages udpAdmission = iota
+	// udpAdmitCycleComplete: this Initial completed a ClientHello reassembly
+	// cycle, so the cycle's single fake burst belongs to it.
+	udpAdmitCycleComplete
+	// udpAdmitCyclePending: this Initial is part of an incomplete cycle.
+	// Upstream delays it and replays it without a fake burst of its own; the
+	// original still has to be delivered.
+	udpAdmitCyclePending
+	// udpAdmitCancel: the datagram was refused by the QUIC session and upstream
+	// cancelled the reassembly. Pinned continues to tampering only for a
+	// profile whose separate desync_any_proto bit is set; this increment passes
+	// the original untouched (see the handleUDP note on that scope).
+	udpAdmitCancel
+)
+
+// handleUDP processes one captured outbound UDP datagram. When it returns
+// VerdictHold the caller must not issue a native disposition: the queued
+// original is delivered exactly once through its Completer when the CRYPTO
+// cycle completes, is cancelled or times out.
+//
+// Hostname facts come from the pinned Initial decrypt plus CRYPTO reassembly,
+// never from a plaintext scan or a port guess. Fake-unit admission is the
+// pinned delayed-replay semantics: a captured partial Initial is queued and its
+// cycle owns exactly one fake burst, emitted before the queue head when the
+// cycle completes.
+func (f *flowState) handleUDP(config *Config, packet *Packet, inject Injector, complete Completer) (Verdict, *Batch, error) {
+	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
 	if f.failed || f.leaseClosed() {
-		return nil, nil
+		return VerdictPass, nil, nil
 	}
-	protocol := classifyUDPPayload(packet)
-	// Hostname facts come from the pinned upstream Initial decrypt + CRYPTO
-	// reassembly path, never from a plaintext scan or a port guess. CRYPTO
-	// fragments may span several Initial datagrams of the same connection;
-	// decryption and validation happen before any fact is reported.
-	host := ""
-	discoveredHost := false
-	if protocol == ProtocolQUIC {
-		if f.quic == nil {
-			f.quic = newQUICReassembler()
-		}
-		if name, ok := f.quic.add(packet.Payload); ok {
-			host = name
-			discoveredHost = true
-		}
-	}
-	facts := MatchFacts{Family: packet.Family, Transport: TransportUDP, Destination: packet.Dst,
-		Port: packet.DstPort, Protocol: protocol, Host: host, HostKnown: host != ""}
-	if facts.HostKnown {
-		_, facts.HostIsIP = parseIPLiteral(facts.Host)
-	}
-	if host == "" {
-		// Provisional selection may use a hostname learned for this exact
-		// destination address; it is revalidated below once L7 facts arrive.
-		if cached, isIP, ok := f.cache.lookupHost(packet.Dst, f.iface); ok {
-			facts.Host, facts.HostKnown, facts.HostIsIP = cached, true, isIP
-		}
-	}
-	if facts.HostKnown {
-		facts.Learned = f.learning.learned(facts.Host)
-	}
+	// Every captured datagram is counted exactly once, before any admission
+	// decision. Replayed originals and generated packets never reach this path.
 	f.observe(packet, config.TCPEmptyACK)
-	if f.rule == nil {
-		f.selectRule(config, facts)
-	} else if host != "" && !f.validateSelection(facts) {
-		// A provisional pre-L7 match must be reconsidered when the decrypted
-		// ClientHello names a different host or protocol. No permanent match is
-		// kept from the no-host SYN/datagram state.
-		f.selectRule(config, facts)
+	protocol := classifyUDPPayload(packet)
+	if protocol != ProtocolQUIC {
+		// A non-Initial outbound datagram ends an incomplete cycle before it is
+		// processed: no overtaking and no stale parser carry-over.
+		f.abortUDPCycleLocked("non-Initial UDP datagram")
+		f.resetQUICLocked()
+		return f.handleUDPVerdict(config, packet, protocol, udpHostFact{}, false, udpAdmitStages)
 	}
-	if facts.HostKnown {
-		f.setLearningHost(facts.Host)
+	if f.quic == nil {
+		f.quic = newQUICReassembler()
 	}
-	if !discoveredHost {
-		// Upstream counts a later datagram for an already-known auto-hostlist
-		// host as a retransmission trigger.
-		f.countLearningRetransmission(packet, true)
+	result := f.quic.feedCycle(packet.Payload)
+	if result.replaced {
+		// The datagram replaced the accumulated cycle identity or superseded its
+		// CRYPTO stream: the originals of the replaced cycle are delivered
+		// unchanged before this datagram is admitted. The parser already holds
+		// this datagram's fragments, so it is not reset here.
+		f.abortUDPCycleLocked("QUIC CRYPTO cycle replaced")
 	}
-	if f.learningSkip {
-		return nil, nil
+	switch result.state {
+	case quicCryptoComplete:
+		return f.completeUDPCycleLocked(config, packet, udpHostFactOf(result), result.sniPresent, inject, complete)
+	case quicCryptoPending:
+		return f.holdUDPInitialLocked(config, packet, inject, complete)
 	}
-	if f.rule == nil {
-		return nil, nil
+	// A parser refusal cancelled the reassembly: the pending cycle is released
+	// first and only the explicit any-protocol bit may transform the current
+	// datagram. A bounded-resource refusal always passes the original.
+	f.abortUDPCycleLocked("QUIC CRYPTO refusal")
+	if result.resource {
+		return VerdictPass, nil, nil
 	}
-	if host != "" {
-		f.host = host
-		f.facts.Host, f.facts.HostKnown = host, true
-		f.cache.learnHost(packet.Dst, f.iface, host)
-	}
-	f.refreshCutoffLatches()
-	if !f.intervalAllows() {
-		return nil, nil
-	}
-	batch, err := PlanUDP(f.rule, packet)
-	if err != nil {
-		f.failed = true
-		return &Batch{Original: VerdictPass, Reason: err.Error()}, nil
-	}
-	if batch == nil || batch.Original == VerdictDrop {
-		return batch, nil
-	}
-	// orig_mod applies to UDP originals too; duplicates follow the upstream
-	// udp_orig_send branch. The original datagram is delivered at most once:
-	// if any replacement send fails the engine returns Pass, never a second
-	// copy through this path.
-	planFacts := f.factsForPacket(packet)
-	working, modErr := applyOrigMod(f.rule, packet, planFacts, batch)
-	if modErr != nil {
-		f.failed = true
-		return &Batch{Original: VerdictPass, Reason: modErr.Error()}, nil
-	}
-	if err = planUDPDup(f.rule, packet, working, planFacts, batch, planFacts.Rand); err != nil {
-		f.failed = true
-		return &Batch{Original: VerdictPass, Reason: err.Error()}, nil
-	}
-	return batch, nil
+	return f.handleUDPVerdict(config, packet, protocol, udpHostFact{}, false, udpAdmitCancel)
 }
 
 // Intent is the immutable per-native-attempt description supplied by the

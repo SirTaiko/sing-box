@@ -1,0 +1,24 @@
+package windivert
+
+import "errors"
+
+// Offline native boundary only. Its methods never claim native execution.
+// Each successful/failed result is supplied by the test, not by default.
+type Handle struct {
+ RecvFunc func([]byte) (int, Address, error)
+ SendFunc func([]byte, *Address) (int, error)
+ ShutdownFunc func() error
+ CloseFunc func() error
+ DoneChan <-chan struct{}
+}
+var ReplayOpen func(*Filter, Layer, int16, Flag) (*Handle, error)
+func Open(f *Filter,l Layer,p int16,flags Flag)(*Handle,error) {
+ if ReplayOpen==nil { panic("unscripted model Open") }; return ReplayOpen(f,l,p,flags)
+}
+func(h *Handle) Recv(p []byte)(int,Address,error){return h.RecvFunc(p)}
+func(h *Handle) Send(p []byte,a *Address)(int,error){return h.SendFunc(p,a)}
+func(h *Handle) ShutdownRecv()error{return h.ShutdownFunc()}
+func(h *Handle) Close()error{return h.CloseFunc()}
+func(h *Handle) Done()<-chan struct{}{return h.DoneChan}
+var ReplayDrained=errors.New("model ERROR_NO_DATA")
+func IsDrained(e error)bool{return errors.Is(e,ReplayDrained)}
