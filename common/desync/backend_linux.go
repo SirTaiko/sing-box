@@ -634,6 +634,40 @@ func readAnchorTables(session anchorSession, family byte) ([]nftTableRecord, err
 	return tables, nil
 }
 
+// nftReplyTableIdentity returns the table a chain or rule dump reply actually
+// names. The reply is the only authority on that identity: the exact target
+// kernel's GETCHAIN dump walks every table of the requested family and ignores
+// the requested NFTA_CHAIN_TABLE attribute (nf_tables_dump_chains compares only
+// nfmsg->nfgen_family with table->family), while its GETRULE dump does honour
+// the requested table and chain (nf_tables_dump_rules). The kernel always emits
+// the attribute, so a missing, empty or repeated identity is a malformed
+// readback and is reported: it is never silently attributed to the requested
+// table.
+func nftReplyTableIdentity(attrs []netlink.Attribute, attr uint16) (string, error) {
+	var (
+		table string
+		seen  bool
+	)
+	for _, attribute := range attrs {
+		if attribute.Type&0x3fff != attr {
+			continue
+		}
+		if seen {
+			return "", errors.New("desync: duplicate nftables table identity attribute")
+		}
+		seen = true
+		data := attribute.Data
+		if len(data) > 0 && data[len(data)-1] == 0 {
+			data = data[:len(data)-1]
+		}
+		table = string(data)
+	}
+	if !seen || table == "" {
+		return "", errors.New("desync: nftables readback without a table identity")
+	}
+	return table, nil
+}
+
 func readAnchorChains(session anchorSession, family byte, table string) ([]nftChainRecord, error) {
 	replies, err := session.dump(unix.NFT_MSG_GETCHAIN, family, []netlink.Attribute{
 		{Type: unix.NFTA_TABLE_NAME, Data: []byte(table + "\x00")},
@@ -647,11 +681,24 @@ func readAnchorChains(session anchorSession, family byte, table string) ([]nftCh
 		if parseErr != nil {
 			return nil, parseErr
 		}
+		returnedTable, identityErr := nftReplyTableIdentity(attrs, unix.NFTA_CHAIN_TABLE)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		if returnedTable != table {
+			// A chain of another table of the same family. It is not ours: it
+			// is neither validated nor recorded, and nothing about it is
+			// mutated or adopted.
+			continue
+		}
+		if msgFamily != family {
+			return nil, fmt.Errorf("desync: nftables table %q readback has family %d, want %d", table, msgFamily, family)
+		}
 		name, ok := nftAttrString(attrs, unix.NFTA_CHAIN_NAME)
 		if !ok {
 			return nil, errors.New("desync: nftables chain readback without a name")
 		}
-		record := nftChainRecord{table: table, name: name, family: msgFamily}
+		record := nftChainRecord{table: returnedTable, name: name, family: msgFamily}
 		if hookData, hasHook := nftAttrBytes(attrs, unix.NFTA_CHAIN_HOOK); hasHook {
 			hookAttrs, hookErr := netlink.UnmarshalAttributes(hookData)
 			if hookErr != nil {
@@ -696,11 +743,25 @@ func readAnchorRules(session anchorSession, family byte, table string, chain str
 	}
 	rules := make([]nftRuleRecord, 0, len(replies))
 	for _, reply := range replies {
-		_, msgAttrs, parseErr := nftMessageData(reply)
+		msgFamily, msgAttrs, parseErr := nftMessageData(reply)
 		if parseErr != nil {
 			return nil, parseErr
 		}
-		record := nftRuleRecord{table: table}
+		returnedTable, identityErr := nftReplyTableIdentity(msgAttrs, unix.NFTA_RULE_TABLE)
+		if identityErr != nil {
+			return nil, identityErr
+		}
+		if returnedTable != table {
+			// A rule of another table. The target kernel filters this dump by
+			// table and chain already, so this selection is a redundant guard;
+			// it keeps the rule readback from ever recording a foreign-table
+			// rule as ours.
+			continue
+		}
+		if msgFamily != family {
+			return nil, fmt.Errorf("desync: nftables table %q rule readback has family %d, want %d", table, msgFamily, family)
+		}
+		record := nftRuleRecord{table: returnedTable}
 		record.chain, _ = nftAttrString(msgAttrs, unix.NFTA_RULE_CHAIN)
 		record.handle, _ = nftAttrUint64(msgAttrs, unix.NFTA_RULE_HANDLE)
 		if userdata, ok := nftAttrBytes(msgAttrs, unix.NFTA_RULE_USERDATA); ok {
@@ -2571,15 +2632,25 @@ func (c *linuxCapture) configureOn(queue uint16, family Family, attrs []netlink.
 	return err
 }
 
+// stillBoundQueues is the single ordered enumeration of the queues this capture
+// still owns: the outbound witness, the inbound observation queue and, when
+// configured, the owned ICMP-error queue. The ordered no-op CONFIG receipts and
+// the fresh queue_total=0 observation both consume it, so the two §3.3 receipts
+// can never enumerate different sets.
+func (c *linuxCapture) stillBoundQueues() []uint16 {
+	queues := []uint16{c.queue, c.inQueue}
+	if c.icmpQueue != 0 {
+		queues = append(queues, c.icmpQueue)
+	}
+	return queues
+}
+
 // observeOwnQueuesEmpty requires a fresh /proc/net/netfilter/nfnetlink_queue
 // read inside the capture's actual namespace with queue_total 0 for every still
 // bound own queue. A missing row while the queue is bound is an unproven
 // receipt, not emptiness.
 func (c *linuxCapture) observeOwnQueuesEmpty() error {
-	queues := []uint16{c.queue, c.inQueue}
-	if c.icmpQueue != 0 {
-		queues = append(queues, c.icmpQueue)
-	}
+	queues := c.stillBoundQueues()
 	var rows []queueRow
 	err := withAnchorNamespace(c.owner.nsFD, func() error {
 		fresh, readErr := readQueueReportInNamespace()
@@ -3847,12 +3918,10 @@ func (c *linuxCapture) retire() error {
 		c.owner.markRetained()
 		return err
 	}
-	// 3. Ordered no-op CONFIG ACK0 for every still-bound own queue.
-	queues := []uint16{c.inQueue}
-	if c.icmpQueue != 0 {
-		queues = append(queues, c.icmpQueue)
-	}
-	for _, queue := range queues {
+	// 3. Ordered no-op CONFIG ACK0 for every still-bound own queue, including
+	// the outbound witness: §3.3 requires the matching ACK0 for EACH bound own
+	// queue, not only for the non-witness ones.
+	for _, queue := range c.stillBoundQueues() {
 		if err := c.noOpQueueReceipt(queue); err != nil {
 			c.owner.markRetained()
 			return err
