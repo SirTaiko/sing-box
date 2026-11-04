@@ -338,3 +338,27 @@ func TestSendCopiesCallerBytesBeforeNativeAccess(t *testing.T) {
 		t.Fatalf("caller slice = %q, want the caller-owned mutation %q", callerPacket, want)
 	}
 }
+
+// TestBatchAddressCountExactReceipt pins the raw RecvBatch address-byte length
+// validation: a driver-written length is divided into packets only when it is a
+// non-zero whole number of 80-byte records within WINDIVERT_BATCH_MAX. A
+// remainder must never be floored away.
+func TestBatchAddressCountExactReceipt(t *testing.T) {
+	valid := map[uint32]int{
+		addressSize:            1,
+		2 * addressSize:        2,
+		BatchMax * addressSize: BatchMax,
+	}
+	for written, want := range valid {
+		count, err := batchAddressCount(written)
+		if err != nil || count != want {
+			t.Fatalf("batchAddressCount(%d) = %d, %v; want %d", written, count, err, want)
+		}
+	}
+	invalid := []uint32{0, addressSize - 1, addressSize + 1, BatchMax*addressSize + 1, ^uint32(0)}
+	for _, written := range invalid {
+		if count, err := batchAddressCount(written); err == nil {
+			t.Fatalf("batchAddressCount(%d) accepted as %d packets", written, count)
+		}
+	}
+}

@@ -87,7 +87,7 @@ func planTCPLegacy(rule *Rule, packet *Packet, message []byte, offset int, facts
 			if spec == nil {
 				continue
 			}
-			segments, err := planMultiSplit(spec, packet, facts, offset, packetEnd)
+			segments, err := planMultiSplit(spec, packet, facts, offset, packetEnd, newIPAllocator(rule, packet, facts.Rand))
 			if err != nil {
 				return nil, err
 			}
@@ -100,7 +100,7 @@ func planTCPLegacy(rule *Rule, packet *Packet, message []byte, offset int, facts
 			if spec == nil {
 				continue
 			}
-			segments, err := planMultiDisorder(spec, packet, facts, offset, packetEnd)
+			segments, err := planMultiDisorder(spec, packet, facts, offset, packetEnd, newIPAllocator(rule, packet, facts.Rand))
 			if err != nil {
 				return nil, err
 			}
@@ -150,7 +150,7 @@ func overlapBytes(spec *SplitSpec, length int) []byte {
 	return pattern
 }
 
-func planMultiSplit(spec *SplitSpec, packet *Packet, facts Facts, offset int, packetEnd int) ([][]byte, error) {
+func planMultiSplit(spec *SplitSpec, packet *Packet, facts Facts, offset int, packetEnd int, allocator *IPAllocator) ([][]byte, error) {
 	payload := packet.Payload
 	positions := localizePositions(spec, facts, offset, packetEnd)
 	if len(positions) == 0 {
@@ -179,10 +179,11 @@ func planMultiSplit(spec *SplitSpec, packet *Packet, facts Facts, offset int, pa
 			segment = append(prefix, segment...)
 			sequence -= uint32(overlap)
 		}
-		mods := TCPMods{Seq: &sequence, ExtHeaders: facts.OrigExtHeaders}
-		if spec.OverlapIsPos {
-			mods.IPIDSet = true
-		}
+		// Upstream builds one packet per transmitted interval and advances the
+		// per-packet IPv4 ID cursor after every rawsend (desync.c:2293-2301),
+		// so consecutive interval IDs are sequential under the seq modes.
+		id, _ := allocator.Value()
+		mods := TCPMods{Seq: &sequence, IPID: id, IPIDSet: true, ExtHeaders: facts.OrigExtHeaders}
 		generated, err := BuildTCP(packet, segment, mods)
 		if err != nil {
 			return nil, fmt.Errorf("desync: build multisplit segment: %w", err)
@@ -193,7 +194,7 @@ func planMultiSplit(spec *SplitSpec, packet *Packet, facts Facts, offset int, pa
 	return segments, nil
 }
 
-func planMultiDisorder(spec *SplitSpec, packet *Packet, facts Facts, offset int, packetEnd int) ([][]byte, error) {
+func planMultiDisorder(spec *SplitSpec, packet *Packet, facts Facts, offset int, packetEnd int, allocator *IPAllocator) ([][]byte, error) {
 	payload := packet.Payload
 	positions := localizePositions(spec, facts, offset, packetEnd)
 	if len(positions) == 0 {
@@ -233,7 +234,8 @@ func planMultiDisorder(spec *SplitSpec, packet *Packet, facts Facts, offset int,
 				sequence -= uint32(overlap)
 			}
 		}
-		mods := TCPMods{Seq: &sequence, IPIDSet: true, ExtHeaders: facts.OrigExtHeaders}
+		id, _ := allocator.Value()
+		mods := TCPMods{Seq: &sequence, IPID: id, IPIDSet: true, ExtHeaders: facts.OrigExtHeaders}
 		generated, err := BuildTCP(packet, segment, mods)
 		if err != nil {
 			return nil, fmt.Errorf("desync: build multidisorder segment: %w", err)

@@ -315,7 +315,7 @@ func (f *flowState) handleUDPVerdict(config *Config, packet *Packet, protocol Pr
 // holdUDPInitialLocked admits one authenticated partial Initial to the bounded
 // cycle queue. It returns VerdictHold: the record's Completer owns its single
 // terminal disposition and the native backend must not answer it now.
-func (f *flowState) holdUDPInitialLocked(config *Config, packet *Packet, inject Injector, complete Completer) (Verdict, *Batch, error) {
+func (f *flowState) holdUDPInitialLocked(config *Config, packet *Packet, inject packetInjection, complete Completer) (Verdict, *Batch, error) {
 	facts := f.udpMatchFactsLocked(packet, ProtocolQUIC, udpHostFact{})
 	// The provisional rule owns the cycle, not a claim that the datagram is
 	// transformable now: a hostname-scoped profile stays reachable while only
@@ -362,7 +362,7 @@ func (f *flowState) holdUDPInitialLocked(config *Config, packet *Packet, inject 
 // original joins the queue, the rule is selected from the authoritative facts
 // and the whole queue is replayed with the configured fake burst before its
 // first original.
-func (f *flowState) completeUDPCycleLocked(config *Config, packet *Packet, fact udpHostFact, sniPresent bool, inject Injector, complete Completer) (Verdict, *Batch, error) {
+func (f *flowState) completeUDPCycleLocked(config *Config, packet *Packet, fact udpHostFact, sniPresent bool, inject packetInjection, complete Completer) (Verdict, *Batch, error) {
 	// The profile in scope for pinned's desync_skip_nosni check is the one that
 	// owns the cycle: the provisional rule of the incomplete queue, or the
 	// datagram-time selection of a standalone Initial (dp before the hostname
@@ -461,7 +461,7 @@ func (f *flowState) releaseUDPHoldsLocked(reason string) {
 		return
 	}
 	if reason == "" {
-		_ = f.replayUDPCycleLocked(f.rule, nil)
+		_ = f.replayUDPCycleLocked(f.rule, packetInjection{})
 		return
 	}
 	holds := f.holds
@@ -507,20 +507,20 @@ func (f *flowState) planUDPReplayEntryLocked(rule *Rule, entry *holdEntry, fakeA
 // terminal disposition. A partial send failure never becomes a Drop and never
 // retries an already submitted packet: the original is delivered unchanged
 // instead.
-func (f *flowState) deliverUDPPlanLocked(entry *holdEntry, batch *Batch, inject Injector) (Verdict, []byte, string, error) {
+func (f *flowState) deliverUDPPlanLocked(entry *holdEntry, batch *Batch, inject packetInjection) (Verdict, []byte, string, error) {
 	if batch == nil {
 		return VerdictPass, nil, "", nil
 	}
 	if f.leaseClosed() {
 		return VerdictPass, nil, "lease closed", nil
 	}
-	for index, replacement := range batch.Packets {
-		if inject == nil {
+	if len(batch.Packets) > 0 {
+		if !inject.available() {
 			return VerdictPass, nil, "no injector for a replayed QUIC Initial", fmt.Errorf("desync: UDP replay has no injector")
 		}
-		if err := f.injectHeldLocked(inject, replacement); err != nil {
+		if sent, err := f.injectHeldLocked(inject, batch.Packets); err != nil {
 			return VerdictPass, nil, "partial replacement failure: " + err.Error(),
-				fmt.Errorf("desync: inject replayed UDP packet %d: %w", index, err)
+				fmt.Errorf("desync: inject replayed UDP after %d successful replacements: %w", sent, err)
 		}
 	}
 	verdict := batch.Original
@@ -541,7 +541,7 @@ func (f *flowState) deliverUDPPlanLocked(entry *holdEntry, batch *Batch, inject 
 // once in capture order. The cycle is finished (parser, queue and timer reset)
 // even when the attempted transformation fails, so the next independent
 // authenticated cycle can be admitted.
-func (f *flowState) replayUDPCycleLocked(rule *Rule, inject Injector) error {
+func (f *flowState) replayUDPCycleLocked(rule *Rule, inject packetInjection) error {
 	holds := f.holds
 	f.holds = nil
 	if f.holdTimer != nil {

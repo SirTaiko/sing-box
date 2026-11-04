@@ -1052,6 +1052,10 @@ func (l *Lease) snapshotUDPFlows() (flows []*flowState, pinned bool) {
 // the terminal verdict later. For every other verdict the caller owns the
 // disposition and must not call complete.
 func (l *Lease) HandlePacket(raw []byte, direction Direction, inject Injector, complete Completer) Verdict {
+	return l.handlePacket(raw, direction, packetInjection{single: inject}, complete)
+}
+
+func (l *Lease) handlePacket(raw []byte, direction Direction, inject packetInjection, complete Completer) Verdict {
 	packet, err := ParsePacket(raw)
 	if err != nil {
 		return VerdictPass
@@ -1108,14 +1112,12 @@ func (l *Lease) HandlePacket(raw []byte, direction Direction, inject Injector, c
 		if batch == nil {
 			return VerdictPass
 		}
-		for index, replacement := range batch.Packets {
-			if inject == nil {
-				return VerdictPass
-			}
-			if injectErr := inject(replacement); injectErr != nil {
-				l.failFlow(packet, fmt.Errorf("desync: inject packet %d: %w", index, injectErr))
-				return VerdictPass
-			}
+		if len(batch.Packets) > 0 && !inject.available() {
+			return VerdictPass
+		}
+		if sent, injectErr := inject.send(batch.Packets); injectErr != nil {
+			l.failFlow(packet, fmt.Errorf("desync: inject after %d successful replacements: %w", sent, injectErr))
+			return VerdictPass
 		}
 		// Never suppress the original without a replacement, and never ask the
 		// native layer for a Modify without the bytes to deliver.
@@ -1159,16 +1161,14 @@ func (l *Lease) HandlePacket(raw []byte, direction Direction, inject Injector, c
 	if batch == nil {
 		return VerdictPass
 	}
-	for index, replacement := range batch.Packets {
-		if inject == nil {
-			return VerdictPass
-		}
-		if injectErr := inject(replacement); injectErr != nil {
-			// A partial replacement batch is never a reason to drop real user
-			// bytes: release the original and stop transforming this flow.
-			l.failFlow(packet, fmt.Errorf("desync: inject packet %d: %w", index, injectErr))
-			return VerdictPass
-		}
+	if len(batch.Packets) > 0 && !inject.available() {
+		return VerdictPass
+	}
+	if sent, injectErr := inject.send(batch.Packets); injectErr != nil {
+		// A partial replacement batch is never a reason to drop real user
+		// bytes: release the original and stop transforming this flow.
+		l.failFlow(packet, fmt.Errorf("desync: inject after %d successful replacements: %w", sent, injectErr))
+		return VerdictPass
 	}
 	if batch.Original == VerdictDrop && len(batch.Packets) == 0 {
 		return VerdictPass

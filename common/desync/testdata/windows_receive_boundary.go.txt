@@ -6,7 +6,12 @@ import "errors"
 // Each successful/failed result is supplied by the test, not by default.
 type Handle struct {
  RecvFunc func([]byte) (int, Address, error)
+ RecvBatchFunc func([]byte) (int, []Address, error)
+ RecvBatchIntoFunc func([]byte, []Address) (int, []Address, error)
+ RecvBatchViewFunc func(int, func([]byte, []Address)) (int, error)
+ RecvBatchViewForwardFunc func(int, func([]byte, []Address, func() (int, error))) (int, error)
  SendFunc func([]byte, *Address) (int, error)
+ SendBatchFunc func([]byte, []Address) (int, error)
  ShutdownFunc func() error
  CloseFunc func() error
  DoneChan <-chan struct{}
@@ -16,9 +21,46 @@ func Open(f *Filter,l Layer,p int16,flags Flag)(*Handle,error) {
  if ReplayOpen==nil { panic("unscripted model Open") }; return ReplayOpen(f,l,p,flags)
 }
 func(h *Handle) Recv(p []byte)(int,Address,error){return h.RecvFunc(p)}
+func(h *Handle) RecvBatch(p []byte)(int,[]Address,error){
+ if h.RecvBatchFunc==nil { panic("unscripted model RecvBatch") }
+ return h.RecvBatchFunc(p)
+}
+// Caller storage must have BatchMax room before the receive, the receipt is
+// copied only on success, and the returned slice aliases that storage. Models
+// without a dedicated callback adapt the established allocating fake here.
+func(h *Handle) RecvBatchInto(p []byte,a []Address)(int,[]Address,error){
+ if len(a)<BatchMax { panic("model RecvBatchInto short caller storage") }
+ if h.RecvBatchIntoFunc!=nil { return h.RecvBatchIntoFunc(p,a) }
+ if h.RecvBatchFunc==nil { panic("unscripted model RecvBatchInto") }
+ n,addrs,err:=h.RecvBatchFunc(p)
+ if err!=nil { return n,nil,err }
+ if len(addrs)>len(a) { panic("model RecvBatchInto receipt exceeds caller storage") }
+ copy(a,addrs)
+ return n,a[:len(addrs)],nil
+}
+// The synchronous terminal view: the fake owns the modeled lane backing and
+// invokes the consumer only for a validated terminal receipt, exactly like the
+// production wrapper. The consumer's views end when it returns.
+func(h *Handle) RecvBatchView(n int,consume func([]byte,[]Address))(int,error){
+ if h.RecvBatchViewFunc==nil { panic("unscripted model RecvBatchView") }
+ return h.RecvBatchViewFunc(n,consume)
+}
+// The receive-bound forwarding companion: the fake owns the modeled lane
+// backing and hands the consumer a one-shot capability that submits the same
+// terminal batch. It never models kernel behavior beyond invoking that
+// capability once; the caller's scope rules are exercised by the wrapper test.
+func(h *Handle) RecvBatchViewForward(n int,consume func([]byte,[]Address,func()(int,error)))(int,error){
+ if h.RecvBatchViewForwardFunc==nil { panic("unscripted model RecvBatchViewForward") }
+ return h.RecvBatchViewForwardFunc(n,consume)
+}
 func(h *Handle) Send(p []byte,a *Address)(int,error){return h.SendFunc(p,a)}
+func(h *Handle) SendBatch(p []byte,a []Address)(int,error){
+ if h.SendBatchFunc==nil { panic("unscripted model SendBatch") }
+ return h.SendBatchFunc(p,a)
+}
 func(h *Handle) ShutdownRecv()error{return h.ShutdownFunc()}
 func(h *Handle) Close()error{return h.CloseFunc()}
 func(h *Handle) Done()<-chan struct{}{return h.DoneChan}
 var ReplayDrained=errors.New("model ERROR_NO_DATA")
 func IsDrained(e error)bool{return errors.Is(e,ReplayDrained)}
+const BatchMax=255

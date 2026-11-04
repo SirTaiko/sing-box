@@ -834,6 +834,7 @@ func (s *linuxCaptureSeams) setFenceReply(reply func(request enqueueFenceRequest
 // is modelled separately from an unavailable one.
 func installLinuxCaptureSeams(t *testing.T, queue *fakeNFQueueConn) *linuxCaptureSeams {
 	t.Helper()
+	installForkModelTransport(t)
 	kernel := newFakeQueueKernel()
 	previousGet := getThreadNetns
 	previousSet := setThreadNetns
@@ -850,6 +851,16 @@ func installLinuxCaptureSeams(t *testing.T, queue *fakeNFQueueConn) *linuxCaptur
 	if queue != nil {
 		queue.kernel = kernel
 		seams.first = queue
+	}
+	// A regular file supplies only a stable dev/inode MODEL identity. Never
+	// inspect/open the host's network namespace in these lifecycle fixtures.
+	namespacePath := filepath.Join(t.TempDir(), "model-namespace")
+	if err := os.WriteFile(namespacePath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	getThreadNetns = func() (netns.NsHandle, error) {
+		fd, err := unix.Open(namespacePath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		return netns.NsHandle(fd), err
 	}
 	setThreadNetns = func(netns.NsHandle) error { return nil }
 	openQueueTransport = seams.dial

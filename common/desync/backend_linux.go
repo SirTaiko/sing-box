@@ -3,6 +3,7 @@
 package desync
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -56,8 +57,8 @@ const (
 	// queueCapacity bounds the kernel-side queue of one owned capture. It must
 	// cover the held originals of one flow plus the initial flight.
 	queueCapacity = 8192
-	// queueStopDrain bounds the teardown drain of one owned capture. The
-	// window is only an interrupt; emptiness is proven by the transport
+	// queueStopDrain is a legacy scheduling interval used by historical tests,
+	// not a production drain bound. Emptiness is proven by the transport
 	// readiness probe and the ordered no-op CONFIG receipts.
 	queueStopDrain = 10 * time.Millisecond
 
@@ -126,10 +127,29 @@ func withAnchorNamespace(namespaceFD int, operation func() error) error {
 	return operationErr
 }
 
+// linuxForkSafetyOnce joins the pinned Go os.checkPidfdOnce through its public
+// FindProcess path BEFORE any backend descriptor or fork token exists. Its
+// capability-false result is cached by os too: FindProcess falls back to a PID
+// Process, not a desync compatibility failure. The private handle is released
+// exactly once. OnceValue also retains/rethrows a panic; no caller can bypass
+// an incomplete initializer. There is deliberately no eager package init.
+var linuxForkSafetyOnce = sync.OnceValue(func() error {
+	process, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return fmt.Errorf("desync: initialize fork safety: %w", err)
+	}
+	return process.Release()
+})
+
+func ensureLinuxForkSafety() error { return linuxForkSafetyOnce() }
+
 // withForkReadToken holds the single nonrecursive syscall.ForkLock read token
 // for one short interval. No nested helper may take it again: a waiting fork
 // writer would deadlock the nested read lock.
 func withForkReadToken(operation func() error) error {
+	if err := ensureLinuxForkSafety(); err != nil {
+		return err
+	}
 	syscall.ForkLock.RLock()
 	defer syscall.ForkLock.RUnlock()
 	return operation()
@@ -214,7 +234,11 @@ var (
 		}
 		return &anchorGuard{fd: fd, name: name}, nil
 	}
-	probeAnchorGuardAddress = func(name string) (busy bool, err error) {
+	// Separate syscall seams let lifecycle models exercise the actual token
+	// and transaction ordering without creating a host abstract socket.
+	bindAnchorTransactionSocket  = bindAbstractDatagram
+	closeAnchorTransactionSocket = unix.Close
+	probeAnchorGuardAddress      = func(name string) (busy bool, err error) {
 		fd, bindErr := bindAbstractDatagram(name)
 		if bindErr == nil {
 			_ = unix.Close(fd)
@@ -350,10 +374,13 @@ type anchorOwner struct {
 	guard  *anchorGuard
 	refs   int
 	closed bool
+	// published counts captures with durable w, not waiting first openers.
+	// Guard retirement is serialized with publication by the namespace tx.
+	published int
 	// retiring is set when the last capture started owner retirement: no new
 	// reference may be admitted from that point.
 	retiring bool
-	// ready is closed once the guard binding finished (or failed).
+	// ready describes registry initialization, NOT guard publication.
 	ready   chan struct{}
 	initErr error
 	// retained is set when a close or failed open could not prove retirement;
@@ -369,9 +396,12 @@ var anchorOwnerRegistry = struct {
 func newAnchorProcessToken() (string, error) { return newAnchorNonce() }
 
 // anchorOwnerAcquire pins the calling thread's actual namespace and returns a
-// referenced owner. The first caller of a namespace binds the owner guard; the
-// concrete anchor initialization runs on every capture open, not only here.
+// referenced owner. Guard birth/publication belongs to the first namespace
+// transaction, not registry acquisition.
 func anchorOwnerAcquire() (*anchorOwner, error) {
+	if err := ensureLinuxForkSafety(); err != nil {
+		return nil, err
+	}
 	namespaceFD, key, err := anchorNamespaceHandle()
 	if err != nil {
 		return nil, err
@@ -409,29 +439,7 @@ func anchorOwnerAcquire() (*anchorOwner, error) {
 	owner := &anchorOwner{key: key, nsFD: namespaceFD, token: token, refs: 1, ready: make(chan struct{})}
 	anchorOwnerRegistry.owners[key] = owner
 	anchorOwnerRegistry.Unlock()
-	initErr := withAnchorNamespace(namespaceFD, func() error {
-		guard, err := bindAnchorGuardSocket(anchorGuardAddress(token))
-		if err != nil {
-			return fmt.Errorf("desync: bind anchor owner guard: %w", err)
-		}
-		owner.guard = guard
-		return nil
-	})
-	owner.mu.Lock()
-	owner.initErr = initErr
-	owner.mu.Unlock()
 	close(owner.ready)
-	if initErr != nil {
-		owner.mu.Lock()
-		owner.closed = true
-		owner.mu.Unlock()
-		anchorOwnerRegistry.Lock()
-		delete(anchorOwnerRegistry.owners, key)
-		anchorOwnerRegistry.Unlock()
-		_ = owner.guard.close()
-		_ = unix.Close(namespaceFD)
-		return nil, initErr
-	}
 	return owner, nil
 }
 
@@ -447,6 +455,15 @@ func (o *anchorOwner) releaseRef() {
 		o.refs--
 	}
 	last := o.refs <= 0
+	if last && o.guard != nil {
+		// Never silently drop an unpublished or unretired guard here. Clean
+		// first-open failures already closed it under the token; published
+		// guards require the last-record receipt, including probe close.
+		o.refs = 1
+		o.retained = true
+		o.mu.Unlock()
+		return
+	}
 	if last {
 		o.closed = true
 	}
@@ -459,7 +476,6 @@ func (o *anchorOwner) releaseRef() {
 		delete(anchorOwnerRegistry.owners, o.key)
 	}
 	anchorOwnerRegistry.Unlock()
-	_ = o.guard.close()
 	if o.nsFD >= 0 {
 		_ = unix.Close(o.nsFD)
 		o.nsFD = -1
@@ -485,17 +501,17 @@ func (o *anchorOwner) retainedState() bool {
 	return o.retained
 }
 
-// beginCaptureRetirement marks the owner RETIRING when this capture is its last
-// reference. From that point no new capture reference is admitted, so the
-// guard release probe and the last record removal are ordered against every
-// later open.
+// beginCaptureRetirement marks the owner RETIRING for its last published
+// capture, under the namespace transaction. Waiting opener references do not
+// keep that guard alive: they recheck RETIRING before guard birth/publication.
+// No new reference is admitted between guard probe and last-record removal.
 func (o *anchorOwner) beginCaptureRetirement() (bool, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.retiring {
 		return false, errors.New("desync: anchor owner is already retiring")
 	}
-	if o.refs <= 1 {
+	if o.published <= 1 {
 		o.retiring = true
 		return true, nil
 	}
@@ -508,6 +524,11 @@ func (c *linuxCapture) releaseOwnerRef() {
 		return
 	}
 	c.refHeld = false
+	if c.outWitnessed {
+		c.owner.mu.Lock()
+		c.owner.published--
+		c.owner.mu.Unlock()
+	}
 	c.owner.releaseRef()
 }
 
@@ -515,23 +536,31 @@ func (c *linuxCapture) releaseOwnerRef() {
 // Namespace transaction.
 // ---------------------------------------------------------------------------
 
-// withAnchorTransaction runs one short bounded metadata operation under the
+// withAnchorTransaction runs one synchronous metadata operation under the
 // namespace transaction abstract socket and the single fork-read token. The
 // transaction fd is created after the fork token and closed before it is
-// released, so a child can never inherit it.
+// released, so a child can never inherit it. Only pre-callback bind contention
+// is retried; a side-effectful operation must never be replayed by errno.
 func withAnchorTransaction(owner *anchorOwner, operation func(anchorSession) error) error {
 	if owner == nil || owner.nsFD < 0 {
 		return errors.New("desync: anchor namespace is not open")
 	}
+	// This invocation-local identity cannot come from the callback/session.
+	// A joined namespace-restore error is deliberately not this exact marker.
+	bindBusy := fmt.Errorf("desync: namespace transaction bind busy: %w", unix.EADDRINUSE)
 	var lastErr error
 	for attempt := 0; attempt < anchorTransactionAttempts; attempt++ {
 		err := withAnchorNamespace(owner.nsFD, func() error {
 			return withForkReadToken(func() error {
-				fd, bindErr := bindAbstractDatagram(anchorTransactionAddress)
+				fd, bindErr := bindAnchorTransactionSocket(anchorTransactionAddress)
 				if bindErr != nil {
+					if errors.Is(bindErr, unix.EADDRINUSE) {
+						lastErr = bindErr
+						return bindBusy
+					}
 					return bindErr
 				}
-				defer unix.Close(fd)
+				defer closeAnchorTransactionSocket(fd)
 				session, sessionErr := openAnchorSession()
 				if sessionErr != nil {
 					return sessionErr
@@ -543,10 +572,9 @@ func withAnchorTransaction(owner *anchorOwner, operation func(anchorSession) err
 		if err == nil {
 			return nil
 		}
-		if !errors.Is(err, unix.EADDRINUSE) {
+		if err != bindBusy {
 			return err
 		}
-		lastErr = err
 		time.Sleep(anchorTransactionBackoff * time.Duration(attempt+1))
 	}
 	return fmt.Errorf("desync: namespace transaction stayed busy: %w", lastErr)
@@ -577,15 +605,18 @@ type anchorManifestRecord struct {
 // anchorFamilyState is one fully validated family of the fixed anchors plus
 // every captured record that exists in that namespace.
 type anchorFamilyState struct {
-	family       string
-	tableFamily  byte
-	epoch        string
-	nextTag      uint64
-	anchorHandle uint64
-	tagHandle    uint64
-	captures     map[string]*anchorManifestRecord
-	chains       map[string]map[string]uint64 // capture key -> chain name -> handle
-	baseRules    map[string][]anchorTaggedRule
+	// Presence is validated only for this coherent snapshot, never cached.
+	baseInputPresent  bool
+	baseOutputPresent bool
+	family            string
+	tableFamily       byte
+	epoch             string
+	nextTag           uint64
+	anchorHandle      uint64
+	tagHandle         uint64
+	captures          map[string]*anchorManifestRecord
+	chains            map[string]map[string]uint64 // capture key -> chain name -> handle
+	baseRules         map[string][]anchorTaggedRule
 }
 
 func captureKey(process, capture string) string { return process + "/" + capture }
@@ -1003,6 +1034,12 @@ func parseMarkerRules(records []nftRuleRecord, family, epoch string) (anchorReco
 // generation-consistent: the nftables generation is sampled before and after
 // the dumps and a changed generation repeats the whole read.
 func readAnchorFamilyState(session anchorSession, family Family) (anchorFamilyState, error) {
+	return readAnchorFamilySnapshot(session, family, false)
+}
+
+// readAnchorFamilySnapshot shares the complete validator. Only bootstrap and
+// its base-creation reconciliation may tolerate genuinely absent fixed bases.
+func readAnchorFamilySnapshot(session anchorSession, family Family, allowMissingBase bool) (anchorFamilyState, error) {
 	_, familyByte, err := anchorFamilyNames(family)
 	if err != nil {
 		return anchorFamilyState{}, err
@@ -1012,7 +1049,7 @@ func readAnchorFamilyState(session anchorSession, family Family) (anchorFamilySt
 		if err != nil {
 			return anchorFamilyState{}, err
 		}
-		state, err := readAnchorFamilyStateOnce(session, family)
+		state, err := readAnchorFamilyStateOnce(session, family, allowMissingBase)
 		if err != nil {
 			return anchorFamilyState{}, err
 		}
@@ -1027,7 +1064,7 @@ func readAnchorFamilyState(session anchorSession, family Family) (anchorFamilySt
 	return anchorFamilyState{}, errors.New("desync: nftables generation changed during anchor readback")
 }
 
-func readAnchorFamilyStateOnce(session anchorSession, family Family) (anchorFamilyState, error) {
+func readAnchorFamilyStateOnce(session anchorSession, family Family, allowMissingBase bool) (anchorFamilyState, error) {
 	familyName, familyByte, err := anchorFamilyNames(family)
 	if err != nil {
 		return anchorFamilyState{}, err
@@ -1078,6 +1115,17 @@ func readAnchorFamilyStateOnce(session anchorSession, family Family) (anchorFami
 		epoch := anchorRule.record.epoch
 		anchorRule, tagRule, manifests, err = parseMarkerRules(rules, familyName, epoch)
 		if err == nil {
+			// Chain names carry only the capture token, not the process token.
+			// Build this index afresh for this validated snapshot; ambiguity is
+			// a collision, never an arbitrary manifest chosen by map iteration.
+			manifestByCapture := make(map[string]string, len(manifests))
+			for key, manifest := range manifests {
+				capture := manifest.record.capture
+				if _, duplicate := manifestByCapture[capture]; duplicate {
+					return anchorFamilyState{}, fmt.Errorf("desync: ambiguous capture token %s", capture)
+				}
+				manifestByCapture[capture] = key
+			}
 			state := anchorFamilyState{
 				family:       familyName,
 				tableFamily:  familyByte,
@@ -1092,20 +1140,28 @@ func readAnchorFamilyStateOnce(session anchorSession, family Family) (anchorFami
 			// Validate the fixed base chains and every rule they contain.
 			outputHook, inputHook := uint32(unix.NF_INET_LOCAL_OUT), uint32(unix.NF_INET_LOCAL_IN)
 			output, hasOutput := byName[anchorBaseOutputName]
-			if !hasOutput {
+			if !hasOutput && !allowMissingBase {
 				return anchorFamilyState{}, errors.New("desync: fixed output base chain is missing")
 			}
-			if chainErr := validateAnchorBaseChain(output, familyName, familyByte, anchorBaseOutputName, outputHook, epoch); chainErr != nil {
-				return anchorFamilyState{}, fmt.Errorf("desync: fixed output base chain is mismatched: %w", chainErr)
+			if hasOutput {
+				if chainErr := validateAnchorBaseChain(output, familyName, familyByte, anchorBaseOutputName, outputHook, epoch); chainErr != nil {
+					return anchorFamilyState{}, fmt.Errorf("desync: fixed output base chain is mismatched: %w", chainErr)
+				}
 			}
 			input, hasInput := byName[anchorBaseInputName]
-			if !hasInput {
+			if !hasInput && !allowMissingBase {
 				return anchorFamilyState{}, errors.New("desync: fixed input base chain is missing")
 			}
-			if chainErr := validateAnchorBaseChain(input, familyName, familyByte, anchorBaseInputName, inputHook, epoch); chainErr != nil {
-				return anchorFamilyState{}, fmt.Errorf("desync: fixed input base chain is mismatched: %w", chainErr)
+			if hasInput {
+				if chainErr := validateAnchorBaseChain(input, familyName, familyByte, anchorBaseInputName, inputHook, epoch); chainErr != nil {
+					return anchorFamilyState{}, fmt.Errorf("desync: fixed input base chain is mismatched: %w", chainErr)
+				}
 			}
+			state.baseInputPresent, state.baseOutputPresent = hasInput, hasOutput
 			for _, base := range []string{anchorBaseOutputName, anchorBaseInputName} {
+				if _, present := byName[base]; !present {
+					continue
+				}
 				baseRules, ruleErr := readAnchorRules(session, familyByte, anchorTableName, base)
 				if ruleErr != nil {
 					return anchorFamilyState{}, ruleErr
@@ -1149,14 +1205,8 @@ func readAnchorFamilyStateOnce(session anchorSession, family Family) (anchorFami
 				if !ok {
 					return anchorFamilyState{}, fmt.Errorf("desync: unknown anchor chain %q", name)
 				}
-				key := ""
-				for manifestKey, manifest := range manifests {
-					if manifest.record.capture == capture {
-						key = manifestKey
-						break
-					}
-				}
-				if key == "" {
+				key, found := manifestByCapture[capture]
+				if !found {
 					return anchorFamilyState{}, fmt.Errorf("desync: capture chain %q has no manifest", name)
 				}
 				if err := validateAnchorRegularChain(chain, "capture chain"); err != nil {
@@ -1269,7 +1319,7 @@ func ensureAnchorFamily(session anchorSession, family Family, needCreate bool) e
 			return fmt.Errorf("desync: anchor table creation did not become visible: %w", err)
 		}
 	}
-	state, err := readAnchorFamilyStateAllowNoBase(session, family)
+	state, err := readAnchorFamilySnapshot(session, family, true)
 	if err != nil {
 		return err
 	}
@@ -1278,23 +1328,48 @@ func ensureAnchorFamily(session anchorSession, family Family, needCreate bool) e
 		name     string
 		hooknum  int
 		userdata string
+		present  bool
 	}
 	specs := []chainSpec{
-		{anchorBaseInputName, int(unix.NF_INET_LOCAL_IN), anchorBaseUserdata(state.epoch, anchorBaseInputName)}, {anchorBaseOutputName, int(unix.NF_INET_LOCAL_OUT), anchorBaseUserdata(state.epoch, anchorBaseOutputName)},
+		{anchorBaseInputName, int(unix.NF_INET_LOCAL_IN), anchorBaseUserdata(state.epoch, anchorBaseInputName), state.baseInputPresent},
+		{anchorBaseOutputName, int(unix.NF_INET_LOCAL_OUT), anchorBaseUserdata(state.epoch, anchorBaseOutputName), state.baseOutputPresent},
+	}
+	reconcile := func(name string) (bool, error) {
+		fresh, readErr := readAnchorFamilySnapshot(session, family, true)
+		if readErr != nil {
+			return false, readErr
+		}
+		if fresh.epoch != state.epoch {
+			return false, errors.New("desync: anchor epoch changed during base creation")
+		}
+		if name == anchorBaseInputName {
+			return fresh.baseInputPresent, nil
+		}
+		return fresh.baseOutputPresent, nil
 	}
 	for _, spec := range specs {
+		if spec.present {
+			continue
+		}
 		request := nftBaseChainMessage(familyByte, anchorTableName, spec.name, "filter", spec.hooknum, anchorBaseHookPriority, []byte(spec.userdata))
 		if _, err = session.batch([]nftRequest{request}); err != nil {
 			// Either the chain was committed before a lost ACK or it is
-			// absent. Never compensate by deleting a committed chain.
-			if readErr := validateBaseChainPresent(session, family, spec.name, spec.userdata); readErr != nil {
-				if !definitelyAbsentChain(session, family, spec.name) {
-					return err
+			// coherently absent at the selected epoch. Invalid data is never
+			// absence, and committed chains are never deleted as compensation.
+			present, readErr := reconcile(spec.name)
+			if readErr != nil {
+				return fmt.Errorf("desync: reconcile anchor base chain %s: %w", spec.name, errors.Join(err, readErr))
+			}
+			if present {
+				continue
+			}
+			if _, retryErr := session.batch([]nftRequest{request}); retryErr != nil {
+				present, readErr = reconcile(spec.name)
+				if readErr == nil && !present {
+					readErr = errors.New("desync: fixed base chain is absent after retry")
 				}
-				if _, retryErr := session.batch([]nftRequest{request}); retryErr != nil {
-					if readErr = validateBaseChainPresent(session, family, spec.name, spec.userdata); readErr != nil {
-						return fmt.Errorf("desync: create anchor base chain %s: %w", spec.name, retryErr)
-					}
+				if readErr != nil {
+					return fmt.Errorf("desync: create anchor base chain %s: %w", spec.name, errors.Join(err, retryErr, readErr))
 				}
 			}
 		}
@@ -1425,6 +1500,19 @@ func definitelyAbsentChain(session anchorSession, family Family, name string) bo
 // fallback would take ForkLock.RLock again).
 type nfqueueSocketAdapter struct {
 	conn *socket.Conn
+	// recvfrom is a private per-instance transport seam. Production leaves it
+	// nil and uses this same concrete socket.Conn with unchanged arguments.
+	recvfrom func(context.Context, []byte, int) (int, unix.Sockaddr, error)
+	// receiveBuffer is lazy and retains exactly 64KiB per receiving adapter.
+	// The single pinned netlink.Conn created below confines Receive/ReceiveIter
+	// with receiveMu and excludes them during Execute with its exclusive lock.
+	// Direct adapter reads must also be serialized. Returned messages never
+	// alias this scratch: parseNetlinkDatagram keeps detached owned storage.
+	receiveBuffer []byte
+	// Execute holds netlink.Conn's exclusive lock across Send and Receive.
+	// Only acknowledged CONFIG sends write this owned request; concurrent
+	// verdict sends never touch it. It is consumed by the next Receive.
+	configRequest []byte
 }
 
 // The pinned netlink library reaches deadline control and the raw descriptor
@@ -1505,6 +1593,9 @@ func (a *nfqueueSocketAdapter) Send(message netlink.Message) error {
 	if err != nil {
 		return err
 	}
+	if message.Header.Type == netlink.HeaderType(3<<8|nfqMessageConfig) && message.Header.Flags&netlink.Acknowledge != 0 {
+		a.configRequest = data
+	}
 	_, err = a.conn.Sendmsg(contextBackground(), data, nil, nil, 0)
 	return err
 }
@@ -1519,15 +1610,55 @@ func (a *nfqueueSocketAdapter) SendMessages(messages []netlink.Message) error {
 }
 
 func (a *nfqueueSocketAdapter) Receive() ([]netlink.Message, error) {
-	buffer := make([]byte, nftMetadataBuffer)
-	length, _, err := a.conn.Recvfrom(contextBackground(), buffer, 0)
+	if a.receiveBuffer == nil {
+		a.receiveBuffer = make([]byte, nftMetadataBuffer)
+	}
+	buffer := a.receiveBuffer
+	request := a.configRequest
+	a.configRequest = nil
+	recvfrom := a.recvfrom
+	if recvfrom == nil {
+		recvfrom = a.conn.Recvfrom
+	}
+	length, peer, err := recvfrom(contextBackground(), buffer, 0)
 	if err != nil {
 		return nil, err
 	}
 	if length == len(buffer) {
 		return nil, errors.New("desync: NFQUEUE datagram was truncated")
 	}
-	return parseNetlinkDatagram(buffer[:length])
+	messages, err := parseNetlinkDatagram(buffer[:length])
+	if err != nil {
+		return nil, err
+	}
+	if rejected := matchingQueueConfigRejection(messages, peer, request); rejected != nil {
+		return nil, rejected
+	}
+	return messages, nil
+}
+
+// A known rejection needs the complete negative ACK from the kernel, with the
+// exact request echo and destination/sequence. netlink.Conn otherwise returns
+// OpError BEFORE Validate, discarding the PID/echo: errno/sequence alone cannot
+// distinguish a current rejection from an unrelated or malformed response.
+// CAP_ACK/EXT_ACK are not enabled on this socket; unfamiliar replies stay
+// unknown instead of being promoted to proof that BIND had no effect.
+func matchingQueueConfigRejection(messages []netlink.Message, peer unix.Sockaddr, request []byte) error {
+	address, ok := peer.(*unix.SockaddrNetlink)
+	if !ok || address.Family != unix.AF_NETLINK || address.Pid != 0 || address.Groups != 0 || len(request) < 20 || len(messages) != 1 {
+		return nil
+	}
+	m := messages[0]
+	if m.Header.Type != netlink.Error || m.Header.Flags != 0 || len(m.Data) != 4+len(request) ||
+		m.Header.Sequence != binary.NativeEndian.Uint32(request[8:]) ||
+		m.Header.PID != binary.NativeEndian.Uint32(request[12:]) || !bytes.Equal(m.Data[4:], request) {
+		return nil
+	}
+	code := int32(binary.NativeEndian.Uint32(m.Data))
+	if code >= 0 || code < -4095 {
+		return nil
+	}
+	return &queueConfigRejected{unix.Errno(-code)}
 }
 
 func (a *nfqueueSocketAdapter) ReceiveIter() iter.Seq2[netlink.Message, error] {
@@ -1729,6 +1860,12 @@ type linuxCapture struct {
 	// icmpQueue is the owned ICMP-error queue (only when configured).
 	icmpQueue    uint16
 	overrideQnum int
+	// Presence is separate: explicit qnum zero is a valid owned reservation.
+	overrideReserved bool
+	// queueBindings records effects, not reserved queue numbers. Missing entries
+	// are planned/unattempted; only acknowledged BINDs are own-bound.
+	queueBindings map[uint16]queueBindingState
+
 	// outPort is the explicit high-bit netlink port bound to nl.
 	outPort uint32
 	// outWitnessed reports that p(w) was durably published for outPort.
@@ -1737,7 +1874,6 @@ type linuxCapture struct {
 	dispatch *captureDispatchGate
 	nl       nfqueueTransport
 
-	bound     bool
 	unbounded bool
 	started   bool
 	stopping  atomic.Bool
@@ -1759,6 +1895,10 @@ type linuxCapture struct {
 	// refHeld reports that this capture still owns one reference of its
 	// anchorOwner. It is released exactly once.
 	refHeld bool
+	// metadataAttempted is the exact own-effect ledger: assigning a token or
+	// failing an anchor read is not itself a possible capture metadata effect.
+	metadataAttempted bool
+	openRollbackDone  bool
 
 	// retired is the positive native-retirement receipt of this capture.
 	retired atomic.Bool
@@ -1874,10 +2014,13 @@ func openLinuxCapture(lease *Lease) (capture Capture, err error) {
 	}
 	if err = captureValue.open(endpoint); err != nil {
 		captureValue.rollbackOpen()
-		if !owner.retainedState() {
+		if captureValue.retired.Load() || !owner.retainedState() {
 			captureValue.releaseOwnerRef()
+			return nil, err
 		}
-		return nil, err
+		// Keep the actual failed owner with the Lease, so uncertainty retains
+		// its admission charge and cannot publish CaptureRetired(nil).
+		return captureValue, err
 	}
 	return captureValue, nil
 }
@@ -1893,7 +2036,54 @@ func (c *linuxCapture) open(endpoint Endpoint) error {
 		queue, inQueue, icmpQueue uint16
 		hasICMP                   bool
 	)
-	err = withAnchorTransaction(c.owner, func(session anchorSession) error {
+	err = withAnchorTransaction(c.owner, func(session anchorSession) (openErr error) {
+		// A concurrent failed opener or last close may have changed the owner
+		// since acquisition. This check shares the publication/retirement tx.
+		c.owner.mu.Lock()
+		unavailable := c.owner.closed || c.owner.retiring || c.owner.retained
+		provisional := c.owner.guard == nil
+		c.owner.mu.Unlock()
+		if unavailable {
+			return errors.New("desync: anchor owner is retained or retiring")
+		}
+		if provisional {
+			guard, guardErr := bindAnchorGuardSocket(anchorGuardAddress(c.owner.token))
+			if guardErr != nil {
+				return fmt.Errorf("desync: bind anchor owner guard: %w", guardErr)
+			}
+			c.owner.mu.Lock()
+			c.owner.guard = guard
+			c.owner.mu.Unlock()
+		}
+		defer func() {
+			if c.outWitnessed {
+				return
+			}
+			// Every failed pre-w return closes native resources BEFORE token
+			// release, including witness encoding and uncertain metadata ACKs.
+			cleanupErr := closeTransport(c.nl)
+			c.nl = nil
+			if provisional {
+				c.owner.mu.Lock()
+				guard := c.owner.guard
+				c.owner.guard = nil
+				c.owner.mu.Unlock()
+				cleanupErr = errors.Join(cleanupErr, guard.close())
+			}
+			if cleanupErr == nil {
+				cleanupErr = c.removeUnwitnessedMetadata(session)
+			}
+			c.openRollbackDone = true
+			if cleanupErr != nil {
+				c.owner.markRetained()
+			} else {
+				c.retired.Store(true)
+			}
+			// A failed opener has one terminal cleanup result, not another
+			// cleanup attempt after ForkLock release or on repeated Close.
+			c.closeOnce.Do(func() { c.closeErr = cleanupErr })
+			openErr = errors.Join(openErr, cleanupErr)
+		}()
 		if err := ensureAnchorFamily(session, FamilyIPv4, true); err != nil {
 			return err
 		}
@@ -2020,6 +2210,7 @@ func (c *linuxCapture) open(endpoint Endpoint) error {
 					portRule,
 				}
 			}
+			c.metadataAttempted = true
 			if _, batchErr := session.batch(requests); batchErr != nil {
 				// A lost ACK is reconciled by complete readback; an absent or
 				// conflicting effect fails the open without a second table or
@@ -2052,11 +2243,8 @@ func (c *linuxCapture) open(endpoint Endpoint) error {
 		// While the same fork-read token is held, make the private queue
 		// socket the exclusive owner of outq and publish the durable witness.
 		if err = c.bindQueue(queue, endpoint.Family); err != nil {
-			_ = transport.Close()
-			c.nl = nil
 			return err
 		}
-		c.bound = true
 		witnessRule, err := anchorPortUserdataRecord(state.tableFamily, state.epoch, c.owner.token, captureToken, port, "w", tag)
 		if err != nil {
 			return err
@@ -2069,41 +2257,38 @@ func (c *linuxCapture) open(endpoint Endpoint) error {
 				// §2: a lost w ACK does not permit dropping the lock while a
 				// socket remains open. Close it before releasing the token and
 				// retain the o record for recovery.
-				_ = closeTransport(c.nl)
-				c.nl = nil
 				return fmt.Errorf("desync: publish port witness: %w", err)
 			}
 		}
 		if err = c.readbackCapturePhase(session, state, "w"); err != nil {
-			_ = closeTransport(c.nl)
-			c.nl = nil
 			return err
 		}
 		c.outWitnessed = true
-		return nil
+		c.owner.mu.Lock()
+		c.owner.published++
+		c.owner.mu.Unlock()
+		// Complete the same synchronous open on this borrowed session. A
+		// post-w error unwinds it before openLinuxCapture starts rollback.
+		if err = c.bindRemainingQueues(endpoint); err != nil {
+			return err
+		}
+		if err = c.attachCaptureRulesOn(session, endpoint); err != nil {
+			return err
+		}
+		return c.verifyCaptureRulesOn(session)
 	})
 	if err != nil {
 		return err
 	}
-	// The transaction fd and its fork token are now closed. Go fork/exec may
-	// transiently inherit the queue fd, but the durable witness makes that
-	// visible to retirement rather than false.
-	if err = c.bindRemainingQueues(endpoint); err != nil {
-		return err
-	}
-	if err = c.attachCaptureRules(endpoint); err != nil {
-		return err
-	}
-	if err = c.verifyCaptureRules(); err != nil {
-		return err
-	}
+	// Metadata and the transaction fd are closed, the fork token is released
+	// and the caller namespace is restored before starting the receive loop.
 	c.started = true
 	go c.loop()
 	return nil
 }
 
 // anchorPortUserdataRecord builds one p record request.
-func anchorPortUserdataRecord(tableFamily byte, epoch, process, capture string, port uint32, phase string, tag uint32) (nftRequest, error) {
+var anchorPortUserdataRecord = func(tableFamily byte, epoch, process, capture string, port uint32, phase string, tag uint32) (nftRequest, error) {
 	userdata, err := anchorPortUserdata(epoch, process, capture, port, phase, tag)
 	if err != nil {
 		return nftRequest{}, err
@@ -2448,9 +2633,9 @@ func observeReleaseScan(session anchorSession, port uint32, outq uint16) (releas
 		if row.port == port {
 			return releaseScanReceipt{}, errors.New("desync: release scan: old queue instance still present")
 		}
-		if queryErr != nil {
-			return releaseScanReceipt{}, fmt.Errorf("desync: release scan: old instance removed but absence query did not qualify: %w", queryErr)
-		}
+		// The fresh different-port row is an independent W-REPLACED
+		// receipt. A control-class query normally returns EPERM for this
+		// foreign instance; only W-ABSENT requires a qualified query.
 		return releaseScanReceipt{kind: "W-REPLACED", port: port, foreign: row.port, procRows: rows}, nil
 	}
 	if queryErr != nil {
@@ -2638,9 +2823,15 @@ func (c *linuxCapture) configureOn(queue uint16, family Family, attrs []netlink.
 // the fresh queue_total=0 observation both consume it, so the two §3.3 receipts
 // can never enumerate different sets.
 func (c *linuxCapture) stillBoundQueues() []uint16 {
-	queues := []uint16{c.queue, c.inQueue}
-	if c.icmpQueue != 0 {
-		queues = append(queues, c.icmpQueue)
+	var queues []uint16
+	for _, queue := range []uint16{c.queue, c.inQueue, c.icmpQueue} {
+		if c.queueBindings[queue] != queueBindingBound {
+			continue
+		}
+		// Zero is a valid outbound queue, and the absent ICMP slot is zero.
+		if len(queues) == 0 || queue != queues[0] {
+			queues = append(queues, queue)
+		}
 	}
 	return queues
 }
@@ -2723,6 +2914,9 @@ func (c *linuxCapture) allocateQueues(endpoint Endpoint, state anchorFamilyState
 		if qnum < 0 || qnum > 65535 {
 			return 0, 0, fmt.Errorf("desync: capture.linux.qnum %d outside 0..65535", qnum)
 		}
+		if excluded[qnum] {
+			return 0, 0, fmt.Errorf("desync: capture.linux.qnum %d is reserved by another capture manifest", qnum)
+		}
 		if linuxQueueInUse(uint16(qnum)) {
 			return 0, 0, fmt.Errorf("desync: capture.linux.qnum %d is bound by another listener", qnum)
 		}
@@ -2731,12 +2925,13 @@ func (c *linuxCapture) allocateQueues(endpoint Endpoint, state anchorFamilyState
 		}
 		out := uint16(qnum)
 		c.overrideQnum = qnum
+		c.overrideReserved = true
 		start := uint16(managedQueueBase + (linuxQueueCounter.Add(1)*7)%managedQueueSpan)
 		inCandidates := nextFreeQueues(start, 1, func(queue uint16) bool {
 			return int(queue) == qnum || excluded[int(queue)] || qnumLive(int(queue)) || linuxQueueInUse(queue)
 		})
 		if len(inCandidates) < 1 {
-			releaseQnum(qnum)
+			c.releaseOverrideQnum()
 			return 0, 0, fmt.Errorf("desync: no free inbound NFQUEUE identity")
 		}
 		return out, inCandidates[0], nil
@@ -2955,15 +3150,43 @@ func (c *linuxCapture) bindQueue(queue uint16, family Family) error {
 	return c.bindQueueOn(queue, family, c.nl)
 }
 
+type queueBindingState uint8
+
+const (
+	queueBindingPlanned queueBindingState = iota
+	queueBindingBound
+	queueBindingUnbound
+	queueBindingUncertain
+)
+
+// Only the owning adapter's validated negative ACK (or its MODEL equivalent)
+// implements this receipt. A raw OpError/errno/timeout is never a known effect.
+type queueConfigRejected struct{ error }
+
+func (e *queueConfigRejected) Unwrap() error         { return e.error }
+func (e *queueConfigRejected) queueConfigRejection() {}
+
 func (c *linuxCapture) bindQueueOn(queue uint16, family Family, transport nfqueueConn) error {
 	if transport == nil {
 		return fmt.Errorf("desync: NFQUEUE connection is not open")
 	}
+	if c.queueBindings == nil {
+		c.queueBindings = make(map[uint16]queueBindingState, 3)
+	}
+	c.queueBindings[queue] = queueBindingUncertain
 	if err := c.configureQueueOn(transport, queue, family, []netlink.Attribute{
 		{Type: nfqCfgAttrCmd, Data: []byte{nfqCfgCmdBind, 0, 0, transactionFamily(family)}},
 	}); err != nil {
+		var rejected interface {
+			error
+			queueConfigRejection()
+		}
+		if errors.As(err, &rejected) {
+			c.queueBindings[queue] = queueBindingUnbound
+		}
 		return fmt.Errorf("desync: bind NFQUEUE %d: %w", queue, err)
 	}
+	c.queueBindings[queue] = queueBindingBound
 	flags := make([]byte, 4)
 	binary.BigEndian.PutUint32(flags, nfqCfgFlagFail)
 	mask := make([]byte, 4)
@@ -2977,8 +3200,8 @@ func (c *linuxCapture) bindQueueOn(queue uint16, family Family, transport nfqueu
 		{Type: nfqCfgAttrParams, Data: []byte{0, 0, 0xff, 0xff, 2}},
 	}
 	if err := c.configureQueueOn(transport, queue, family, params); err != nil {
-		_ = c.unbindQueueOn(transport, queue, family)
-		return fmt.Errorf("desync: configure NFQUEUE %d: %w", queue, err)
+		unbindErr := c.unbindQueueOn(transport, queue, family)
+		return fmt.Errorf("desync: configure NFQUEUE %d: %w", queue, errors.Join(err, unbindErr))
 	}
 	return nil
 }
@@ -2993,21 +3216,15 @@ func (c *linuxCapture) configureQueueOn(transport nfqueueConn, queue uint16, fam
 }
 
 func (c *linuxCapture) unbindQueues() error {
-	if !c.bound {
-		return nil
-	}
 	endpoint := c.lease.Endpoint()
-	var firstErr error
-	if c.icmpQueue != 0 {
-		if err := c.unbindQueue(c.icmpQueue, endpoint.Family); err != nil {
-			firstErr = err
+	for _, queue := range []uint16{c.icmpQueue, c.inQueue} {
+		if queue != c.queue && c.queueBindings[queue] == queueBindingBound {
+			if err := c.unbindQueue(queue, endpoint.Family); err != nil {
+				return err
+			}
 		}
 	}
-	if err := c.unbindQueue(c.inQueue, endpoint.Family); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	c.bound = false
-	return firstErr
+	return nil
 }
 
 func (c *linuxCapture) unbindQueue(queue uint16, family Family) error {
@@ -3015,12 +3232,17 @@ func (c *linuxCapture) unbindQueue(queue uint16, family Family) error {
 }
 
 func (c *linuxCapture) unbindQueueOn(transport nfqueueConn, queue uint16, family Family) error {
-	if queue == 0 || transport == nil {
-		return nil
+	if transport == nil || c.queueBindings[queue] != queueBindingBound {
+		return fmt.Errorf("desync: NFQUEUE %d has no confirmed own binding", queue)
 	}
-	return c.configureQueueOn(transport, queue, family, []netlink.Attribute{
+	c.queueBindings[queue] = queueBindingUncertain
+	err := c.configureQueueOn(transport, queue, family, []netlink.Attribute{
 		{Type: nfqCfgAttrCmd, Data: []byte{nfqCfgCmdUnbind, 0, 0, transactionFamily(family)}},
 	})
+	if err == nil {
+		c.queueBindings[queue] = queueBindingUnbound
+	}
+	return err
 }
 
 func transactionFamily(family Family) byte {
@@ -3031,7 +3253,7 @@ func transactionFamily(family Family) byte {
 }
 
 // bindRemainingQueues binds the non-witness queues and their parameters after
-// the witness transaction closed.
+// the witness is confirmed, within the same open transaction.
 func (c *linuxCapture) bindRemainingQueues(endpoint Endpoint) error {
 	if c.inQueue != c.queue {
 		if err := c.bindQueueOn(c.inQueue, endpoint.Family, c.nl); err != nil {
@@ -3055,6 +3277,13 @@ func (c *linuxCapture) bindRemainingQueues(endpoint Endpoint) error {
 // every tag accept precedes every ordinary dispatch entry; ordinary entries are
 // appended.
 func (c *linuxCapture) attachCaptureRules(endpoint Endpoint) error {
+	return withAnchorTransaction(c.owner, func(session anchorSession) error {
+		return c.attachCaptureRulesOn(session, endpoint)
+	})
+}
+
+// attachCaptureRulesOn borrows the caller's live metadata transaction.
+func (c *linuxCapture) attachCaptureRulesOn(session anchorSession, endpoint Endpoint) error {
 	var (
 		familyByte byte
 		familyName string
@@ -3186,7 +3415,7 @@ func (c *linuxCapture) attachCaptureRules(endpoint Endpoint) error {
 			return err
 		}
 	}
-	if _, err = c.batchAnchor(requests); err != nil {
+	if _, err = session.batch(requests); err != nil {
 		return err
 	}
 	c.anchor.chainHandles = make(map[string]uint64)
@@ -3361,8 +3590,8 @@ func (c *linuxCapture) icmpDispatchExpressions(endpoint Endpoint) ([]expr.Any, e
 	return rule[:len(rule)-1], nil
 }
 
-// batchAnchor commits one capture-owned metadata batch outside the open
-// transaction (rule attachment).
+// batchAnchor commits one capture-owned metadata batch in a standalone
+// transaction; open borrows its existing session instead.
 func (c *linuxCapture) batchAnchor(requests []nftRequest) ([]nftReply, error) {
 	var replies []nftReply
 	err := withAnchorTransaction(c.owner, func(session anchorSession) error {
@@ -3377,64 +3606,69 @@ func (c *linuxCapture) batchAnchor(requests []nftRequest) ([]nftReply, error) {
 // presence before the capture becomes visible.
 func (c *linuxCapture) verifyCaptureRules() error {
 	return withAnchorTransaction(c.owner, func(session anchorSession) error {
-		state, err := readAnchorFamilyState(session, c.lease.Endpoint().Family)
-		if err != nil {
-			return err
-		}
-		key := captureKey(c.owner.token, c.anchor.capture)
-		manifest, found := state.captures[key]
-		if !found || manifest.port == nil || manifest.port.record.phase != "w" {
-			return errors.New("desync: capture metadata is not visible as witnessed")
-		}
-		rules := state.baseRules[key]
-		roles := make(map[string]bool, len(rules))
-		for _, rule := range rules {
-			roles[rule.role] = true
-		}
-		if !roles["inject"] {
-			return errors.New("desync: capture injection entry is missing")
-		}
-		expected := 1
-		if c.lease.engine.Config().Capture.limits.direction(c.lease.Endpoint().Transport, true).enabled() {
-			expected++
-			if !roles["entry-o"] {
-				return errors.New("desync: capture output entry is missing")
-			}
-		}
-		if c.inboundEnabled(c.lease.Endpoint()) {
-			expected++
-			if !roles["entry-i"] {
-				return errors.New("desync: capture input entry is missing")
-			}
-		}
-		if c.wantsICMPFilter() {
-			expected++
-			if !roles["entry-e"] {
-				return errors.New("desync: capture ICMP entry is missing")
-			}
-		}
-		if len(rules) != expected {
-			return fmt.Errorf("desync: capture has %d base entries, want %d", len(rules), expected)
-		}
-		chains := state.chains[key]
-		if len(chains) != len(c.anchor.chainHandles) {
-			return errors.New("desync: capture regular chains are incomplete")
-		}
-		for name := range c.anchor.chainHandles {
-			if _, found := chains[name]; !found {
-				return fmt.Errorf("desync: capture chain %q is missing", name)
-			}
-			rules, ruleErr := readAnchorRules(session, state.tableFamily, anchorTableName, name)
-			if ruleErr != nil {
-				return ruleErr
-			}
-			if len(rules) == 0 {
-				return fmt.Errorf("desync: capture chain %q is empty", name)
-			}
-		}
-		c.anchor.chainHandles = chains
-		return nil
+		return c.verifyCaptureRulesOn(session)
 	})
+}
+
+// verifyCaptureRulesOn borrows the session and performs a fresh full readback.
+func (c *linuxCapture) verifyCaptureRulesOn(session anchorSession) error {
+	state, err := readAnchorFamilyState(session, c.lease.Endpoint().Family)
+	if err != nil {
+		return err
+	}
+	key := captureKey(c.owner.token, c.anchor.capture)
+	manifest, found := state.captures[key]
+	if !found || manifest.port == nil || manifest.port.record.phase != "w" {
+		return errors.New("desync: capture metadata is not visible as witnessed")
+	}
+	rules := state.baseRules[key]
+	roles := make(map[string]bool, len(rules))
+	for _, rule := range rules {
+		roles[rule.role] = true
+	}
+	if !roles["inject"] {
+		return errors.New("desync: capture injection entry is missing")
+	}
+	expected := 1
+	if c.lease.engine.Config().Capture.limits.direction(c.lease.Endpoint().Transport, true).enabled() {
+		expected++
+		if !roles["entry-o"] {
+			return errors.New("desync: capture output entry is missing")
+		}
+	}
+	if c.inboundEnabled(c.lease.Endpoint()) {
+		expected++
+		if !roles["entry-i"] {
+			return errors.New("desync: capture input entry is missing")
+		}
+	}
+	if c.wantsICMPFilter() {
+		expected++
+		if !roles["entry-e"] {
+			return errors.New("desync: capture ICMP entry is missing")
+		}
+	}
+	if len(rules) != expected {
+		return fmt.Errorf("desync: capture has %d base entries, want %d", len(rules), expected)
+	}
+	chains := state.chains[key]
+	if len(chains) != len(c.anchor.chainHandles) {
+		return errors.New("desync: capture regular chains are incomplete")
+	}
+	for name := range c.anchor.chainHandles {
+		if _, found := chains[name]; !found {
+			return fmt.Errorf("desync: capture chain %q is missing", name)
+		}
+		rules, ruleErr := readAnchorRules(session, state.tableFamily, anchorTableName, name)
+		if ruleErr != nil {
+			return ruleErr
+		}
+		if len(rules) == 0 {
+			return fmt.Errorf("desync: capture chain %q is empty", name)
+		}
+	}
+	c.anchor.chainHandles = chains
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -3570,7 +3804,7 @@ func (c *linuxCapture) loop() {
 			return
 		}
 		if c.stopping.Load() {
-			if err := c.nl.SetReadDeadline(time.Now().Add(queueStopDrain)); err != nil {
+			if err := c.nl.SetReadDeadline(time.Now()); err != nil {
 				c.lease.ReportNativeFailure(fmt.Errorf("desync: rearm NFQUEUE receive deadline for stop: %w", err))
 				return
 			}
@@ -3630,7 +3864,7 @@ func (c *linuxCapture) handleBatch(messages []netlink.Message) bool {
 			c.sendVerdict(packetQueue, packetID, VerdictPass, "", nil)
 			continue
 		}
-		verdict := c.lease.HandlePacket(frame, direction, c.inject, complete)
+		verdict := c.lease.handlePacket(frame, direction, packetInjection{single: c.inject, batch: c.injectBatch}, complete)
 		c.dispatch.endDispatch()
 		if verdict == VerdictHold {
 			continue
@@ -3651,128 +3885,6 @@ func (c *linuxCapture) handleBatch(messages []netlink.Message) bool {
 	return true
 }
 
-// inject performs one operation-scoped raw send in the capture owner's pinned
-// namespace. rawMu serializes the entire save/enter/send/close/restore operation;
-// the single fork-read token covers raw fd creation through its actual Close.
-// The short-lived helper exits even if namespace restoration fails, allowing
-// withAnchorNamespace's still-locked thread to be discarded, not reused by the
-// caller. Nothing is cached, exported, queued or retried.
-func (c *linuxCapture) inject(packet []byte) error {
-	parsed, err := ParsePacket(packet)
-	if err != nil {
-		return err
-	}
-	c.rawMu.Lock()
-	defer c.rawMu.Unlock()
-	done := make(chan error)
-	go func() {
-		done <- withAnchorNamespace(c.owner.nsFD, func() error {
-			return withForkReadToken(func() error {
-				return c.sendInjected(parsed, packet)
-			})
-		})
-	}()
-	return <-done
-}
-
-// Raw injection syscall seams keep the operation-scoped path testable without
-// CAP_NET_RAW or changes to the calling thread's actual network namespace.
-var (
-	openInjectionSocket       = unix.Socket
-	setInjectionSockoptInt    = unix.SetsockoptInt
-	setInjectionSockoptString = unix.SetsockoptString
-	bindInjectionSocket       = unix.Bind
-	sendInjectionPacket       = unix.Sendto
-	closeInjectionSocket      = unix.Close
-)
-
-func (c *linuxCapture) sendInjected(parsed *Packet, packet []byte) error {
-	family := parsed.Family
-	var (
-		fd        int
-		sendErr   error
-		sockProto int
-	)
-	switch family {
-	case FamilyIPv4:
-		fd, sendErr = openInjectionSocket(unix.AF_INET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_RAW)
-		sockProto = unix.IPPROTO_IP
-	case FamilyIPv6:
-		fd, sendErr = openInjectionSocket(unix.AF_INET6, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.IPPROTO_RAW)
-		sockProto = unix.IPPROTO_IPV6
-	default:
-		return fmt.Errorf("desync: unsupported injection family")
-	}
-	_ = sockProto
-	if sendErr != nil {
-		return sendErr
-	}
-	defer closeInjectionSocket(fd)
-	if family == FamilyIPv4 {
-		if err := setInjectionSockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1); err != nil {
-			return err
-		}
-	}
-	if bindSource(c.lease.engine.Config().Capture, family) {
-		bindInjectionSource(fd, family, parsed.Src)
-	}
-	if mark := injectionMark(c.lease.socketMark(), c.lease.engine.Config().Capture); mark != 0 {
-		_ = setInjectionSockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, mark)
-	}
-	if device := c.lease.socketDevice(); device != "" {
-		_ = setInjectionSockoptString(fd, unix.SOL_SOCKET, unix.SO_BINDTODEVICE, device)
-	}
-	if err := setInjectionSockoptInt(fd, unix.SOL_SOCKET, unix.SO_PRIORITY, int(c.anchor.tag)); err != nil {
-		return err
-	}
-	var destination unix.Sockaddr
-	switch family {
-	case FamilyIPv4:
-		value := &unix.SockaddrInet4{Port: int(parsed.DstPort)}
-		value.Addr = parsed.Dst.As4()
-		destination = value
-	case FamilyIPv6:
-		// Raw IPv6 interprets sin6_port as an IP protocol, not a transport
-		// port. Zero selects the socket protocol; UDP/TCP ports stay in packet.
-		value := &unix.SockaddrInet6{}
-		value.Addr = parsed.Dst.As16()
-		destination = value
-	}
-	if err := sendInjectionPacket(fd, packet, 0, destination); err != nil {
-		return err
-	}
-	c.lease.noteInjection()
-	return nil
-}
-
-// bindInjectionSource ports upstream bind-fix4/bind-fix6: bind the raw socket
-// to the generated packet's source address; a refused bind is ignored.
-func bindInjectionSource(fd int, family Family, source netip.Addr) {
-	if !source.IsValid() {
-		return
-	}
-	var sockaddr unix.Sockaddr
-	switch family {
-	case FamilyIPv4:
-		if !source.Is4() {
-			return
-		}
-		value := &unix.SockaddrInet4{Addr: source.As4()}
-		_ = setInjectionSockoptInt(fd, unix.IPPROTO_IP, unix.IP_FREEBIND, 1)
-		sockaddr = value
-	case FamilyIPv6:
-		if !source.Is6() {
-			return
-		}
-		value := &unix.SockaddrInet6{Addr: source.As16()}
-		_ = setInjectionSockoptInt(fd, unix.IPPROTO_IPV6, unix.IPV6_FREEBIND, 1)
-		sockaddr = value
-	default:
-		return
-	}
-	_ = bindInjectionSocket(fd, sockaddr)
-}
-
 // ---------------------------------------------------------------------------
 // Receive shutdown and drain.
 // ---------------------------------------------------------------------------
@@ -3782,7 +3894,7 @@ func (c *linuxCapture) stopReceive() error {
 		return nil
 	}
 	c.stopping.Store(true)
-	if err := c.nl.SetReadDeadline(time.Now().Add(queueStopDrain)); err != nil {
+	if err := c.nl.SetReadDeadline(time.Now()); err != nil {
 		_ = closeTransport(c.nl)
 		<-c.done
 		return fmt.Errorf("desync: stop NFQUEUE receive: %w", err)
@@ -3861,6 +3973,13 @@ func (c *linuxCapture) Close() error {
 // non-witness queues are unbound when reachable, and the p(o)/m records are
 // removed only after a complete readback.
 func (c *linuxCapture) closeUnwitnessed() error {
+	if !c.metadataAttempted {
+		// No own metadata batch was sent. A namespace/anchor/guard failure
+		// does not turn this effect-free attempt into a permanent orphan.
+		c.releaseOverrideQnum()
+		c.retired.Store(true)
+		return nil
+	}
 	var firstErr error
 	if c.nl != nil {
 		if err := closeTransport(c.nl); err != nil {
@@ -3870,38 +3989,55 @@ func (c *linuxCapture) closeUnwitnessed() error {
 	}
 	if firstErr != nil {
 		c.owner.markRetained()
-		if c.overrideQnum != 0 {
-			// Keep the reservation while the effect is unproven.
-			c.overrideQnum = 0
-		}
+		// Keep both the reservation and its exact identity while unproven.
 		return firstErr
 	}
-	err := withAnchorTransaction(c.owner, func(session anchorSession) error {
+	err := withAnchorTransaction(c.owner, c.removeUnwitnessedMetadata)
+	if err != nil {
+		c.owner.markRetained()
+		return err
+	}
+	c.retired.Store(true)
+	return nil
+}
+
+// removeUnwitnessedMetadata runs under the caller's existing transaction/token
+// after its private socket has closed. Uncertainty retains the exact identity;
+// a lost w ACK never licenses interpreting a committed w as an o record.
+func (c *linuxCapture) removeUnwitnessedMetadata(session anchorSession) error {
+	if c.metadataAttempted {
 		state, err := readAnchorFamilyState(session, c.lease.Endpoint().Family)
 		if err != nil {
 			return err
 		}
 		key := captureKey(c.owner.token, c.anchor.capture)
-		manifest, found := state.captures[key]
-		if !found {
-			return nil
+		if manifest, found := state.captures[key]; found {
+			if manifest.port != nil && manifest.port.record.phase == "w" {
+				if _, err = observeReleaseScan(session, c.outPort, c.queue); err != nil {
+					return err
+				}
+			}
+			if _, err = runEnqueueFence(); err != nil {
+				return err
+			}
+			if err = c.removeMetadata(session, state, key, manifest); err != nil {
+				return err
+			}
 		}
-		// The p(o) capture was never attached; still run the separate
-		// no-mutation fence before erasing its record, so an old reader
-		// cannot interleave.
-		if _, err = runEnqueueFence(); err != nil {
-			return err
-		}
-		return c.removeMetadata(session, state, key, manifest)
-	})
-	if err != nil {
-		c.owner.markRetained()
-		return err
+		c.metadataAttempted = false
 	}
-	if c.overrideQnum != 0 {
-		releaseQnum(c.overrideQnum)
-	}
+	c.releaseOverrideQnum()
 	return nil
+}
+
+// releaseOverrideQnum is reached only after safe cleanup/retirement (or before
+// any native effect). Clearing presence makes a repeated old Close harmless to
+// a later capture that has reserved the same number, including zero.
+func (c *linuxCapture) releaseOverrideQnum() {
+	if c.overrideReserved {
+		releaseQnum(c.overrideQnum)
+		c.overrideReserved = false
+	}
 }
 
 // retire is the ordered positive-retirement protocol of §3.3/§4.
@@ -3917,6 +4053,14 @@ func (c *linuxCapture) retire() error {
 	if err := c.stopReceive(); err != nil {
 		c.owner.markRetained()
 		return err
+	}
+	// Unknown BIND/UNBIND effects cannot be promoted to own-bound by a proc
+	// row, nor skipped as absent. Keep the exact W/guard/charge for recovery.
+	for queue, state := range c.queueBindings {
+		if state == queueBindingUncertain {
+			c.owner.markRetained()
+			return fmt.Errorf("desync: NFQUEUE %d binding effect is uncertain", queue)
+		}
 	}
 	// 3. Ordered no-op CONFIG ACK0 for every still-bound own queue, including
 	// the outbound witness: §3.3 requires the matching ACK0 for EACH bound own
@@ -3959,44 +4103,39 @@ func (c *linuxCapture) retire() error {
 		c.owner.markRetained()
 		return scanErr
 	}
-	// 6. Last-owner guard release probe, BEFORE the last m/p record is
-	// erased: a busy inherited guard retains that record, its reservation and
-	// the native charge of this attempt.
-	last, lastErr := c.owner.beginCaptureRetirement()
-	if lastErr != nil {
-		c.owner.markRetained()
-		return lastErr
-	}
-	if last {
-		if err := c.retireOwnerGuard(); err != nil {
-			c.owner.markRetained()
-			return err
-		}
-	}
-	// 7. Remove exact own regular chains and m+p. The irreversible t
-	// high-water and the fixed anchors stay.
+	// 6-7. Serialize last-record guard retirement and metadata removal with
+	// first publication. Waiting openers are references, not durable records:
+	// they must recheck RETIRING rather than strand an inherited guard.
 	var metadataErr error
 	metadataErr = withAnchorTransaction(c.owner, func(session anchorSession) error {
+		last, lastErr := c.owner.beginCaptureRetirement()
+		if lastErr != nil {
+			return lastErr
+		}
+		if last {
+			if err := c.retireOwnerGuard(); err != nil {
+				return err
+			}
+		}
 		state, err := readAnchorFamilyState(session, endpoint.Family)
 		if err != nil {
 			return err
 		}
 		key := captureKey(c.owner.token, c.anchor.capture)
 		manifest, found := state.captures[key]
-		if !found {
-			return nil
+		if found {
+			if err = c.removeMetadata(session, state, key, manifest); err != nil {
+				return err
+			}
 		}
-		return c.removeMetadata(session, state, key, manifest)
+		c.releaseOwnerRef()
+		return nil
 	})
 	if metadataErr != nil {
 		c.owner.markRetained()
 		return metadataErr
 	}
-	if c.overrideQnum != 0 {
-		releaseQnum(c.overrideQnum)
-		c.overrideQnum = 0
-	}
-	c.releaseOwnerRef()
+	c.releaseOverrideQnum()
 	c.retired.Store(true)
 	return nil
 }
@@ -4050,11 +4189,13 @@ func (c *linuxCapture) removeMetadata(session anchorSession, state anchorFamilyS
 	return c.readbackMetadataAbsent(session, state, c.owner.token, c.anchor.capture)
 }
 
-// retireOwnerGuard closes the last local guard fd and probes the exact abstract
-// name inside one short fork-excluded transaction. A busy inherited guard
-// retains the final record instead of manufacturing a positive receipt.
+// retireOwnerGuard closes the last local guard fd and probes its exact name
+// under the caller's existing namespace transaction and single fork token.
+// A busy inherited guard retains the final record instead of a false receipt.
 func (c *linuxCapture) retireOwnerGuard() error {
+	c.owner.mu.Lock()
 	guard := c.owner.guard
+	c.owner.mu.Unlock()
 	name := ""
 	if guard != nil {
 		name = guard.name
@@ -4062,20 +4203,16 @@ func (c *linuxCapture) retireOwnerGuard() error {
 	if err := guard.close(); err != nil {
 		return fmt.Errorf("desync: close owner guard: %w", err)
 	}
-	var busy bool
-	err := withAnchorNamespace(c.owner.nsFD, func() error {
-		return withForkReadToken(func() error {
-			var probeErr error
-			busy, probeErr = probeAnchorGuardAddress(name)
-			return probeErr
-		})
-	})
+	busy, err := probeAnchorGuardAddress(name)
 	if err != nil {
 		return fmt.Errorf("desync: probe owner guard release: %w", err)
 	}
 	if busy {
 		return errors.New("desync: owner guard is still held by an inherited descriptor")
 	}
+	c.owner.mu.Lock()
+	c.owner.guard = nil
+	c.owner.mu.Unlock()
 	return nil
 }
 
@@ -4083,11 +4220,11 @@ func (c *linuxCapture) retireOwnerGuard() error {
 // reconciled; an unproven effect marks the owner retained so no new generation
 // is appended while it exists.
 func (c *linuxCapture) rollbackOpen() {
-	if c.retired.Load() {
+	if c.retired.Load() || c.openRollbackDone {
 		return
 	}
 	if c.outWitnessed {
-		if err := c.retire(); err != nil {
+		if err := c.Close(); err != nil {
 			c.owner.markRetained()
 		}
 		return

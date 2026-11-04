@@ -12,9 +12,10 @@ import (
 // It is deliberately portable and free of driver calls so its invariants are
 // regression-tested on any host: an operation registers before the kernel can
 // see it, closing refuses every later registration, cancels what is registered,
-// and retires native resources only after the terminal receipts - or, when the
-// kernel does not produce one inside the bounded grace, reports a non-success
-// close and retires later while Done stays open. That deferral is transient: a
+// and retires native resources only after the terminal receipts and any
+// synchronous terminal consumers finish. If registered use outlasts the bounded
+// grace, Close reports non-success and retires later while Done stays open.
+// That deferral is transient: a
 // late retirement which then proves successful supersedes it, so a later Close
 // observes the completed retirement rather than the stale deferral.
 type ioLifecycle struct {
@@ -22,10 +23,13 @@ type ioLifecycle struct {
 	cancel func(key any)
 	retire func() error
 
-	mu      sync.Mutex
-	cond    *sync.Cond
-	closed  bool
-	pending map[any]*ioOperation
+	mu     sync.Mutex
+	cond   *sync.Cond
+	closed bool
+	// pending holds the registration state by value: the record is one bool, so
+	// storing it in the map keeps a per-I/O registration allocation-free while
+	// the map key still identifies the operation (and cancels it on Close).
+	pending map[any]ioOperation
 	// err is the close result every Close returns. deferred marks it as the
 	// bounded-grace result that only describes the outstanding state: it is
 	// superseded by nil once the late retirement is proven successful, and
@@ -45,6 +49,13 @@ type ioLifecycle struct {
 // The registration exists before submission precisely so that Close can refuse
 // later work and drain what is already owned; the armed transition is what
 // makes cancellation and submission linearizable in either order.
+//
+// Registration lifetime is not only the native receipt. A synchronous terminal
+// consumer (the receive batch view) runs while its operation is still
+// registered, because the caller's borrowed storage stays in use until the
+// consumer returns. Retirement must wait for that registered use; Close
+// reports deferred retirement only if it remains outstanding past the bounded
+// grace. The registration ends with the consumer, not with kernel completion.
 type ioOperation struct {
 	armed bool
 }
@@ -57,7 +68,7 @@ func newIOLifecycle(grace time.Duration, cancel func(key any), retire func() err
 		grace:   grace,
 		cancel:  cancel,
 		retire:  retire,
-		pending: make(map[any]*ioOperation),
+		pending: make(map[any]ioOperation),
 		done:    make(chan struct{}),
 	}
 	lifecycle.cond = sync.NewCond(&lifecycle.mu)
@@ -72,7 +83,7 @@ func (l *ioLifecycle) begin(key any) error {
 	if l.closed {
 		return E.New("windivert: handle is closed")
 	}
-	l.pending[key] = &ioOperation{}
+	l.pending[key] = ioOperation{}
 	return nil
 }
 
@@ -96,7 +107,11 @@ func (l *ioLifecycle) begin(key any) error {
 func (l *ioLifecycle) arm(key any) (closed bool) {
 	l.mu.Lock()
 	if operation, loaded := l.pending[key]; loaded {
+		// The record is stored by value, so the armed transition is a read,
+		// update and store-back of that value under this same mutex; the map
+		// entry never changes identity and stays findable for cancellation.
 		operation.armed = true
+		l.pending[key] = operation
 	}
 	closed = l.closed
 	l.mu.Unlock()

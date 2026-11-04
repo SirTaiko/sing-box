@@ -31,7 +31,7 @@ type flowCounters struct {
 // or when the flow is closed.
 type holdEntry struct {
 	packet   *Packet
-	inject   Injector
+	inject   packetInjection
 	complete Completer
 	// origModCutoff/wssizeCutoff snapshot the in-place modifier latches at
 	// capture time. Upstream rewrites orig_mod/wssize before delaying the
@@ -764,7 +764,7 @@ func (f *flowState) needsAssembly() bool {
 // handleTCP processes one captured outbound TCP packet. When it returns
 // VerdictHold the caller must not issue a native disposition: the held original
 // is released exactly once through its Completer.
-func (f *flowState) handleTCP(config *Config, packet *Packet, intent Intent, inject Injector, complete Completer) (Verdict, *Batch) {
+func (f *flowState) handleTCP(config *Config, packet *Packet, intent Intent, inject packetInjection, complete Completer) (Verdict, *Batch) {
 	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
 	if f.failed {
@@ -1006,7 +1006,7 @@ func (f *flowState) reserveBudget(bytes int) bool {
 	}
 }
 
-func (f *flowState) holdLocked(packet *Packet, inject Injector, complete Completer) {
+func (f *flowState) holdLocked(packet *Packet, inject packetInjection, complete Completer) {
 	if complete == nil {
 		complete = func(Verdict, string, []byte) {}
 	}
@@ -1217,16 +1217,13 @@ func (f *flowState) releaseHoldsLocked(reason string) {
 			continue
 		}
 		ok := true
-		for _, replacement := range item.batch.Packets {
-			if item.entry.inject == nil {
+		if len(item.batch.Packets) > 0 {
+			if !item.entry.inject.available() {
 				ok = false
-				break
-			}
-			if injectErr := f.injectHeldLocked(item.entry.inject, replacement); injectErr != nil {
+			} else if sent, injectErr := f.injectHeldLocked(item.entry.inject, item.batch.Packets); injectErr != nil {
 				f.failed = true
 				ok = false
-				item.batch.Reason = "partial replacement failure: " + injectErr.Error()
-				break
+				item.batch.Reason = fmt.Sprintf("partial replacement failure after %d successful replacements: %v", sent, injectErr)
 			}
 		}
 		switch item.batch.Original {
@@ -1305,10 +1302,10 @@ func (f *flowState) endHoldReleaseLocked() {
 // These callbacks can synchronously enter a pinned namespace helper or send a
 // native disposition. They receive only the detached plan/record, never mu.
 // Reacquire mu before updating state or returning to the locked caller.
-func (f *flowState) injectHeldLocked(inject Injector, raw []byte) error {
+func (f *flowState) injectHeldLocked(inject packetInjection, packets [][]byte) (int, error) {
 	f.mu.Unlock()
 	defer f.mu.Lock()
-	return inject(raw)
+	return inject.send(packets)
 }
 
 func (f *flowState) completeHeldLocked(entry *holdEntry, verdict Verdict, reason string, modified []byte) {
@@ -1461,7 +1458,7 @@ const (
 // pinned delayed-replay semantics: a captured partial Initial is queued and its
 // cycle owns exactly one fake burst, emitted before the queue head when the
 // cycle completes.
-func (f *flowState) handleUDP(config *Config, packet *Packet, inject Injector, complete Completer) (Verdict, *Batch, error) {
+func (f *flowState) handleUDP(config *Config, packet *Packet, inject packetInjection, complete Completer) (Verdict, *Batch, error) {
 	f.lockAfterHoldRelease()
 	defer f.mu.Unlock()
 	if f.failed || f.leaseClosed() {

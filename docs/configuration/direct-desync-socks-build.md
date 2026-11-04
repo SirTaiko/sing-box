@@ -79,27 +79,28 @@ a Go version preference and it is not a `go.mod` change: the module keeps
 `go 1.25.5`, Linux keeps the existing Go 1.25.5 build, and `go.sum` and the
 module cache are untouched.
 
-Why: the enabled Windows TCP path adopts a native ConnectEx socket through one
-`net.FileConn` call, and the `*os.File` carrier that call needs must be created
-by the socket-aware constructor `net.newWindowsFile`. `os.NewFile` classifies a
-Winsock descriptor as an ordinary file, so both `File.Close` and the `File`
-finalizer would dispose of it with `CloseHandle`, which Microsoft forbids for
-sockets. The carrier is also where `net.FileConn` performs its own duplication;
-the Go1.25.5 body loses a `WSADuplicateSocket`/`WSASocket` error behind a
-successful `SyscallConn().Control` callback and can return a zero descriptor
-with a nil error, while the inspected Go1.26.9 body propagates it.
+Why: the enabled Windows TCP path adopts the readiness-verified ConnectEx socket
+by consuming it directly into the standard library's own connection lifecycle.
+The bridge references exactly five enumerated non-public Go symbols —
+`net.newFD`, `net.(*netFD).init`, `net.(*netFD).setAddr`, `net.(*netFD).Close`
+and `net.newTCPConn` — and represents `*netFD` only as a GC-visible
+`unsafe.Pointer`. No `net.FileConn` call, `*os.File` carrier, hidden internal
+duplicate, mirrored `netFD`/`poll.FD`/`TCPConn` layout, offset write or `uintptr`
+round-trip exists on this path. The standard library allocates the FD with its
+real runtime type and GC layout, `(*netFD).init` associates the socket with the
+runtime IOCP, and `net.newTCPConn` returns a genuine `*net.TCPConn`.
 
 Two consequences must be stated honestly:
 
 * The qualified toolchain applies to **every** Windows console build, including
   deployments that disable desync at runtime. The disabled fast path is a
   runtime guarantee, not a return of Go 1.25 Windows build compatibility, because
-  the constructor file is compiled into the console binary.
-* The single internal symbol is reachable only because the project already links
+  the adoption bridge file is compiled into the console binary.
+* The five internal symbols are reachable only because the project already links
   the console with `-checklinkname=0` (see `release/LDFLAGS` and
-  `cmd/internal/build_shared`). That is a blanket linker policy, **not** a
-  per-symbol permission and not a general internal-ABI waiver; a checked link
-  rejects the reference with `link: ... invalid reference to net.newWindowsFile`.
+  `cmd/internal/build_shared`). That is a blanket linker policy and a concrete
+  enumerated source-level exception, **not** a general internal-ABI waiver; a
+  checked link rejects these references.
 
 Qualify the exact cached toolchain before building (exit 0 required):
 
@@ -109,13 +110,17 @@ GOOS=windows GOARCH=amd64 python3 release/check-windows-adoption-go.py \
 ```
 
 The helper checks the exact `go1.26.9` version, the requested target, the pinned
-SHA-256 of the five audited standard-library sources (socket-aware constructor,
-`FileConn` duplication, poll disposal, linker linkname restriction) and the
-presence of `-checklinkname=0` in `release/LDFLAGS`. Any mismatch fails the
-qualification; there is no generic-File or plaintext fallback. The Windows build
+SHA-256 of the fifteen audited standard-library sources (FD construction,
+addresses/finalizer/Close, TCPConn and keepalive/NoDelay defaults, public
+Read/Write ownership, poll disposal and destruction, runtime IOCP/poll
+lifecycle, linker policy), the exact five-symbol/signature set and the absence
+of a FileConn/os.NewFile/mirrored-layout fallback, and the presence of
+`-checklinkname=0` in `release/LDFLAGS`. Any mismatch fails the qualification;
+there is no FileConn, generic-File or plaintext fallback. The Windows build
 constraint refuses other Go minor versions at compile time
 (`windows && go1.26 && !go1.27`); the patch-release requirement is enforced by
-this qualification gate, not by a build tag.
+this qualification gate, not by a build tag. An unqualified build fails closed
+with `undefined: newOwnedSocketConn`.
 
 ## Windows (cross build from Ubuntu or native preparation)
 

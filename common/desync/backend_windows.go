@@ -3,6 +3,7 @@
 package desync
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -204,7 +205,14 @@ type windowsCapture struct {
 	readerDone, receiveHalt, sendUnsafe bool
 	capacityErr                         error
 	scratch                             windowsReceiveRecord
-	receiveBuffer                       []byte
+	// pendingBatch is the single capture-owned view of the last native
+	// outbound batch receipt. raw aliases receiveBuffer and addrs aliases the
+	// returned address array; neither is copied into a second queue. next is
+	// the first packet whose ownership has not been transferred yet, and only
+	// the outbound reader mutates this descriptor under rxMu. An occupied
+	// descriptor keeps the whole receipt rooted and forbids the next receive.
+	pendingBatch  windowsOutboundPendingBatch
+	receiveBuffer []byte
 
 	// dispatch is the ordered close gate: it fences new semantic dispatch,
 	// waits for the records already being handled, and holds records captured
@@ -228,7 +236,13 @@ type windowsCapture struct {
 	sendIncomplete bool
 	// Optional lanes have no new FIFO; on unknown progress retain their one
 	// existing buffer/address instead of losing it when the receive user exits.
-	optionalRetained [2]windowsReceiveRecord
+	// The inbound slot also records the packed batch that was actually
+	// submitted, because a batched native send completion owns both copies.
+	optionalRetained [2]windowsOptionalRetention
+	// prepareErrors are local batch-preparation failures (for example a
+	// length-changing inbound replacement). They are not receive errors, but
+	// they own a retained batch and must keep teardown from claiming success.
+	prepareErrors windowsErrorSummary
 
 	closeOnce sync.Once
 	closeErr  error
@@ -256,6 +270,15 @@ const captureDrainGrace = 2 * time.Second
 const (
 	windowsReceiveRecords  = 256
 	windowsReceiveRawBytes = 8 << 20
+	// windowsReceiveInlinePayload is the one private per-slot payload backing of
+	// a reserved detached record. It is not an accepted packet size or a
+	// capture strategy limit: a longer span keeps the exact previous
+	// make([]byte, n) copy. The fixed extra backing is
+	// windowsReceiveRecords*windowsReceiveInlinePayload = 32768 B for the ring
+	// plus one more slot for the scratch rendezvous; it sits outside the
+	// windowsReceiveRawBytes packet ledger, which still charges every record
+	// its logical length exactly as before.
+	windowsReceiveInlinePayload = 128
 )
 
 var (
@@ -266,10 +289,54 @@ var (
 // Fixed descriptors/ring: no per-record channel, goroutine or error history.
 // Full address bytes include the blank union which struct comparison ignores.
 type windowsReceiveRecord struct {
-	raw                                        []byte
-	address                                    [80]byte
+	raw     []byte
+	address [80]byte
+	// inline is this slot's own payload backing for a reserved detached record
+	// of at most windowsReceiveInlinePayload bytes. raw aliases it with
+	// len==cap==n while the slot is occupied, so the payload lifetime is
+	// exactly the record lifetime and the ledger releases exactly the charged
+	// n. The array is inside the slot (never shared with another record) and
+	// the wholesale reset in reserveRecordLocked/finishRecord zeroes it, so a
+	// reused slot cannot expose a previous, longer payload. The only other
+	// cost is that reset: 128 more zeroed bytes per record transition, with no
+	// heap object and no change to 8MiB admission.
+	inline                                     [windowsReceiveInlinePayload]byte
 	sequence                                   uint64
 	occupied, worker, claimed, terminal, ready bool
+}
+
+// windowsOutboundPendingBatch is the one packed-tail descriptor of the
+// outbound receive path. raw/addrs borrow the synchronous terminal view only
+// while the reader callback that acquired them runs; before a descriptor may
+// outlive that callback, the reader materializes the complete receipt into
+// receiveBuffer and its own address backing and rebinds these slices to those
+// capture-owned targets (the ordinary path never copies into them at all).
+// count/next preserve the original ordinal order, validated records that the
+// whole batch passed framing/family checks, and occupied keeps the receipt
+// rooted across saturation, unsafe or a refused view. A pre-native occupied
+// marker has nil views: it roots one possible acquire, never received bytes.
+// Only the reader mutates this value, always under rxMu.
+type windowsOutboundPendingBatch struct {
+	raw       []byte
+	addrs     []windivert.Address
+	count     int
+	next      int
+	occupied  bool
+	validated bool
+}
+
+// windowsOptionalRetention is the single retained unit of an optional lane.
+// The old single-packet fields are kept for the ICMP lane; the inbound slot
+// additionally owns the captured addresses of its batch and the exact
+// bytes/addresses handed to SendBatch, because an unknown native completion
+// retains both the caller copy and the driver-visible copy.
+type windowsOptionalRetention struct {
+	raw       []byte
+	address   [80]byte
+	addrs     []windivert.Address
+	submitted []byte
+	sendAddrs []windivert.Address
+	occupied  bool
 }
 
 type windowsErrorSummary struct {
@@ -347,9 +414,12 @@ func (c *windowsCapture) failCapture(err error) {
 
 // Charge copy-in-progress before allocation. Subtraction avoids overflow;
 // invalid counters cannot admit another record. Dequeue/Hold return no credit.
-func (c *windowsCapture) reserveRecordLocked(n int) *windowsReceiveRecord {
+// The reservation carries the exact slot index it found: publication uses that
+// index directly instead of scanning the ring a second time. The index is only
+// valid together with a non-nil record; a refused reservation publishes nothing.
+func (c *windowsCapture) reserveRecordLocked(n int) (*windowsReceiveRecord, uint16) {
 	if n <= 0 || n > windivert.MTUMax || c.usedRecords < 0 || c.usedRecords >= windowsReceiveRecords || c.usedRawBytes < 0 || c.usedRawBytes > windowsReceiveRawBytes || n > windowsReceiveRawBytes-c.usedRawBytes {
-		return nil
+		return nil, 0
 	}
 	for i := range c.records {
 		r := &c.records[i]
@@ -357,25 +427,72 @@ func (c *windowsCapture) reserveRecordLocked(n int) *windowsReceiveRecord {
 			*r = windowsReceiveRecord{occupied: true, worker: true, sequence: c.sequence}
 			c.usedRecords++
 			c.usedRawBytes += n
-			return r
+			return r, uint16(i)
 		}
 	}
-	return nil
+	return nil, 0
+}
+
+// detachPayload copies one framed span out of the packed receive buffer into
+// storage that outlives the native receive. A span that fits this slot's
+// private backing uses it with exact len==cap, so no heap object is created
+// and the ledger releases exactly the charged n; a longer span keeps the exact
+// previous make/copy. The copy happens before publication and outside rxMu: an
+// occupied slot is unreachable to any other goroutine until the reader
+// publishes it, so filling it needs no lock, exactly like the previous heap
+// copy.
+func (r *windowsReceiveRecord) detachPayload(span []byte) []byte {
+	n := len(span)
+	if n <= windowsReceiveInlinePayload {
+		packet := r.inline[:n:n]
+		copy(packet, span)
+		return packet
+	}
+	packet := make([]byte, n) // exact backing capacity, never append
+	copy(packet, span)
+	return packet
 }
 
 // In-budget this reader only receives, validates, reserves, copies and publishes.
-// Failed-mode scratch rendezvous is the explicit saturation boundary, NOT a
-// claim of losslessness for packets still below native receive.
+// One native RecvBatchView lends every already-available packet back-to-back for
+// exactly one synchronous callback. The whole packed stream is framed and
+// family-checked before any packet is published, then each packet keeps its own
+// sequence and its own detached record in the unchanged FIFO. A failed
+// reservation latches the existing sticky capacity failure and moves the
+// remaining packed tail through the one scratch rendezvous. Failed-mode scratch
+// rendezvous is the explicit saturation boundary, NOT a claim of losslessness
+// for packets still below native receive. The next native receive is issued only
+// after the whole receipt was transferred and the shared scratch is terminal and
+// worker-free.
+//
+// Ownership: the borrowed view ends when the callback returns, so every path
+// that keeps the receipt - a malformed/family/sequence receipt, the first failed
+// reservation of a sticky batch, or a concurrent unsafe - materializes the
+// complete receipt into the capture-owned receive buffer and this reader's
+// address backing before the callback returns. The ordinary prefix is detached
+// directly from the view, so it is never written into that fallback backing.
 func (c *windowsCapture) loop() {
 	defer c.wg.Done()
 	defer close(c.done)
 	c.initReceive()
 	defer func() { c.rxMu.Lock(); c.readerDone = true; c.rxCond.Broadcast(); c.rxMu.Unlock() }()
-	buffer := c.receiveBuffer
+	// This reader-local address backing is the fallback snapshot target, never
+	// native receive storage: a pending descriptor may borrow the view only
+	// inside the callback that materializes or clears it.
+	addresses := make([]windivert.Address, windivert.BatchMax)
+	var spans [windivert.BatchMax + 1]uint32
 	for {
 		c.rxMu.Lock()
 		halt := c.receiveHalt
 		exhausted := c.sequence == ^uint64(0)
+		owned := c.pendingBatch.occupied || c.scratch.occupied
+		if !halt && !exhausted && !owned {
+			// Pre-native occupied marker: nil views only root one possible
+			// acquire; they never claim received bytes. Only the exact empty
+			// drained receipt, or a callback that cleared its descriptor,
+			// releases this marker.
+			c.pendingBatch = windowsOutboundPendingBatch{occupied: true}
+		}
 		c.rxMu.Unlock()
 		if halt {
 			return
@@ -384,40 +501,136 @@ func (c *windowsCapture) loop() {
 			c.recordDrainError("outbound", errors.New("desync: Windows receive sequence exhausted"))
 			return
 		}
-		length, address, err := c.outbound.Recv(buffer)
-		if err != nil && windivert.IsDrained(err) {
-			c.markDrained(0)
+		if owned {
+			// The previous receipt must be transferred completely and the one
+			// shared scratch terminal before this reader may receive again.
+			c.recordDrainError("outbound", errors.New("desync: Windows outbound receive buffer still owned"))
 			return
 		}
-		if err != nil || length <= 0 || length > len(buffer) {
-			// Invalid/unknown lengths never index a slice. Keep the one scratch.
-			c.rxMu.Lock()
-			c.scratch = windowsReceiveRecord{raw: buffer, occupied: true, address: *(*[80]byte)(unsafe.Pointer(&address))}
-			c.rxMu.Unlock()
-			if err == nil {
-				err = fmt.Errorf("desync: invalid Windows receive length %d", length)
+		consumed := false
+		stop := false
+		length, err := c.outbound.RecvBatchView(windivert.MTUMax, func(raw []byte, addrs []windivert.Address) {
+			consumed = true
+			stop = c.consumeOutboundBatch(raw, addrs, &spans, addresses)
+		})
+		if err != nil {
+			// Only the exact empty terminal receipt proves the queue drained. A
+			// negative count or a callback that already ran is not proof, and a
+			// callback's local stop/diagnostics never become the receive error.
+			// A receipt the wrapper refused to publish keeps the nil marker:
+			// the native bytes/addresses stay in the quarantined lane and this
+			// reader never reads lane memory to invent them.
+			if windivert.IsDrained(err) && length == 0 && !consumed {
+				c.rxMu.Lock()
+				c.pendingBatch = windowsOutboundPendingBatch{}
+				c.rxMu.Unlock()
+				c.markDrained(0)
+				return
 			}
 			c.recordDrainError("outbound", err)
 			return
 		}
-		c.rxMu.Lock()
-		c.sequence++ // checked before receive; only this reader advances it
-		if c.sendUnsafe {
-			c.scratch = windowsReceiveRecord{raw: buffer[:length], occupied: true, sequence: c.sequence, address: *(*[80]byte)(unsafe.Pointer(&address))}
-			c.rxMu.Unlock()
+		if !consumed {
+			// The wrapper publishes success only through the callback. Refuse
+			// to spin on a receipt nobody consumed; the marker still roots it.
+			c.recordDrainError("outbound", fmt.Errorf("desync: outbound view success without a consumed batch (%d bytes)", length))
 			return
 		}
+		if stop {
+			return
+		}
+	}
+}
+
+// consumeOutboundBatch runs the whole reader cycle for one terminal view. The
+// borrowed raw/addrs are valid only inside this call: any path that returns
+// while the descriptor is still occupied first materializes the complete
+// receipt into capture-owned storage, and each already-reserved record owns its
+// exact detached copy before publication. stop reports that the receive owner
+// must not issue another receive.
+func (c *windowsCapture) consumeOutboundBatch(raw []byte, addrs []windivert.Address, spans *[windivert.BatchMax + 1]uint32, addresses []windivert.Address) (stop bool) {
+	length := len(raw)
+	materialized := false
+	// Record the acquisition under rxMu. Both receipt dimensions were already
+	// validated by the wrapper, so this never publishes anything.
+	c.rxMu.Lock()
+	c.pendingBatch.raw, c.pendingBatch.addrs = raw, addrs
+	c.rxMu.Unlock()
+	retain := func() {
+		c.rxMu.Lock()
+		c.materializeOutboundReceipt(&raw, &addrs, addresses, &materialized)
+		c.rxMu.Unlock()
+	}
+	if length <= 0 || length > len(c.receiveBuffer) || len(addrs) == 0 || len(addrs) > windivert.BatchMax {
+		// Zero bytes with captured addresses is an invalid backend batch, not
+		// the ordinary empty native drain (which never reaches a callback).
+		retain()
+		c.recordDrainError("outbound", fmt.Errorf("desync: invalid outbound batch view (%d bytes, %d addresses)", length, len(addrs)))
+		return true
+	}
+	// The whole packed stream is validated before ANY prefix publication: a
+	// malformed suffix forbids delivering an otherwise valid prefix.
+	count, frameErr := frameWindowsBatch(raw, spans)
+	if frameErr == nil {
+		frameErr = validateWindowsBatchFamilies(raw, spans, count, addrs)
+	}
+	if frameErr != nil {
+		// The complete visible receipt is retained as unvalidated (count/next 0).
+		retain()
+		c.recordDrainError("outbound", frameErr)
+		return true
+	}
+	c.rxMu.Lock()
+	// Sequence range is checked for the whole batch before the first record.
+	// Only this reader advances the sequence, exactly once per packet that is
+	// actually transferred to a record or to the scratch rendezvous.
+	if uint64(count) > ^uint64(0)-c.sequence {
+		c.rxMu.Unlock()
+		retain()
+		c.recordDrainError("outbound", errors.New("desync: Windows receive sequence exhausted"))
+		return true
+	}
+	c.pendingBatch.count, c.pendingBatch.next, c.pendingBatch.validated = count, 0, true
+	c.rxMu.Unlock()
+	for index := 0; index < count; index++ {
+		start, end := int(spans[index]), int(spans[index+1])
+		c.rxMu.Lock()
+		if c.sendUnsafe {
+			// Concurrent unsafe stops new receive but never discards the
+			// already-received tail: materialize it and keep the descriptor.
+			c.materializeOutboundReceipt(&raw, &addrs, addresses, &materialized)
+			c.rxMu.Unlock()
+			return true
+		}
+		c.sequence++
 		var record *windowsReceiveRecord
+		var queueIndex uint16
 		if c.capacityErr == nil {
-			record = c.reserveRecordLocked(length)
+			record, queueIndex = c.reserveRecordLocked(end - start)
 		}
 		if record == nil {
-			c.scratch = windowsReceiveRecord{raw: buffer[:length], occupied: true, worker: true, ready: true, sequence: c.sequence, address: *(*[80]byte)(unsafe.Pointer(&address))}
+			// First failed reservation: one complete snapshot into the existing
+			// capture backing, once, before the scratch aliases it. Subsequent
+			// spans of this sticky batch reuse the same backing without a second
+			// copy or a cursor change.
+			c.materializeOutboundReceipt(&raw, &addrs, addresses, &materialized)
+			// Sticky mid-batch exhaustion: one span at a time through the
+			// existing single-record scratch rendezvous, with its own
+			// sequence and the full 80-byte captured address. The scratch is
+			// capture-owned; it is not a record credit and never enters the
+			// ledger.
+			c.scratch = windowsReceiveRecord{
+				raw:      raw[start:end:end],
+				address:  *(*[80]byte)(unsafe.Pointer(&addrs[index])),
+				sequence: c.sequence,
+				occupied: true, worker: true, ready: true,
+			}
+			c.pendingBatch.next = index + 1
 			first := c.capacityErr == nil
 			if first {
 				c.capacityErr = errWindowsReceiveCapacity
-				// Staging -> producer leaf is the only extra lock edge. This is
-				// admission linearization, NOT a retrospective packet credit.
+				// Staging -> producer leaf is the only extra lock edge. This
+				// is admission linearization, NOT a retrospective credit.
 				c.lease.producers.fail(c.capacityErr)
 			}
 			c.rxCond.Broadcast()
@@ -425,32 +638,84 @@ func (c *windowsCapture) loop() {
 			if first {
 				c.failCapture(errWindowsReceiveCapacity)
 			}
+			// Wait only for the scratch completion protocol. A halt stops
+			// new native receive, not the preservation of the acquired tail.
 			c.rxMu.Lock()
 			for c.scratch.occupied && !c.sendUnsafe {
 				c.rxCond.Wait()
 			}
-			halt = c.receiveHalt
+			unsafe := c.sendUnsafe
 			c.rxMu.Unlock()
-			if halt {
-				return
+			if unsafe {
+				return true
 			}
 			continue
 		}
 		c.rxMu.Unlock()
-		packet := make([]byte, length) // exact backing capacity, never append
-		copy(packet, buffer[:length])
-		addressBytes := *(*[80]byte)(unsafe.Pointer(&address))
+		// The charged record is filled directly from the terminal view: one
+		// exact detached copy and one raw80 pointer copy of the captured
+		// address (including the blank union). Neither borrow is retained.
+		packet := record.detachPayload(raw[start:end])
+		addressBytes := *(*[80]byte)(unsafe.Pointer(&addrs[index]))
 		c.rxMu.Lock()
+		// A concurrent unsafe does not cancel this already-charged copy:
+		// the exact detached record is published, then the reader stops.
 		record.raw, record.address = packet, addressBytes
-		index := uint16(0)
-		for &c.records[index] != record {
-			index++
-		}
-		c.queue[(c.queueHead+c.queueCount)%windowsReceiveRecords] = index
+		c.queue[(c.queueHead+c.queueCount)%windowsReceiveRecords] = queueIndex
 		c.queueCount++
+		c.pendingBatch.next = index + 1
 		c.rxCond.Broadcast()
 		c.rxMu.Unlock()
 	}
+	c.rxMu.Lock()
+	for c.scratch.occupied && !c.sendUnsafe {
+		c.rxCond.Wait()
+	}
+	if c.sendUnsafe {
+		// Retain the complete descriptor; the cursor is the only owner state of
+		// the remaining originals. A sticky batch is already capture-owned.
+		c.materializeOutboundReceipt(&raw, &addrs, addresses, &materialized)
+		c.rxMu.Unlock()
+		return true
+	}
+	// Whole batch transferred and the shared scratch terminal and worker-free:
+	// the descriptor may be received into again. Dropping it returns no ledger
+	// credit because it never held one.
+	c.pendingBatch = windowsOutboundPendingBatch{}
+	c.rxMu.Unlock()
+	return false
+}
+
+// materializeOutboundReceipt copies the complete borrowed receipt into the
+// capture-owned packed buffer and this reader's address backing exactly once,
+// then rebinds only the pending descriptor and the callback-local views. It
+// runs under rxMu before the first scratch alias is published or an occupied
+// descriptor escapes the callback. count/next/validated, the original spans and
+// the sequence stay untouched, so the existing cursor still addresses the same
+// bytes; no suffix is compacted, reframed or re-reserved.
+func (c *windowsCapture) materializeOutboundReceipt(raw *[]byte, addrs *[]windivert.Address, addresses []windivert.Address, materialized *bool) {
+	if *materialized {
+		return
+	}
+	n := len(*raw)
+	// The wrapper already bounds both views to MTUMax and BatchMax. These
+	// clamps only keep an out-of-contract wrapper from writing past the fixed
+	// capture backings; a valid receipt is never truncated.
+	if n > len(c.receiveBuffer) {
+		n = len(c.receiveBuffer)
+	}
+	copy(c.receiveBuffer[:n], *raw)
+	addressCount := len(*addrs)
+	if addressCount > len(addresses) {
+		addressCount = len(addresses)
+	}
+	for index := 0; index < addressCount; index++ {
+		copyWindowsAddress(&addresses[index], &(*addrs)[index])
+	}
+	*raw = c.receiveBuffer[:n:n]
+	*addrs = addresses[:addressCount:addressCount]
+	c.pendingBatch.raw, c.pendingBatch.addrs = *raw, *addrs
+	*materialized = true
 }
 
 // This worker alone owns dispatch and the immediate outbound modified slot.
@@ -546,7 +811,10 @@ func (c *windowsCapture) disposeRecord(r *windowsReceiveRecord, sequence uint64,
 
 func (c *windowsCapture) handleOutboundRecord(r *windowsReceiveRecord, sequence uint64) (verdict Verdict, modified []byte, held bool) {
 	complete := func(verdict Verdict, _ string, modified []byte) { c.disposeRecord(r, sequence, verdict, modified) }
-	verdict = c.lease.HandlePacket(r.raw, DirectionOutbound, func(replacement []byte) error {
+	// The synchronous per-packet sender of this captured record is unchanged: it
+	// re-checks ownership under rxMu, clones the full captured address, marks
+	// only the supplied checksum bits and requires a complete native receipt.
+	single := func(replacement []byte) error {
 		c.rxMu.Lock()
 		usable := r.occupied && r.sequence == sequence && !c.sendUnsafe
 		c.rxMu.Unlock()
@@ -561,7 +829,20 @@ func (c *windowsCapture) handleOutboundRecord(r *windowsReceiveRecord, sequence 
 			c.recordSendError(err)
 		}
 		return err
-	}, complete)
+	}
+	// The captured address is written before publication and never rewritten
+	// while the slot remains occupied, so one snapshot is the exact per-packet
+	// metadata of this record.
+	var captured windivert.Address
+	*(*[80]byte)(unsafe.Pointer(&captured)) = r.address
+	batch := func(packets [][]byte) (int, error) {
+		return sendPlanBatches(c.outbound, packets, captured, func() bool {
+			c.rxMu.Lock()
+			defer c.rxMu.Unlock()
+			return r.occupied && r.sequence == sequence && !c.sendUnsafe
+		}, single, c.recordSendError)
+	}
+	verdict = c.lease.handlePacket(r.raw, DirectionOutbound, packetInjection{single: single, batch: batch}, complete)
 	if verdict == VerdictHold {
 		return verdict, nil, true
 	}
@@ -571,62 +852,407 @@ func (c *windowsCapture) handleOutboundRecord(r *windowsReceiveRecord, sequence 
 	return verdict, modified, false
 }
 
+// sendPlanBatches submits the already-built replacement plan of exactly one
+// captured record. Consecutive elements that each frame as exactly one outer
+// IPv4/IPv6 packet of the captured address family are concatenated unchanged
+// into bounded SendBatch chunks (windivert.BatchMax packets / windivert.MTUMax
+// bytes per native call); an element that is not eligible keeps the previous
+// single-packet sender and is submitted on its own after the pending chunk.
+// Framing only decides batch eligibility: bytes, checksums, order and captured
+// metadata are never repaired, truncated or rewritten. A whole plan of zero or
+// one packet keeps the existing single path.
+//
+// A chunk is confirmed only by a nil batch result. Any error, short count or
+// unknown completion confirms no additional packet of that chunk, keeps the
+// previously confirmed prefix and stops this plan; a submitted chunk is never
+// retried, split back into single sends or followed by a later chunk. usable is
+// re-checked under the record lock before every submission, never held across
+// native I/O. recordError publishes a real batch failure once through the
+// existing send-error path.
+func sendPlanBatches(handle *windivert.Handle, packets [][]byte, address windivert.Address, usable func() bool, single Injector, recordError func(error)) (int, error) {
+	if len(packets) == 0 {
+		return 0, nil
+	}
+	if len(packets) == 1 {
+		if err := single(packets[0]); err != nil {
+			return 0, err
+		}
+		return 1, nil
+	}
+	ipv6 := address.IPv6()
+	packed := make([]byte, 0, windivert.MTUMax)
+	addrs := make([]windivert.Address, 0, windivert.BatchMax)
+	confirmed := 0
+	flush := func() error {
+		switch len(addrs) {
+		case 0:
+			return nil
+		case 1:
+			// One packed packet is exactly the old single submission; packing it
+			// into a batch would add no native saving.
+			if err := single(packed); err != nil {
+				return err
+			}
+			confirmed++
+		default:
+			if !usable() {
+				return errCaptureSendIncomplete
+			}
+			if err := sendCapturedBatch(handle, packed, addrs); err != nil {
+				recordError(err)
+				return err
+			}
+			confirmed += len(addrs)
+		}
+		packed, addrs = packed[:0], addrs[:0]
+		return nil
+	}
+	for _, packet := range packets {
+		eligible := planBatchEligible(packet, ipv6)
+		if eligible && len(addrs) != 0 && (len(addrs) == windivert.BatchMax || len(packed)+len(packet) > windivert.MTUMax) {
+			// The work quantum is a chunk boundary, not a rejection: flush the
+			// previous segment and start the next one with this element.
+			if err := flush(); err != nil {
+				return confirmed, err
+			}
+		}
+		if !eligible {
+			// An element that is not yet submitted always keeps its real single
+			// sender: the preceding segment is flushed first, and only that
+			// element's real result decides whether the remaining tail continues.
+			if err := flush(); err != nil {
+				return confirmed, err
+			}
+			if err := single(packet); err != nil {
+				return confirmed, err
+			}
+			confirmed++
+			continue
+		}
+		packed = append(packed, packet...)
+		var sendAddress windivert.Address
+		copyWindowsAddress(&sendAddress, &address)
+		suppliedChecksums(&sendAddress)
+		addrs = append(addrs, sendAddress)
+	}
+	if err := flush(); err != nil {
+		return confirmed, err
+	}
+	return confirmed, nil
+}
+
+// planBatchEligible reports whether one planned replacement is exactly one
+// outer IPv4/IPv6 packet matching the captured address family and fitting one
+// batch quantum. It is a framing/family predicate only: transport parsing and
+// checksum validity are deliberately not consulted and the bytes are never
+// truncated, padded or repaired.
+func planBatchEligible(packet []byte, ipv6 bool) bool {
+	if len(packet) == 0 || len(packet) > windivert.MTUMax {
+		return false
+	}
+	var spans [windivert.BatchMax + 1]uint32
+	count, err := frameWindowsBatch(packet, &spans)
+	if err != nil || count != 1 || int(spans[1]) != len(packet) {
+		return false
+	}
+	return (packet[0]>>4 == 6) == ipv6
+}
+
 // inboundLoop observes replies. Inbound records never reach the outbound
 // planner: a reply is re-injected once on the inbound handle, with its captured
 // direction, interface and offload metadata preserved. In-place reply
 // transformations (window rewrite) replace the bytes and are therefore
 // re-checksummed.
+//
+// One native batch receive returns the packets already queued by the driver,
+// packed back-to-back, with one captured address per packet. The whole packed
+// stream is framed before anything is dispatched, each packet keeps its own
+// dispatch admission and immediate modified-slot consumption, and the batch is
+// re-sent once. An all-Pass batch is forwarded through the receive-bound
+// one-shot capability, which submits the terminal view itself; the first Modify
+// lazily stages the batch in a capture-loop-owned copy and keeps the ordinary
+// SendBatch path.
+//
+// Ownership: the native view is borrowed for exactly one synchronous iteration.
+// RecvBatchViewForward keeps the receive lane serialized and the operation
+// registered until the consumer returns. The all-Pass capability submits the
+// exact receive payload and raw80 array through the separate send lane, so no
+// capture-owned staging copy stands between the terminal receipt and the
+// kernel read. SendBatch still copies what it submits into its own lane for a
+// modified batch. Every retention path detaches the whole original batch and
+// its raw80 addresses before the view ends, then the loop returns instead of
+// receiving again; the retained copies keep the receipt alive without aliasing
+// lane storage.
 func (c *windowsCapture) inboundLoop() {
 	defer c.wg.Done()
-	buffer := make([]byte, windivert.MTUMax)
+	var spans [windivert.BatchMax + 1]uint32
+	// Modified staging is allocated only after the first Modify and then
+	// reused by this single inbound owner. All-Pass never touches it.
+	var sendBuffer []byte
+	var sendAddresses []windivert.Address
 	for {
 		if c.receivesHalted() {
 			return
 		}
-		length, address, err := c.inbound.Recv(buffer)
-		if err != nil && windivert.IsDrained(err) {
-			c.markDrained(1)
-			return
-		}
-		if err != nil || length <= 0 || length > len(buffer) {
-			c.retainOptional(0, buffer, &address)
-			if err == nil {
-				err = fmt.Errorf("desync: invalid inbound receive length %d", length)
-			}
-			c.recordDrainError("inbound", err)
-			return
-		}
-		packet := append([]byte(nil), buffer[:length]...)
-		var sendAddress windivert.Address
-		copyWindowsAddress(&sendAddress, &address)
-		if c.sendsUnsafe() {
-			c.retainOptional(0, packet, &address)
-			return
-		}
-		if c.dispatch.beginDispatch() {
-			// Inbound verdicts are Pass/Modify only; a reply is never replanned
-			// on the outbound path.
-			_ = c.lease.HandlePacket(packet, DirectionInbound, nil, nil)
-			c.dispatch.endDispatch()
-		} else {
-			// A quiesced capture only forwards already-captured traffic, and
-			// only after the lease released the held originals of earlier
-			// captures.
-			c.dispatch.awaitPassThrough()
-		}
-		sendPacket := packet
-		if replacement := c.lease.TakeModified(DirectionInbound); replacement != nil {
-			sendPacket = replacement
-			recomputeChecksums(&sendAddress)
-		}
-		if err = sendCaptured(c.inbound, sendPacket, &sendAddress); err != nil {
-			c.recordSendError(err)
-			if errors.Is(err, errCaptureSendIncomplete) {
-				c.retainOptional(0, packet, &address)
+		consumed := false
+		stop := false
+		length, err := c.inbound.RecvBatchViewForward(windivert.MTUMax, func(raw []byte, addrs []windivert.Address, forwardOriginal func() (int, error)) {
+			consumed = true
+			stop = c.consumeInboundBatch(raw, addrs, &spans, &sendBuffer, &sendAddresses, forwardOriginal)
+		})
+		if err != nil {
+			// A drain receipt is only the ordinary terminal empty receive. A
+			// negative count or a consumer that already ran is not proof that
+			// the queue was empty.
+			if windivert.IsDrained(err) && length == 0 && !consumed {
+				c.markDrained(1)
 				return
 			}
+			if !consumed {
+				// No validated view was published: keep the occupied marker so
+				// teardown cannot claim a lossless drain, and never read the
+				// lane's pending memory. The native bytes stay in the lane.
+				c.retainInboundMarker()
+				c.recordDrainError("inbound", err)
+			}
+			return
+		}
+		if !consumed {
+			// The wrapper publishes success only through the consumer. Refuse
+			// to spin on a receipt nobody consumed.
+			c.retainInboundMarker()
+			c.recordDrainError("inbound", fmt.Errorf("desync: inbound view success without a consumed batch (%d bytes)", length))
+			return
+		}
+		if stop {
+			return
 		}
 	}
+}
+
+// consumeInboundBatch processes one batch acquired through the synchronous
+// terminal view. It returns true when the receive owner must stop. The raw and
+// addrs views are only valid inside this call: every retention detaches a
+// complete copy before returning, and no path asks for another receive.
+//
+// forwardOriginal is the receive-bound one-shot capability of this exact
+// batch. It is used only after every existing gate admitted the unchanged
+// all-Pass disposition; a batch with any Modify keeps the detached staging and
+// the ordinary SendBatch path.
+func (c *windowsCapture) consumeInboundBatch(raw []byte, addrs []windivert.Address, spans *[windivert.BatchMax + 1]uint32, sendBuffer *[]byte, sendAddresses *[]windivert.Address, forwardOriginal func() (int, error)) bool {
+	length := len(raw)
+	if length <= 0 || len(addrs) == 0 || len(addrs) > windivert.BatchMax {
+		// Zero bytes with valid addresses is an invalid backend batch, not the
+		// ordinary empty native drain (which never reaches a consumer).
+		c.retainInboundOriginal(raw, addrs)
+		c.recordDrainError("inbound", fmt.Errorf("desync: invalid inbound batch receive (%d bytes, %d addresses)", length, len(addrs)))
+		return true
+	}
+	count, frameErr := frameWindowsBatch(raw, spans)
+	if frameErr == nil {
+		frameErr = validateWindowsBatchFamilies(raw, spans, count, addrs)
+	}
+	if frameErr != nil {
+		c.retainInboundOriginal(raw, addrs)
+		c.recordDrainError("inbound", frameErr)
+		return true
+	}
+	if c.sendsUnsafe() {
+		c.retainInboundOriginal(raw, addrs)
+		return true
+	}
+	sendBatch := raw
+	sendBatchAddrs := addrs
+	modifiedAny := false
+	var prepareErr error
+	for index := 0; index < count; index++ {
+		start, end := int(spans[index]), int(spans[index+1])
+		if !c.dispatch.beginDispatch() {
+			// The fence won between packets: the remaining tail is
+			// pass-through only. Wait for the held-original release without
+			// holding a dispatch/send count, lease/flow lock or capture rxMu.
+			// The terminal view still holds recvLane.mu and its lifecycle
+			// registration; the pass-through release does not need that lane.
+			c.dispatch.awaitPassThrough()
+			break
+		}
+		_ = c.lease.HandlePacket(raw[start:end:end], DirectionInbound, nil, nil)
+		// The modified slot is one per direction: it must be consumed before
+		// the next packet can overwrite it.
+		modified := c.lease.TakeModified(DirectionInbound)
+		c.dispatch.endDispatch()
+		if modified == nil {
+			continue
+		}
+		if len(modified) != end-start {
+			// PlanReply is length-preserving; anything else is a local
+			// preparation failure, never a truncation or silent Pass.
+			prepareErr = fmt.Errorf("desync: inbound reply replacement has %d bytes for a %d-byte packet", len(modified), end-start)
+			break
+		}
+		if *sendBuffer == nil {
+			*sendBuffer = make([]byte, windivert.MTUMax)
+			*sendAddresses = make([]windivert.Address, windivert.BatchMax)
+		}
+		if !modifiedAny {
+			copy((*sendBuffer)[:length], raw)
+			sendBatch = (*sendBuffer)[:length]
+			sendBatchAddrs = (*sendAddresses)[:len(addrs)]
+			for i := range addrs {
+				copyWindowsAddress(&sendBatchAddrs[i], &addrs[i])
+			}
+			modifiedAny = true
+		}
+		copy(sendBatch[start:end], modified)
+		recomputeChecksums(&sendBatchAddrs[index])
+	}
+	if prepareErr != nil {
+		c.retainInboundSubmitted(raw, addrs, sendBatch, sendBatchAddrs, modifiedAny)
+		c.recordPrepareError(prepareErr)
+		return true
+	}
+	if c.sendsUnsafe() {
+		c.retainInboundSubmitted(raw, addrs, sendBatch, sendBatchAddrs, modifiedAny)
+		return true
+	}
+	preFence := c.dispatch.beginSend()
+	if !preFence {
+		// Never hold a pre-fence send token while waiting for the release:
+		// Quiesce itself waits for that token.
+		c.dispatch.awaitPassThrough()
+	}
+	// Re-check after the wait: an unrelated lane may have reported an unknown
+	// completion in the meantime.
+	if c.sendsUnsafe() {
+		if preFence {
+			c.dispatch.endSend()
+		}
+		c.retainInboundSubmitted(raw, addrs, sendBatch, sendBatchAddrs, modifiedAny)
+		return true
+	}
+	var err error
+	if modifiedAny {
+		err = sendCapturedBatch(c.inbound, sendBatch, sendBatchAddrs)
+	} else {
+		// The unchanged all-Pass batch is submitted from the terminal
+		// receive view itself, so the exact payload and raw80 array reach
+		// the send lane without a capture-owned staging copy.
+		err = forwardCapturedBatch(forwardOriginal, raw, addrs)
+	}
+	if preFence {
+		c.dispatch.endSend()
+	}
+	if err != nil {
+		c.recordSendError(err)
+		if errors.Is(err, errCaptureSendIncomplete) {
+			// Unknown progress owns both the received original and the
+			// submitted batch; do not retry and do not receive again.
+			c.retainInboundSubmitted(raw, addrs, sendBatch, sendBatchAddrs, modifiedAny)
+			return true
+		}
+	}
+	return false
+}
+
+// frameWindowsBatch validates the whole packed stream before any packet
+// reaches a semantic user. This helper is direction-neutral; inbound dispatch
+// and outbound record publication both require the same exact boundaries. WinDivert's batch receive appends the IPv4/IPv6
+// packets back-to-back without padding, so each outer IP total length is the
+// only boundary fact. ParsePacket is deliberately not used for framing: it may
+// shorten a transport payload, while fragments, unsupported protocols and
+// semantic-invalid packets must still pass unchanged. spans receives
+// BatchMax+1 boundaries for a stream of at most BatchMax packets; IPv6 payload
+// length zero means exactly a 40-byte header, never a guessed jumbogram.
+func frameWindowsBatch(raw []byte, spans *[windivert.BatchMax + 1]uint32) (int, error) {
+	n := len(raw)
+	spans[0] = 0
+	if n == 0 {
+		return 0, errors.New("desync: empty batch")
+	}
+	offset, count := 0, 0
+	for offset < n {
+		if count >= windivert.BatchMax {
+			return 0, fmt.Errorf("desync: batch exceeds %d packets", windivert.BatchMax)
+		}
+		remaining := n - offset
+		switch raw[offset] >> 4 {
+		case 4:
+			if remaining < 20 {
+				return 0, fmt.Errorf("desync: IPv4 packet truncated at offset %d", offset)
+			}
+			length := int(binary.BigEndian.Uint16(raw[offset+2 : offset+4]))
+			if length < 20 || length > remaining {
+				return 0, fmt.Errorf("desync: invalid IPv4 length %d at offset %d", length, offset)
+			}
+			offset += length
+		case 6:
+			if remaining < 40 {
+				return 0, fmt.Errorf("desync: IPv6 packet truncated at offset %d", offset)
+			}
+			length := 40 + int(binary.BigEndian.Uint16(raw[offset+4:offset+6]))
+			if length > remaining {
+				return 0, fmt.Errorf("desync: invalid IPv6 length %d at offset %d", length, offset)
+			}
+			offset += length
+		default:
+			return 0, fmt.Errorf("desync: unsupported IP version %d at offset %d", raw[offset]>>4, offset)
+		}
+		spans[count+1] = uint32(offset)
+		count++
+	}
+	return count, nil
+}
+
+// validateWindowsBatchFamilies requires one captured address per framed
+// packet and an exact IP-version/address-family match. Remaining captured
+// metadata is preserved, never normalized.
+func validateWindowsBatchFamilies(raw []byte, spans *[windivert.BatchMax + 1]uint32, count int, addrs []windivert.Address) error {
+	if count != len(addrs) {
+		return fmt.Errorf("desync: batch has %d packets for %d captured addresses", count, len(addrs))
+	}
+	for index := 0; index < count; index++ {
+		ipv6 := raw[spans[index]]>>4 == 6
+		if ipv6 != addrs[index].IPv6() {
+			return fmt.Errorf("desync: packet %d family does not match its captured address", index)
+		}
+	}
+	return nil
+}
+
+// capturedBatchSendDisposition applies the one terminal disposition shared by
+// the copied SendBatch path and the direct original forward. A negative count
+// is the wrapper's unknown-progress result and owns the whole batch; any other
+// terminal error is a visible failure (a count on it is the completion attempt,
+// not progress); a short successful count is equally a visible failure and
+// never a prefix to retry.
+func capturedBatchSendDisposition(n int, err error, byteCount int, packetCount int) error {
+	if n < 0 {
+		return E.Errors(errCaptureSendIncomplete, err)
+	}
+	if err != nil {
+		return fmt.Errorf("desync: windivert batch reinjection of %d bytes in %d packets failed: %w", byteCount, packetCount, err)
+	}
+	if n != byteCount {
+		return fmt.Errorf("desync: windivert batch reinjection wrote %d of %d bytes", n, byteCount)
+	}
+	return nil
+}
+
+// sendCapturedBatch submits one captured batch and requires a complete native
+// receipt. A short/error write is a visible terminal failure, not a prefix to
+// retry; an unknown count keeps the whole-batch ownership with the caller.
+func sendCapturedBatch(handle *windivert.Handle, batch []byte, addrs []windivert.Address) error {
+	n, err := handle.SendBatch(batch, addrs)
+	return capturedBatchSendDisposition(n, err, len(batch), len(addrs))
+}
+
+// forwardCapturedBatch forwards the exact terminal original batch through the
+// receive-bound capability and applies the same terminal disposition as the
+// copied batch send. The receive result itself is returned by the receive call,
+// never replaced by this send diagnostic.
+func forwardCapturedBatch(forwardOriginal func() (int, error), batch []byte, addrs []windivert.Address) error {
+	n, err := forwardOriginal()
+	return capturedBatchSendDisposition(n, err, len(batch), len(addrs))
 }
 
 // sendDisposition applies the one terminal disposition of a captured outbound
@@ -742,8 +1368,97 @@ func (c *windowsCapture) sendsUnsafe() bool {
 
 func (c *windowsCapture) retainOptional(index int, raw []byte, address *windivert.Address) {
 	c.drainMu.Lock()
-	c.optionalRetained[index] = windowsReceiveRecord{raw: raw, occupied: true, address: *(*[80]byte)(unsafe.Pointer(address))}
+	c.optionalRetained[index] = windowsOptionalRetention{raw: raw, occupied: true, address: *(*[80]byte)(unsafe.Pointer(address))}
 	c.drainMu.Unlock()
+}
+
+// detachOriginalBytes copies the whole original batch into storage that
+// outlives the terminal view. The capacity is exact, so a retained receipt is a
+// detached copy and never an alias of lane storage.
+func detachOriginalBytes(raw []byte) []byte {
+	if len(raw) == 0 {
+		return nil
+	}
+	detached := make([]byte, len(raw))
+	copy(detached, raw)
+	return detached
+}
+
+func detachOriginalAddrs(addrs []windivert.Address) []windivert.Address {
+	if len(addrs) == 0 {
+		return nil
+	}
+	detached := make([]windivert.Address, len(addrs))
+	for i := range addrs {
+		copyWindowsAddress(&detached[i], &addrs[i])
+	}
+	return detached
+}
+
+// retainInboundMarker records an occupied optional slot without a published
+// view: a receive that never reached a validated terminal consumer owns no
+// readable batch, and the lane's pending memory is never read to invent one.
+func (c *windowsCapture) retainInboundMarker() {
+	c.drainMu.Lock()
+	c.optionalRetained[0] = windowsOptionalRetention{occupied: true}
+	c.drainMu.Unlock()
+}
+
+// retainInbound detaches the complete original batch (all bytes and every raw80
+// address) from the terminal view before the consumer returns and keeps it in
+// the existing optional slot. The old aliasing-only retention is deliberately
+// gone: a lane view cannot outlive the consumer.
+//
+// When a send batch was already chosen, detached reports whether it is
+// capture-owned staging (kept as-is) or the all-pass terminal view (retained as
+// the same detached original copies).
+func (c *windowsCapture) retainInbound(raw []byte, addrs []windivert.Address, chosen bool, submitted []byte, sendAddrs []windivert.Address, detached bool) {
+	retained := windowsOptionalRetention{
+		raw:      detachOriginalBytes(raw),
+		addrs:    detachOriginalAddrs(addrs),
+		occupied: true,
+	}
+	if chosen {
+		if detached {
+			retained.submitted = submitted
+			retained.sendAddrs = sendAddrs
+		} else {
+			retained.submitted = retained.raw
+			retained.sendAddrs = retained.addrs
+		}
+	}
+	c.drainMu.Lock()
+	c.optionalRetained[0] = retained
+	c.drainMu.Unlock()
+}
+
+// retainInboundOriginal retains a batch before any send batch was chosen.
+func (c *windowsCapture) retainInboundOriginal(raw []byte, addrs []windivert.Address) {
+	c.retainInbound(raw, addrs, false, nil, nil, false)
+}
+
+// retainInboundSubmitted retains the original batch and the exact send-batch
+// forms of a batch whose submission had already been prepared.
+func (c *windowsCapture) retainInboundSubmitted(raw []byte, addrs []windivert.Address, submitted []byte, sendAddrs []windivert.Address, detached bool) {
+	c.retainInbound(raw, addrs, true, submitted, sendAddrs, detached)
+}
+
+// recordPrepareError publishes a local batch-preparation failure: the whole
+// batch is retained by the caller and no native disposition was issued.
+func (c *windowsCapture) recordPrepareError(err error) {
+	c.drainMu.Lock()
+	first := c.prepareErrors.add(err)
+	c.drainMu.Unlock()
+	c.rxMu.Lock()
+	c.receiveHalt = true
+	if c.rxCond != nil {
+		c.rxCond.Broadcast()
+	}
+	c.rxMu.Unlock()
+	if first {
+		c.lease.ReportNativeFailure(err)
+		c.failCapture(err)
+	}
 }
 
 // FenceDispatch publishes the ordered-close fence without waiting for the
@@ -961,10 +1676,21 @@ func (c *windowsCapture) teardown() error {
 	for _, summary := range c.sendErrors {
 		errs = append(errs, summary.err())
 	}
+	errs = append(errs, c.prepareErrors.err())
+	if c.prepareErrors.first != nil {
+		incomplete = true
+	}
+	// An occupied optional retention owns the only received unit of that lane;
+	// it is never cleared to manufacture a successful Close.
+	for index := range c.optionalRetained {
+		if c.optionalRetained[index].occupied {
+			incomplete = true
+		}
+	}
 	c.drainMu.Unlock()
 	c.rxMu.Lock()
 	errs = append(errs, c.capacityErr)
-	incomplete = incomplete || c.usedRecords != 0 || c.usedRawBytes != 0 || c.scratch.occupied
+	incomplete = incomplete || c.usedRecords != 0 || c.usedRawBytes != 0 || c.scratch.occupied || c.pendingBatch.occupied
 	c.rxMu.Unlock()
 	if c.stopErr != nil || incomplete {
 		// Receive-user exit is not ERROR_NO_DATA, and a failed completion query

@@ -33,6 +33,10 @@ type ioLane struct {
 	mu         sync.Mutex
 	event      windows.Handle
 	overlapped windows.Overlapped
+	// returned is reusable lane-owned count storage for DeviceIoControl and
+	// GetOverlappedResult. submit resets it before each submission and copies
+	// it into ioResult while lane serialization is held.
+	returned uint32
 	// quarantined marks a lane whose last submission could not be proven
 	// terminal. The OVERLAPPED, its event and the native packet/address
 	// storage may still be referenced by the kernel, so the lane is never
@@ -51,8 +55,13 @@ type ioLane struct {
 	// terminal completion.
 	inBuf []byte
 	// dataBuf is the lane-owned data buffer of the current submission. Receives
-	// are delivered into it and copied to the caller only after a terminal
-	// receipt; sends are copied into it before submission, so the kernel never
+	// are delivered into it, then copied to the caller or synchronously lent
+	// to a terminal consumer only after a terminal receipt. The view keeps the
+	// lane serialized and registered until its consumer returns. A terminal
+	// receive view may also be submitted once as the payload of a direct send;
+	// the receive lane stays registered for that submission, so the kernel's
+	// read never races a later receive into the same storage. Sends are copied
+	// into the send lane's buffer before submission, so the kernel never
 	// references caller memory that may be reused as soon as the public call
 	// returns. The control lane stages its ioctl request and response in the
 	// same buffer. A quarantine keeps it reachable with the lane.
@@ -111,12 +120,12 @@ func (l *ioLane) close() error {
 //
 // Lifetime invariant: a native operation registers on its lane under the handle
 // lifecycle lock before the kernel can see it, and deregisters only after a
-// terminal receipt. Closing wins the lifecycle lock, refuses every later
-// registration, cancels the registered operations and retires the device and
-// events only after their terminal receipts - or, when the kernel does not
-// produce one inside the bounded grace, reports a non-success Close and defers
-// retirement to the owner that observes the receipts, still reachable through
-// Done.
+// terminal receipt and any synchronous terminal consumer have finished.
+// Closing wins the lifecycle lock, refuses every later registration, cancels
+// the registered operations and retires the device and events only after all
+// registered use ends. If native completion or a terminal consumer outlasts the
+// bounded grace, Close reports non-success and defers retirement to the owner
+// that observes the registrations end, still reachable through Done.
 type Handle struct {
 	device   windows.Handle
 	recvLane ioLane
@@ -158,6 +167,11 @@ func Open(filter *Filter, layer Layer, priority int16, flags Flag) (*Handle, err
 			return nil, h.failedOpen(err)
 		}
 	}
+	// Requests are awaited on their own lane events, so the file object's own
+	// completion event is never needed. Skipping that unused signal is
+	// optional: a driver that rejects the mode keeps the original completion
+	// path, and a failure here must neither fail nor alter Open.
+	_ = windows.SetFileCompletionNotificationModes(h.device, windows.FILE_SKIP_SET_EVENT_ON_HANDLE)
 	if err = h.initialize(layer, priority, flags); err != nil {
 		// Rollback completes here unless the kernel refuses to produce a
 		// terminal receipt inside the bounded grace; that case is surfaced
@@ -310,58 +324,214 @@ const BatchMax = 255
 
 const addressSize = uint32(unsafe.Sizeof(Address{}))
 
-// The driver packs packets back-to-back into buf with no padding and copies
-// exactly each packet's IP total length, and returns as soon as at least one
-// packet is available.
-//
-// The returned address slice is a copy: the lane's native array becomes
-// reusable as soon as this call returns. The received bytes are written into
-// lane-owned storage and copied to buf only after a terminal receipt, so buf is
-// never referenced by native I/O after this call returns.
+// batchAddressCount validates the driver-written address-byte length before it
+// is divided into a packet count. The length belongs to one native completion,
+// so a value that is not a whole number of WINDIVERT_ADDRESS records must not be
+// rounded down: the remainder is a partial receipt and the missing count is not
+// information the caller can reconstruct. Zero addresses are equally not a
+// successful batch receive, and the array capacity is WINDIVERT_BATCH_MAX.
+func batchAddressCount(written uint32) (int, error) {
+	if written == 0 || written > uint32(BatchMax)*addressSize || written%addressSize != 0 {
+		return 0, E.New("windivert: recv batch: driver returned ", written, " address bytes")
+	}
+	return int(written / addressSize), nil
+}
+
+// RecvBatch receives one batch and returns a detached copy of the captured
+// addresses. The lane's native array becomes reusable as soon as this call
+// returns. The received bytes are written into lane-owned storage and copied to
+// buf only after a terminal receipt, so buf is never referenced by native I/O
+// after this call returns.
 func (h *Handle) RecvBatch(buf []byte) (int, []Address, error) {
-	if len(buf) < MTUMax {
+	return h.recvBatchTerminal(len(buf), func(owned []byte, _ int, addrs []Address) []Address {
+		receipt := make([]Address, len(addrs))
+		copy(receipt, addrs)
+		copy(buf, owned)
+		return receipt
+	}, nil)
+}
+
+// RecvBatchInto receives one batch into buf and copies the captured addresses
+// into caller-owned storage. addresses must have at least BatchMax elements
+// before the receive is submitted; a shorter slice is rejected without
+// receiving anything, because the lane cannot know the packet count before the
+// terminal receipt and must not leave a partial receipt in caller storage. On
+// success the returned slice aliases addresses[:count] and stays valid until
+// the caller issues its next receive on this handle. On error no caller
+// storage is published.
+//
+// Native I/O still uses only the lane-owned address array and buffers; caller
+// storage is written after the completion was proven terminal and while lane
+// serialization is still held.
+func (h *Handle) RecvBatchInto(buf []byte, addresses []Address) (int, []Address, error) {
+	if len(addresses) < BatchMax {
+		return 0, nil, E.New("windivert: recv batch into: address storage smaller than BatchMax")
+	}
+	return h.recvBatchTerminal(len(buf), func(owned []byte, _ int, addrs []Address) []Address {
+		copy(addresses, addrs)
+		copy(buf, owned)
+		return addresses[:len(addrs)]
+	}, nil)
+}
+
+// RecvBatchView receives one batch and lends the receive lane's payload and
+// captured addresses to consume. It is the synchronous terminal-delivery path:
+// consume runs exactly once, after the completion was proven terminal and both
+// receipt dimensions were validated, while the receive lane is still
+// serialized and this operation is still registered against the handle
+// lifetime. Ready-to-use views are capped to their exact receipt length, so the
+// consumer cannot see more than was received.
+//
+// The borrow interval ends when consume returns. The consumer must not retain
+// either slice, must not issue another receive on this handle, and must not
+// wait for Close or Done: the lane mutex and the lifecycle registration are
+// held across the call. A panic is not recovered here; the single deferred
+// terminal cleanup still unlocks the lane and releases the registration.
+//
+// The returned count is the native byte count, not the packet count, so the
+// packet geometry has to be derived from the addresses inside consume. A nil
+// consumer or a buffer smaller than MTUMax is rejected before any submission,
+// and unknown progress, terminal native failures or invalid dimensions
+// deliver nothing.
+func (h *Handle) RecvBatchView(bufferSize int, consume func(raw []byte, addrs []Address)) (int, error) {
+	if consume == nil {
+		return 0, E.New("windivert: recv batch view: nil consumer")
+	}
+	count, _, err := h.recvBatchTerminal(bufferSize, func(owned []byte, _ int, addrs []Address) []Address {
+		consume(owned, addrs)
+		return nil
+	}, nil)
+	return count, err
+}
+
+// RecvBatchViewForward is the same synchronous terminal delivery as
+// RecvBatchView, plus a one-shot capability that forwards exactly this
+// terminal batch through the handle's send lane. The capability takes no
+// arguments: it cannot name another buffer, another address array or another
+// handle, so it is not a general borrowed-memory send API.
+//
+// The capability is valid only while consume runs. The first call submits the
+// batch exactly once; a later call, or a call after consume returned, is
+// rejected without a native submission. The consumer must obey the same borrow
+// rules as RecvBatchView and must not retain the views or the capability.
+// Both raw and addrs are read-only for the entire consume invocation; prepare
+// modifications in detached storage. Invoke forwardOriginal synchronously
+// on consume's goroutine, never concurrently or from another goroutine. The
+// callback-local guards enforce ordinary one-shot/scope use, not concurrent
+// API safety.
+//
+// The direct send keeps the ordinary send-lane protocol: its own event,
+// OVERLAPPED, returned count slot and control input, the same beginLane
+// registration, pending arm, post-submission Close compensation and waited
+// terminal receipt. Only the copies are omitted: the kernel is handed the
+// terminal receive payload and the receive lane's full raw80 address array
+// directly. The receive lane stays serialized and registered for the whole
+// consumer invocation, so neither range can be rewritten while the send may
+// still reference it.
+//
+// If that send completion cannot be proven terminal, the capability reports
+// unknownProgress and the receive cleanup retains the receive lane
+// quarantined and registered as well: the kernel may still hold the submitted
+// receive storage, and a later receive into it would overwrite what the send
+// is reading. A proven terminal send (full, short or error) keeps the ordinary
+// single-lane cleanup.
+func (h *Handle) RecvBatchViewForward(bufferSize int, consume func(raw []byte, addrs []Address, forwardOriginal func() (int, error))) (int, error) {
+	if consume == nil {
+		return 0, E.New("windivert: recv batch forward: nil consumer")
+	}
+	var forwardUnknown bool
+	count, _, err := h.recvBatchTerminal(bufferSize, func(owned []byte, _ int, addrs []Address) []Address {
+		active := true
+		defer func() { active = false }()
+		attempted := false
+		forwardOriginal := func() (int, error) {
+			if !active {
+				return 0, E.New("windivert: recv batch forward: capability used after the consumer returned")
+			}
+			if attempted {
+				return 0, E.New("windivert: recv batch forward: capability already attempted")
+			}
+			attempted = true
+			result := h.submitOriginalBatchSend(owned, addrs)
+			if !result.terminal {
+				// Publish the unknown forward before the consumer can see
+				// the error: the deferred receive cleanup must retain this
+				// lane instead of releasing it for the next receive.
+				forwardUnknown = true
+				return unknownProgress, result.err
+			}
+			if result.err != nil {
+				return int(result.count), result.err
+			}
+			return int(result.count), nil
+		}
+		consume(owned, addrs, forwardOriginal)
+		return nil
+	}, &forwardUnknown)
+	return count, err
+}
+
+// recvBatchTerminal is the single terminal-delivery path shared by every batch
+// receive. The submission protocol (beginLane, lane-owned storage, arm/cancel,
+// terminal classification, both receipt-dimension checks) lives here exactly
+// once; deliver only decides how a validated receipt is published. It runs
+// once, under lane serialization and the lifecycle registration, after the
+// completion was proven terminal, and must not retain the lane-owned views. The
+// slice it returns is the receipt reported to the caller.
+//
+// The release is one deferred terminal cleanup: a proven terminal submission
+// always deregisters and unlocks the lane, including when deliver panics; an
+// unproven completion stays quarantined and keeps its registration charged.
+//
+// forwardUnknown, when non-nil, is set by a direct-original send capability
+// when that send's completion could not be proven terminal. The same single
+// deferred cleanup then withholds the receive release too, so both lanes stay
+// quarantined and registered: the kernel may still read the submitted receive
+// storage, and a later receive into it would overwrite data the send owns.
+// The flag is read at cleanup time, so it holds on a normal consumer return and
+// during stack unwinding alike.
+func (h *Handle) recvBatchTerminal(bufferSize int, deliver func(owned []byte, byteCount int, addrs []Address) []Address, forwardUnknown *bool) (int, []Address, error) {
+	if bufferSize < MTUMax {
 		return 0, nil, E.New("windivert: recv batch: buffer smaller than MTUMax")
 	}
 	lane := &h.recvLane
 	if err := h.beginLane(lane); err != nil {
 		return 0, nil, err
 	}
+	terminal := false
+	defer func() {
+		release := terminal
+		if forwardUnknown != nil && *forwardUnknown {
+			release = false
+		}
+		h.finishLane(lane, release)
+		runtime.KeepAlive(h)
+	}()
 	if lane.addrs == nil {
 		lane.addrs = make([]Address, BatchMax)
 	}
 	lane.addrsLen = uint32(len(lane.addrs)) * addressSize
 	in := buildIoctlRecvBatch(&lane.addrs[0], &lane.addrsLen)
-	owned := lane.ownedData(len(buf))
+	owned := lane.ownedData(bufferSize)
 	result := h.submit(lane, ioctlRecv, in[:], owned)
 	if !result.terminal {
-		h.finishLane(lane, false)
-		runtime.KeepAlive(h)
 		return unknownProgress, nil, result.err
 	}
-	// Copy the driver-written addresses while the lane still owns the array,
-	// and only when the kernel proved the completion.
-	var addrs []Address
-	if result.err == nil {
-		count := int(lane.addrsLen / addressSize)
-		if count > len(lane.addrs) {
-			h.finishLane(lane, true)
-			runtime.KeepAlive(h)
-			return 0, nil, E.New("windivert: recv batch: driver returned ", count, " addresses")
-		}
-		addrs = make([]Address, count)
-		copy(addrs, lane.addrs[:count])
-	}
-	h.finishLane(lane, true)
-	runtime.KeepAlive(h)
+	terminal = true
 	if result.err != nil {
 		return 0, nil, result.err
 	}
-	count := int(result.count)
-	if count > len(owned) {
-		return 0, nil, E.New("windivert: recv batch: driver reported ", count, " bytes for a ", len(owned), "-byte buffer")
+	// Validate both receipt dimensions before publishing either view, so a
+	// malformed receipt publishes nothing.
+	count, countErr := batchAddressCount(lane.addrsLen)
+	if countErr != nil {
+		return 0, nil, countErr
 	}
-	copy(buf, owned[:count])
-	return count, addrs, nil
+	byteCount := int(result.count)
+	if byteCount > len(owned) {
+		return 0, nil, E.New("windivert: recv batch: driver reported ", byteCount, " bytes for a ", len(owned), "-byte buffer")
+	}
+	return byteCount, deliver(owned[:byteCount:byteCount], byteCount, lane.addrs[:count:count]), nil
 }
 
 // The driver recovers packet boundaries from the IP total-length fields and
@@ -401,6 +571,37 @@ func (h *Handle) SendBatch(buf []byte, addrs []Address) (int, error) {
 		return int(result.count), result.err
 	}
 	return int(result.count), nil
+}
+
+// submitOriginalBatchSend submits the exact terminal receive payload and the
+// receive lane's full raw80 address array through the send lane without
+// staging either. The caller holds the receive lane serialization and its
+// lifecycle registration for the whole submission, so both ranges are
+// immutable until the kernel proved it is done with them: no later receive can
+// overwrite the payload and no receive writer can rewrite an address.
+//
+// Everything else is the ordinary send-lane protocol of SendBatch: the same
+// preflight, beginLane registration, lane-owned event/OVERLAPPED/returned-count
+// slot and 16-byte control input, pending arm, post-submission Close
+// compensation and waited terminal receipt. The receive OVERLAPPED is never
+// reused for a send. An unproven completion quarantines the send lane exactly
+// like SendBatch; the receive lane retention is decided by the caller.
+func (h *Handle) submitOriginalBatchSend(raw []byte, addrs []Address) ioResult {
+	if len(addrs) == 0 || len(addrs) > BatchMax {
+		return ioResult{terminal: true, err: E.New("windivert: send batch: invalid packet count ", len(addrs))}
+	}
+	if len(raw) == 0 {
+		return ioResult{terminal: true, err: E.New("windivert: send batch: empty buffer")}
+	}
+	lane := &h.sendLane
+	if err := h.beginLane(lane); err != nil {
+		return ioResult{terminal: true, err: err}
+	}
+	in := buildIoctlSend(&addrs[0], uint32(len(addrs))*addressSize)
+	result := h.submit(lane, ioctlSend, in[:], raw)
+	h.finishLane(lane, result.terminal)
+	runtime.KeepAlive(h)
+	return result
 }
 
 // The address's Outbound flag controls whether the packet is sent toward
@@ -658,9 +859,11 @@ var (
 //
 // The ioctl union is copied into lane-owned storage first: out is already
 // lane-owned by the caller (received payload/version output or the copied send
-// bytes), so no caller-provided memory is handed to the driver. Once this
-// function returns an unproven completion, the caller keeps the lane charged
-// and quarantined, which keeps that storage reachable.
+// bytes), so no caller-provided memory is handed to the driver. The lane's
+// returned-count slot is reset for each submission and copied into ioResult
+// before serialization is released. Once this function returns an unproven
+// completion, the caller keeps the lane charged and quarantined, which keeps
+// the native operation storage reachable.
 //
 // A pending submission is not a terminal receipt. The wait below distinguishes:
 //   - a successful completion (count is authoritative, including short counts);
@@ -685,17 +888,20 @@ func (h *Handle) submit(lane *ioLane, code uint32, in []byte, out []byte) ioResu
 		outPtr = &out[0]
 		outLen = uint32(len(out))
 	}
-	var returned uint32
+	// Reuse the lane's count slot instead of allocating a fresh local per call.
+	// Reset under lane serialization so a call that writes no count cannot
+	// expose the previous submission's value.
+	lane.returned = 0
 	overlapped := &lane.overlapped
-	err := nativeDeviceIoControl(h.device, code, inPtr, inLen, outPtr, outLen, &returned, overlapped)
+	err := nativeDeviceIoControl(h.device, code, inPtr, inLen, outPtr, outLen, &lane.returned, overlapped)
 	if err == nil {
-		return ioResult{count: returned, terminal: true}
+		return ioResult{count: lane.returned, terminal: true}
 	}
 	if !errors.Is(err, windows.ERROR_IO_PENDING) {
 		// The request never became pending: the kernel reported this
 		// operation's terminal failure synchronously and holds no reference to
 		// the lane.
-		return ioResult{count: returned, terminal: true, err: err}
+		return ioResult{count: lane.returned, terminal: true, err: err}
 	}
 	// The request is now visible to the kernel. Publish that and re-check the
 	// gate: a Close whose cancellation missed this submission is compensated
@@ -706,15 +912,15 @@ func (h *Handle) submit(lane *ioLane, code uint32, in []byte, out []byte) ioResu
 	// Waiting for the completion is not the same as shortcutting the wait. A
 	// canceled operation completes with ERROR_OPERATION_ABORTED; a successful
 	// completion that raced the cancellation keeps its authoritative count.
-	err = nativeGetOverlappedResult(h.device, overlapped, &returned, true)
+	err = nativeGetOverlappedResult(h.device, overlapped, &lane.returned, true)
 	if err == nil {
-		return ioResult{count: returned, terminal: true}
+		return ioResult{count: lane.returned, terminal: true}
 	}
 	if unprovenCompletionStatus(err) {
-		return ioResult{count: returned, terminal: false, err: E.Cause(err,
+		return ioResult{count: lane.returned, terminal: false, err: E.Cause(err,
 			"windivert: native completion could not be observed; ownership retained")}
 	}
-	return ioResult{count: returned, terminal: true, err: err}
+	return ioResult{count: lane.returned, terminal: true, err: err}
 }
 
 // unprovenCompletionStatus reports whether a failed GetOverlappedResult means

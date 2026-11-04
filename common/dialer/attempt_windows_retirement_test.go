@@ -5,7 +5,6 @@ package dialer
 import (
 	"context"
 	"errors"
-	"net"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -96,66 +95,49 @@ func TestWA1UnresolvedRetirementRendersThroughJoinedProductionPaths(t *testing.T
 		assertUnresolvedRetirementDiagnostic(t, err, ambiguous, handle)
 	})
 
-	t.Run("adoption-carrier-retirement", func(t *testing.T) {
-		installAdoptionSeams(t, carrier, nil, ambiguous)
-		var adopted net.Conn
-		err := captureErrorPanic(t, "adoptConnectedSocket", func() error {
-			var adoptErr error
-			adopted, adoptErr = adoptConnectedSocket(handle)
+	t.Run("unpublished-netfd-cleanup", func(t *testing.T) {
+		scripted := newScriptedSocketAdoption()
+		scripted.initErr = errors.New("injected netFD init failure")
+		scripted.closeFDErrors = []error{ambiguous}
+		err := captureErrorPanic(t, "bridgeOwnedCarrier", func() error {
+			_, adoptErr := bridgeOwnedCarrier(scripted.api(), carrier, time.Now().Add(time.Second))
 			return adoptErr
 		})
-		if adopted != nil {
-			t.Fatal("a failed carrier retirement published a connection")
-		}
 		assertUnresolvedRetirementDiagnostic(t, err, ambiguous, carrier)
 	})
 
-	t.Run("adoption-and-carrier-retirement", func(t *testing.T) {
-		adoptErr := errors.New("injected adoption failure")
-		installAdoptionSeams(t, carrier, adoptErr, ambiguous)
-		err := captureErrorPanic(t, "adoptConnectedSocket", func() error {
-			_, callErr := adoptConnectedSocket(handle)
-			return callErr
+	t.Run("init-and-fd-cleanup-failure", func(t *testing.T) {
+		initErr := errors.New("injected netFD init failure")
+		scripted := newScriptedSocketAdoption()
+		scripted.initErr = initErr
+		scripted.closeFDErrors = []error{ambiguous}
+		err := captureErrorPanic(t, "bridgeOwnedCarrier", func() error {
+			_, adoptErr := bridgeOwnedCarrier(scripted.api(), carrier, time.Now().Add(time.Second))
+			return adoptErr
 		})
-		if err == nil || !errors.Is(err, adoptErr) {
-			t.Fatalf("error = %v, want the adoption error preserved", err)
+		if err == nil || !errors.Is(err, initErr) {
+			t.Fatalf("error = %v, want the init error preserved", err)
 		}
 		assertUnresolvedRetirementDiagnostic(t, err, ambiguous, carrier)
 	})
 
-	t.Run("constructor-rejection-and-carrier-retirement", func(t *testing.T) {
-		seams := installAdoptionSeams(t, carrier, nil, nil)
-		ctorErr := errors.New("injected constructor rejection")
-		newAdoptionFile = func(candidate windows.Handle) (adoptionFile, error) {
-			seams.ctorInputs = append(seams.ctorInputs, candidate)
-			return nil, ctorErr
-		}
-		seams.closeErrors = []error{ambiguous}
-		err := captureErrorPanic(t, "adoptConnectedSocket", func() error {
-			_, callErr := adoptConnectedSocket(handle)
-			return callErr
+	t.Run("newfd-rejection-and-raw-retirement", func(t *testing.T) {
+		ctorErr := errors.New("injected newFD rejection")
+		scripted := newScriptedSocketAdoption()
+		scripted.newFDNil = true
+		scripted.newFDErr = ctorErr
+		closeCalls := installCarrierCloseSeam(t, ambiguous)
+		err := captureErrorPanic(t, "bridgeOwnedCarrier", func() error {
+			_, adoptErr := bridgeOwnedCarrier(scripted.api(), carrier, time.Now().Add(time.Second))
+			return adoptErr
 		})
 		if err == nil || !errors.Is(err, ctorErr) {
-			t.Fatalf("error = %v, want the constructor error preserved", err)
+			t.Fatalf("error = %v, want the newFD error preserved", err)
 		}
 		assertUnresolvedRetirementDiagnostic(t, err, ambiguous, carrier)
-	})
-
-	t.Run("readiness-probe-retirement", func(t *testing.T) {
-		originalClose := closeCarrierSocket
-		originalProbe := duplicateProbe
-		t.Cleanup(func() {
-			closeCarrierSocket = originalClose
-			duplicateProbe = originalProbe
-		})
-		probe := windows.Handle(0x77)
-		duplicateProbe = func(windows.Handle) (windows.Handle, error) { return probe, nil }
-		closeCarrierSocket = func(windows.Handle) error { return ambiguous }
-		err := captureErrorPanic(t, "probeConnectedContext", func() error {
-			_, callErr := probeConnectedContext(handle)
-			return callErr
-		})
-		assertUnresolvedRetirementDiagnostic(t, err, ambiguous, probe)
+		if len(*closeCalls) != 1 {
+			t.Fatalf("raw closes = %v, want exactly one carrier attempt", *closeCalls)
+		}
 	})
 
 	t.Run("failed-duplicate-retirement", func(t *testing.T) {

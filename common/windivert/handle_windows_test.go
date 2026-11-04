@@ -8,6 +8,8 @@ import (
 	"unsafe"
 
 	"github.com/stretchr/testify/require"
+
+	"golang.org/x/sys/windows"
 )
 
 // CTL_CODE macro from Windows DDK:
@@ -123,4 +125,13 @@ func TestValidateOpenArgsFlags(t *testing.T) {
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, FlagSniff|FlagSendOnly))
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, Flag(0x10)))
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, FlagSendOnly|Flag(0x10)))
+}
+
+func TestFileCompletionModeSkipsOnlyFileEvent(t *testing.T) {
+	t.Parallel()
+	// Open disables the file object's unused completion event and nothing
+	// else: the explicit lane events must stay signaled, and skip-success must
+	// not be requested without an associated completion port.
+	require.Equal(t, uint8(0x2), uint8(windows.FILE_SKIP_SET_EVENT_ON_HANDLE))
+	require.Zero(t, windows.FILE_SKIP_SET_EVENT_ON_HANDLE&windows.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS)
 }

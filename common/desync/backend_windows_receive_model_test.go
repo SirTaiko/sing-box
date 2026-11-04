@@ -4,6 +4,7 @@ package desync
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -307,7 +308,7 @@ func TestWindowsReceiveTokenAndCheckedReservation(t *testing.T) {
 	c.initReceive()
 	for _, workerFirst := range []bool{false, true} {
 		c.sequence++
-		r := c.reserveRecordLocked(17)
+		r, _ := c.reserveRecordLocked(17)
 		if r == nil {
 			t.Fatal("reserve")
 		}
@@ -327,7 +328,7 @@ func TestWindowsReceiveTokenAndCheckedReservation(t *testing.T) {
 			t.Fatal("not exactly once")
 		}
 		c.sequence++
-		fresh := c.reserveRecordLocked(18)
+		fresh, _ := c.reserveRecordLocked(18)
 		fresh.raw = make([]byte, 18)
 		c.finishRecord(r, seq, true, true)
 		if c.usedRecords != 1 || c.usedRawBytes != 18 {
@@ -338,7 +339,7 @@ func TestWindowsReceiveTokenAndCheckedReservation(t *testing.T) {
 	for _, used := range []int{-1, windowsReceiveRawBytes - 1, windowsReceiveRawBytes, windowsReceiveRawBytes + 1, int(^uint(0) >> 1)} {
 		for _, n := range []int{1, 2, windivert.MTUMax + 1} {
 			c := &windowsCapture{usedRawBytes: used}
-			r := c.reserveRecordLocked(n)
+			r, _ := c.reserveRecordLocked(n)
 			want := used == windowsReceiveRawBytes-1 && n == 1
 			if (r != nil) != want {
 				t.Errorf("subtraction boundary used=%d n=%d admitted=%v", used, n, r != nil)
@@ -497,12 +498,19 @@ func TestWindowsReceiveOptionalStopAndReceiveFailures(t *testing.T) {
 					s := make(chan struct{})
 					d := make(chan struct{})
 					var once sync.Once
-					handles[i] = &windivert.Handle{RecvFunc: func([]byte) (int, windivert.Address, error) {
+					recv := func([]byte) (int, windivert.Address, error) {
 						if kind == "receive" && i == lane {
 							return -1, windivert.Address{}, failure
 						}
 						<-s
 						return 0, windivert.Address{}, windivert.ReplayDrained
+					}
+					handles[i] = &windivert.Handle{RecvFunc: recv, RecvBatchFunc: func(p []byte) (int, []windivert.Address, error) {
+						n, address, recvErr := recv(p)
+						if recvErr != nil {
+							return 0, nil, recvErr
+						}
+						return n, []windivert.Address{address}, nil
 					}, SendFunc: func([]byte, *windivert.Address) (int, error) { panic("unexpected send") }, ShutdownFunc: func() error {
 						stops[i].Add(1)
 						once.Do(func() { close(s) })
@@ -549,6 +557,12 @@ func TestWindowsReceivePartialOpenDrainsOpenedHandles(t *testing.T) {
 				stop, done := make(chan struct{}), make(chan struct{})
 				var once sync.Once
 				first := true
+				batchFirst := true
+				// The inbound lane receives a framed IPv4 packet; a bare
+				// one-byte prefix is not an IP batch any more.
+				ipv4 := make([]byte, 20)
+				ipv4[0] = 0x45
+				binary.BigEndian.PutUint16(ipv4[2:4], uint16(len(ipv4)))
 				return &windivert.Handle{RecvFunc: func(p []byte) (int, windivert.Address, error) {
 					if first {
 						first = false
@@ -558,7 +572,22 @@ func TestWindowsReceivePartialOpenDrainsOpenedHandles(t *testing.T) {
 					}
 					<-stop
 					return 0, windivert.Address{}, windivert.ReplayDrained
-				}, SendFunc: func(p []byte, _ *windivert.Address) (int, error) { sent.Add(1); return len(p), nil }, ShutdownFunc: func() error { stopped.Add(1); once.Do(func() { close(stop) }); return nil }, CloseFunc: func() error { closed.Add(1); close(done); return nil }, DoneChan: done}, nil
+				}, RecvBatchFunc: func(p []byte) (int, []windivert.Address, error) {
+					if batchFirst {
+						batchFirst = false
+						received.Add(1)
+						copy(p, ipv4)
+						return len(ipv4), []windivert.Address{{}}, nil
+					}
+					<-stop
+					return 0, nil, windivert.ReplayDrained
+				}, SendFunc: func(p []byte, _ *windivert.Address) (int, error) {
+					sent.Add(1)
+					return len(p), nil
+				}, SendBatchFunc: func(p []byte, _ []windivert.Address) (int, error) {
+					sent.Add(1)
+					return len(p), nil
+				}, ShutdownFunc: func() error { stopped.Add(1); once.Do(func() { close(stop) }); return nil }, CloseFunc: func() error { closed.Add(1); close(done); return nil }, DoneChan: done}, nil
 			}
 			defer func() { windivert.ReplayOpen = nil }()
 			e, err := NewEngine(cfg, NewWindowsReplayBackend())

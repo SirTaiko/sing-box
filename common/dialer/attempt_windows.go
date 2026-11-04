@@ -6,9 +6,10 @@ import (
 	"context"
 	"errors"
 	"net"
-	"os"
+	"runtime"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -81,8 +82,8 @@ type nativeHoldLease interface {
 // non-inheritable overlapped socket, apply the TFO socket option for a
 // non-empty initial buffer, run the existing controls, bind the exclusive
 // local port once, register capture, perform a cancellable ConnectEx with the
-// selected initial data, then adopt the connected socket through the public
-// net.FileConn path.
+// selected initial data, then consume the connected socket into the standard
+// library's netFD/TCPConn through the direct-owned adoption bridge.
 //
 // The caller's completion wait is bounded by the earliest of the attempt
 // context deadline, the caller deadline and the dialer connect timeout. A
@@ -280,9 +281,6 @@ func dialConnectEx(ctx context.Context, base net.Dialer, network, address string
 	if err = windows.Setsockopt(handle, windows.SOL_SOCKET, windows.SO_UPDATE_CONNECT_CONTEXT, nil, 0); err != nil {
 		return nil, written, E.Cause(err, "desync: SO_UPDATE_CONNECT_CONTEXT")
 	}
-	if err = waitConnectedContext(handle); err != nil {
-		return nil, written, E.Cause(err, "desync: observe connected socket context")
-	}
 	conn, err = adoptConnectedSocket(handle)
 	if err != nil {
 		return nil, written, E.Cause(err, "desync: adopt connected socket")
@@ -306,44 +304,41 @@ func dialConnectEx(ctx context.Context, base net.Dialer, network, address string
 	// Only the path that actually completed the operation reports the accepted
 	// bytes: a pending ConnectEx reports zero at initiation time, so reusing
 	// that value would replay the whole initial payload on this same socket.
-	if written < len(payload) {
-		rest, writeErr := conn.Write(payload[written:])
-		written += rest
-		if writeErr != nil {
-			conn.Close()
-			return nil, written, writeErr
-		}
+	written, err = writeAdoptedRemainder(conn, payload, written)
+	if err != nil {
+		return nil, written, err
 	}
 	return conn, written, nil
 }
 
-// adoptionFile is the carrier file the single net.FileConn adoption runs on.
-// Production wraps the real socket-aware *os.File; the interface is a narrow
-// seam so the ownership sequence is regression-tested with fake calls, not just
-// by source inspection.
-type adoptionFile interface {
-	adopt() (net.Conn, error)
-	close() error
+// writeAdoptedRemainder writes only the suffix the connect did not accept on
+// the same adopted connection. The actual native accepted count plus the real
+// remainder progress stays authoritative on both success and error. A write
+// error rolls the adopted connection back exactly once through the existing
+// helper, and a bad rollback Close keeps its opaque retirement charge; there is
+// no reconnect and no replay.
+func writeAdoptedRemainder(conn net.Conn, payload []byte, written int) (int, error) {
+	if written >= len(payload) {
+		return written, nil
+	}
+	rest, writeErr := conn.Write(payload[written:])
+	written += rest
+	if writeErr != nil {
+		return written, errors.Join(writeErr, rollbackAdoptedConn(conn))
+	}
+	return written, nil
 }
-
-type osAdoptionFile struct {
-	file *os.File
-}
-
-func (f *osAdoptionFile) adopt() (net.Conn, error) { return net.FileConn(f.file) }
-
-func (f *osAdoptionFile) close() error { return f.file.Close() }
 
 var (
-	// duplicateForAdoption creates the carrier duplicate through the public
+	// duplicateForAdoption creates the readiness carrier through the public
 	// Winsock duplication API.
 	duplicateForAdoption = duplicateConnectedSocket
-	// newAdoptionFile wraps one carrier handle in the socket-aware File the
-	// single adoption needs. os.NewFile is not usable here: its Close and its
-	// finalizer call CloseHandle, which is not a valid disposal API for a
-	// Winsock descriptor. The constructor is the version-qualified one from
-	// attempt_windows_adoption_ctor.go.
-	newAdoptionFile = newSocketAdoptionFile
+	// adoptOwnedCarrier is the direct-owned adoption bridge of
+	// attempt_windows_adoption_ctor.go. It consumes a valid readiness-verified
+	// carrier on entry, on success and on error, and returns the genuine
+	// *net.TCPConn the standard library built around the same descriptor. The
+	// caller never closes the carrier after this call.
+	adoptOwnedCarrier = newOwnedSocketConn
 	// closeCarrierSocket is the only socket disposal used for the carrier and
 	// readiness-probe descriptors, whose socket-aware File was already closed
 	// or was never constructed. It is a seam so the close-error contract is
@@ -351,10 +346,16 @@ var (
 	closeCarrierSocket = func(handle windows.Handle) error { return windows.Closesocket(handle) }
 	// closeOriginalSocket is the single disposal API of the original native
 	// socket. It is a seam so the original-retirement contract is exercised
-	// with fake handles; the original is never wrapped in an os.File.
+	// with fake handles; the original is never handed to the adoption bridge.
 	closeOriginalSocket = func(handle windows.Handle) error { return windows.Closesocket(handle) }
-	// duplicateProbe creates one bounded readiness observation duplicate.
-	duplicateProbe = duplicateConnectedSocket
+	// adoptNow and adoptSleep are the clock and pause of the bounded adoption
+	// carrier acquisition. They exist so the fake-API tests can place a
+	// carrier entry or a ready carrier on either side of the shared budget
+	// deterministically, instead of depending on real scheduler delay; they
+	// are not a general timer abstraction. Production uses the standard
+	// functions.
+	adoptNow   = time.Now
+	adoptSleep = time.Sleep
 )
 
 const (
@@ -388,6 +389,50 @@ func (e *unresolvedSocketRetirement) Error() string {
 }
 
 func (e *unresolvedSocketRetirement) Unwrap() error { return e.err }
+
+// Opaque adoption-retirement stages. Each stage names a descriptor boundary
+// whose descriptor existed but whose numeric identity is not available to this
+// package, so its charge is recorded without inventing a handle.
+const (
+	adoptionRetirementStageAdoptedRollback = "adopted-connection-rollback"
+)
+
+// opaqueUnprovenAdoptionRetirement reports a descriptor of the adoption
+// boundary whose release is not proven while its numeric identity is not
+// exposed to this package: an adopted connection whose one-shot rollback Close
+// did not report success. The error deliberately has no handle field: putting
+// the original, the carrier or zero there would present a foreign or invented
+// identity as if it were that descriptor, and a numeric close of an unproven
+// handle is exactly what this accounting must not do. The marker is a
+// conservative charge only; it never retries a Close, keeps the attempt's
+// existing native hold/tombstone, and its cause stays inspectable through
+// Unwrap.
+type opaqueUnprovenAdoptionRetirement struct {
+	stage string
+	cause error
+}
+
+func (e *opaqueUnprovenAdoptionRetirement) Error() string {
+	return E.New("desync: unproven adoption retirement at ", e.stage, ": ", e.cause).Error()
+}
+
+func (e *opaqueUnprovenAdoptionRetirement) Unwrap() error { return e.cause }
+
+// rollbackAdoptedConn closes one adopted connection exactly once. The caller
+// must not close it again afterwards. A nil connection had nothing to roll
+// back, and a nil Close result proves this boundary release. A nonnil Close
+// result becomes the opaque unproven-adoption-retirement marker of the rollback
+// stage: a failed Close is not proof that the adopted descriptor was released,
+// and no numeric handle may be substituted for it.
+func rollbackAdoptedConn(conn net.Conn) error {
+	if conn == nil {
+		return nil
+	}
+	if closeErr := conn.Close(); closeErr != nil {
+		return &opaqueUnprovenAdoptionRetirement{stage: adoptionRetirementStageAdoptedRollback, cause: closeErr}
+	}
+	return nil
+}
 
 // retireSocketDescriptor closes one socket descriptor that no socket-aware File
 // owns any more and applies the documented close-error contract to it: only
@@ -448,12 +493,15 @@ func retireOriginalSocketOutcome(handle windows.Handle) (bool, error) {
 // socket. The deferred call site records the attempt outcome, retires the
 // descriptor exactly once through its selected socket API, and then:
 //
-//   - rolls back an already adopted connection when retirement fails, so a
-//     connection is never published while its original socket is unretired;
-//   - keeps the attempt's admission charge when the release is unproven, so a
+//   - rolls back an already adopted connection when retirement is not clean, so
+//     a connection is never published while its original socket is unretired;
+//   - charges a failed adopted rollback through the same opaque marker as the
+//     adoption boundary, because its release is not proven;
+//   - keeps the attempt's admission charge when any release is unproven, so a
 //     possibly valid descriptor can never look like a released, charge-free
 //     attempt that a new native operation may replace;
-//   - keeps both the attempt error and the retirement error visible.
+//   - keeps the attempt error, the original-retirement error and the rollback
+//     error visible before the hold classification.
 type attemptRetirement struct {
 	handle    windows.Handle
 	conn      net.Conn
@@ -463,101 +511,189 @@ type attemptRetirement struct {
 
 func (r *attemptRetirement) retire() {
 	retireErr := retireOriginalSocket(r.handle)
-	// A proven release of the original descriptor is not proof that the whole
-	// attempt retired: a readiness probe, an adoption carrier or a failed
-	// duplicate of this same attempt may still be unresolved in the attempt
-	// error. Every application-visible O/P/C obligation must be proven before
-	// this attempt discharges its admission charge, so an unresolved temporary
-	// descriptor keeps the charge exactly like an unproven original release and
-	// the adopted connection is rolled back instead of being published.
-	attemptUnresolved := hasUnresolvedRetirement(r.err)
-	if retireErr == nil && !attemptUnresolved {
+	// The early return is allowed only when the original descriptor was proven
+	// released and the attempt carries no existing obligation. Every other
+	// outcome takes the rollback path so nothing is discharged on an unproven
+	// boundary.
+	if retireErr == nil && !hasUnresolvedRetirement(r.err) {
 		return
 	}
+	// A proven release of the original descriptor is not proof that the whole
+	// attempt retired: a readiness probe, an adoption carrier, a failed
+	// duplicate or an internal FileConn duplicate of this same attempt may
+	// still be unresolved in the attempt error. The adopted connection is
+	// rolled back through the one-shot helper and its result is joined into
+	// the attempt error before the charge is classified, so an unproven
+	// rollback can never be dropped or discharged.
+	var rollbackErr error
 	if r.conn != nil {
-		_ = r.conn.Close()
+		rollbackErr = rollbackAdoptedConn(r.conn)
 		r.conn = nil
 	}
-	var unresolved *unresolvedSocketRetirement
-	if attemptUnresolved || (retireErr != nil && errors.As(retireErr, &unresolved)) {
-		// The descriptor may still be valid and is not closed again: the
-		// attempt keeps the charge instead of pretending it was released.
+	// The prior attempt error is joined as the original object, not flattened:
+	// the attempt aggregate and every leaf cause keep their identity for
+	// errors.Is/errors.As, so the retirement decision and the caller observe
+	// the exact obligation this attempt recorded. E.Errors would rebuild the
+	// aggregate wrapper and drop the unresolved marker object even when no
+	// rollback error was added. The retirement and rollback diagnostics stay
+	// in the same chain.
+	r.err = errors.Join(r.err, retireErr, rollbackErr)
+	if hasUnresolvedRetirement(r.err) {
+		// A descriptor may still be valid and is not closed again: the attempt
+		// keeps the charge instead of pretending it was released.
 		r.holdOwned = false
-	}
-	if retireErr != nil {
-		r.err = E.Errors(r.err, retireErr)
 	}
 }
 
-// hasUnresolvedRetirement reports whether err carries an unproven socket
-// retirement of one attempt. The retirement decision needs the same
-// classification the deferred original-socket path uses, so a temporary
-// descriptor of this attempt is never mistaken for a proven release.
+// hasUnresolvedRetirement reports whether err carries an unproven descriptor
+// release of one attempt: a socket descriptor with a known handle, or an
+// opaque adoption-boundary descriptor with no known handle. The retirement
+// decision needs the same classification the deferred original-socket path
+// uses, so a temporary descriptor of this attempt is never mistaken for a
+// proven release.
 func hasUnresolvedRetirement(err error) bool {
+	if err == nil {
+		return false
+	}
 	var unresolved *unresolvedSocketRetirement
-	return err != nil && errors.As(err, &unresolved)
+	if errors.As(err, &unresolved) {
+		return true
+	}
+	var opaque *opaqueUnprovenAdoptionRetirement
+	return errors.As(err, &opaque)
 }
 
 // adoptConnectedSocket hands a connected Winsock socket to the net package
-// exactly once and returns the adopted connection.
+// through the direct-owned adoption bridge and returns the genuine TCP
+// connection the standard library built around a readiness-verified carrier.
 //
-// net.FileConn needs an *os.File and duplicates the socket it is given; the
-// returned connection owns that duplicate and releases it through the net
-// package's socket-aware close (closesocket). The *os.File is only a carrier:
-// it must wrap a dedicated duplicate of the connected socket, never the
-// original handle, and it must be constructed by the socket-aware constructor so
-// that both File.Close and the File finalizer call closesocket instead of
-// CloseHandle. The carrier is retired deterministically before this function
-// returns; the caller keeps sole ownership of the original and releases it with
-// windows.Closesocket.
+// The carrier is acquired only after its own duplicated context reports both
+// addresses, so the descriptor that was observed is the descriptor that is
+// adopted. The carrier is consumed by the bridge: on success the standard
+// netFD/TCPConn owns it, and on failure the bridge has already retired the raw
+// descriptor or the unpublished netFD exactly once. The caller keeps sole
+// ownership of the original socket and releases it with the existing original
+// retirement contract.
 //
-// Retirement failures are not hidden. A carrier that cannot be retired prevents
-// publication of the adopted connection (which is rolled back) and is reported
-// together with any adoption or rollback error.
+// Retirement failures are not hidden. Every raw-carrier close and every
+// unpublished FD.Close result becomes visible in the returned error, and an
+// unproven release keeps the attempt's admission charge. No failure is retried.
 func adoptConnectedSocket(handle windows.Handle) (net.Conn, error) {
-	carrier, err := duplicateForAdoption(handle)
+	deadline := adoptNow().Add(adoptContextBudget)
+	return adoptConnectedSocketOnce(handle, deadline)
+}
+
+// adoptConnectedSocketOnce performs the single adoption attempt: one
+// readiness-verified carrier, one consume-on-entry bridge call and the
+// deterministic ownership transfer or cleanup of that descriptor. Every
+// outcome is final for the attempt.
+func adoptConnectedSocketOnce(handle windows.Handle, deadline time.Time) (net.Conn, error) {
+	carrier, err := acquireConnectedCarrier(handle, deadline)
 	if err != nil {
 		return nil, err
 	}
-	file, err := newAdoptionFile(carrier)
+	// A valid acquired carrier is consumed on entry, on success and on error.
+	// The bridge is the only caller-side owner from this point on.
+	return adoptOwnedCarrier(carrier, deadline)
+}
+
+// socketAdoptionAPI is the six-function boundary of the direct adoption
+// bridge. Production binds exactly the five qualified net symbols plus the
+// carrier address observation; the inert tests script the same routine with
+// allocated Go tokens and net.Pipe connections instead of overlaying stdlib.
+type socketAdoptionAPI struct {
+	addresses func(windows.Handle) (int, *net.TCPAddr, *net.TCPAddr, error)
+	newFD     func(syscall.Handle, int, int, string) (unsafe.Pointer, error)
+	initFD    func(unsafe.Pointer) error
+	setAddr   func(unsafe.Pointer, net.Addr, net.Addr)
+	tcpConn   func(unsafe.Pointer) net.Conn
+	closeFD   func(unsafe.Pointer) error
+}
+
+// bridgeOwnedCarrier consumes one valid readiness-verified carrier and builds
+// the standard-library connection around that same descriptor. Ownership moves
+// raw carrier -> netFD, at net.newFD's nonnil descriptor, and then FD ->
+// TCPConn, at net.newTCPConn. Exactly one owner closes the descriptor on each
+// path:
+//
+//   - address/deadline/newFD failure before an FD exists: one raw carrier
+//     close through the documented retirement helper;
+//   - init (or defensive newFD) failure with an FD: one FD.Close, never a raw
+//     close afterwards;
+//   - late success: one rollback Close of the connection;
+//   - timely success: no carrier close, the TCPConn owns it.
+//
+// The FD pointer is never dereferenced, never converted through uintptr and is
+// kept visible to the garbage collector until the last internal call.
+func bridgeOwnedCarrier(api socketAdoptionAPI, carrier windows.Handle, deadline time.Time) (net.Conn, error) {
+	if carrier == 0 || carrier == windows.InvalidHandle {
+		// Invalid sentinels are rejected without a close: no descriptor was
+		// ever transferred to this boundary.
+		return nil, E.New("desync: adoption carrier handle is invalid")
+	}
+	family, local, remote, err := api.addresses(carrier)
 	if err != nil {
-		// No wrapper was created, so this helper is still the carrier's only
-		// owner: it is retired here and never handed to a constructor that
-		// rejects it.
-		constructErr := E.Cause(err, "desync: construct adoption carrier file")
-		if closeErr := closeCarrierSocket(carrier); closeErr != nil {
-			return nil, E.Errors(constructErr, &unresolvedSocketRetirement{handle: carrier, err: closeErr})
-		}
-		return nil, constructErr
+		return nil, retireFailedDuplicate(carrier, err)
 	}
-	conn, adoptErr := file.adopt()
-	closeErr := file.close()
-	var retireErr error
-	if closeErr != nil {
-		// A deterministic Close invalidates the socket-aware File even when it
-		// reports an error: its poll descriptor is invalidated and its
-		// finalizer is cleared, so this helper is the remaining cleanup owner.
-		// The error is never dropped, not even when the documented
-		// WSAEWOULDBLOCK retry below releases the descriptor: the adoption is
-		// not published as a clean one after a close failure.
-		retireErr = E.Cause(closeErr, "desync: retire adoption carrier")
-		if residual := retireSocketDescriptor(carrier, closeErr, closeCarrierSocket); residual != nil {
-			retireErr = E.Errors(retireErr, residual)
-		}
+	// Entry admission of the FD construction group: an expired shared budget
+	// closes the raw carrier and never enters init.
+	if !adoptNow().Before(deadline) {
+		return nil, retireFailedDuplicate(carrier, adoptionBudgetError(nil))
 	}
-	if adoptErr != nil {
-		// The duplication failed and retirement of the carrier may have failed
-		// as well: both errors stay visible.
-		return nil, E.Errors(adoptErr, retireErr)
-	}
-	if retireErr != nil {
-		var rollbackErr error
-		if conn != nil {
-			rollbackErr = conn.Close()
+	fd, newFDErr := api.newFD(syscall.Handle(carrier), family, syscall.SOCK_STREAM, "tcp")
+	if fd == nil {
+		// The pinned body always returns a nonnil FD; a defensive nil leaves
+		// the raw carrier with this bridge as its only owner.
+		cause := E.New("desync: allocate adopted socket")
+		if newFDErr != nil {
+			cause = E.Cause(newFDErr, "desync: allocate adopted socket")
 		}
-		return nil, E.Errors(retireErr, rollbackErr)
+		return nil, retireFailedDuplicate(carrier, cause)
+	}
+	// The nonnil FD owns the carrier from here on, even if newFD also reported
+	// an error. Only the FD may be closed; the raw carrier must not be.
+	if newFDErr != nil {
+		closeErr := api.closeFD(fd)
+		runtime.KeepAlive(fd)
+		return nil, errors.Join(E.Cause(newFDErr, "desync: allocate adopted socket"), adoptedFDCloseFailure(carrier, closeErr))
+	}
+	if err := api.initFD(fd); err != nil {
+		// Init failure: exactly one FD.Close and no raw numeric retry
+		// afterwards. A nil close result proves this unpublished FD boundary;
+		// a nonnil one becomes the known-carrier unresolved obligation.
+		closeErr := api.closeFD(fd)
+		runtime.KeepAlive(fd)
+		return nil, errors.Join(E.Cause(err, "desync: init adopted socket"), adoptedFDCloseFailure(carrier, closeErr))
+	}
+	api.setAddr(fd, local, remote)
+	conn := api.tcpConn(fd)
+	runtime.KeepAlive(fd)
+	// A success observed after the shared budget is rolled back and never
+	// published: the TCPConn now owns the carrier, so this one Close is the
+	// only carrier cleanup.
+	if !adoptNow().Before(deadline) {
+		return nil, errors.Join(adoptionLateError(), rollbackAdoptedConn(conn))
 	}
 	return conn, nil
+}
+
+// adoptedFDCloseFailure classifies the Close result of an unpublished netFD.
+// A nil result proves the boundary release. A nonnil result becomes the
+// existing known-handle unresolved obligation for the carrier, because the
+// failed FD.Close is not proof that the descriptor was released. The descriptor
+// is never closed again through its numeric handle.
+func adoptedFDCloseFailure(carrier windows.Handle, closeErr error) error {
+	if closeErr == nil {
+		return nil
+	}
+	return &unresolvedSocketRetirement{handle: carrier, err: closeErr}
+}
+
+// adoptionLateError reports an adoption success that completed only after the
+// shared admission budget expired. The adopted descriptor is rolled back by the
+// bridge and is never published.
+func adoptionLateError() error {
+	return E.New("desync: adoption completed after the adoption budget expired")
 }
 
 // newOutstandingConnect builds the terminal-completion owner of one ConnectEx
@@ -639,81 +775,94 @@ func connectDeadline(ctx context.Context, base net.Dialer) time.Time {
 }
 
 const (
-	// adoptContextBudget bounds how long the connected context of a just
-	// completed ConnectEx socket may take to become visible to a duplicate.
+	// adoptContextBudget bounds how long the adoption carrier may take to expose
+	// the connected context (local and peer address) of a just completed
+	// ConnectEx socket. The same absolute budget admits the carrier
+	// acquisition, the single adoption entry and the acceptance of an adoption
+	// success, so neither a duplicate nor a late FileConn can extend the
+	// attempt.
 	adoptContextBudget = 20 * time.Millisecond
-	// adoptContextPause is the pause between two context observations. It is
-	// not a delay before adoption: every iteration observes the actual socket
-	// state and adoption is attempted as soon as it is observable.
+	// adoptContextPause is the pause between two carrier observations. It is
+	// not a delay before adoption: every iteration observes the actual carrier
+	// context and the sequence ends as soon as a carrier exposes it.
 	adoptContextPause = 200 * time.Microsecond
 )
 
-// waitConnectedContext observes the socket until a duplicate of it exposes the
-// connected context (local and remote address). It is a no-op when the context
-// is already visible.
+// acquireConnectedCarrier creates the adoption carrier and returns it only when
+// the carrier itself exposes both the local and the peer address of the
+// connected socket, all under the caller's absolute adoption deadline.
 //
-// Native evidence (Windows Server 2022, first adoption in a fresh process): a
-// WSADuplicateSocket + WSASocket duplicate created immediately after a
-// completed overlapped ConnectEx can still be unconnected — Getsockname returns
-// WSAEINVAL and Getpeername returns WSAENOTCONN — even though the original
-// socket already reports both addresses and SO_UPDATE_CONNECT_CONTEXT was set.
-// Go's net.FileConn duplicates the handle internally and derives the address
-// family from syscall.Getsockname of that duplicate, discarding the error, so
-// this transient state surfaces as EPROTONOSUPPORT ("protocol not supported")
-// although the connect succeeded. The window closes within microseconds; this
-// helper waits for the observable precondition instead of guessing a delay. It
-// never re-issues the connect, never resends payload bytes and never adopts
-// twice: net.FileConn below stays the single adoption, and its result (success
-// or error) is authoritative.
+// The carrier is the readiness boundary: the descriptor whose own context is
+// verified is the descriptor the adoption consumes, so a readiness observation
+// can never be separated from the carrier that is adopted. Native evidence
+// (Windows Server 2022): a duplicate created after a completed overlapped
+// ConnectEx can still be unconnected while the original already reports both
+// addresses and SO_UPDATE_CONNECT_CONTEXT was set, and such a duplicate can stay
+// unconnected for its whole life (Getsockname returns WSAEINVAL, Getpeername
+// returns WSAENOTCONN). A carrier born in that state is retired exactly once
+// through the socket API and replaced inside the same bounded budget; an
+// unverified carrier is never handed to the adoption bridge, and budget
+// exhaustion is reported instead of continuing to adoption.
 //
-// A probe whose retirement cannot be proven ends the sequence with an error: a
-// failed closesocket must not be hidden by starting another probe, and no
-// carrier may be created while an earlier probe descriptor is unresolved.
-func waitConnectedContext(handle windows.Handle) error {
-	deadline := time.Now().Add(adoptContextBudget)
+// A carrier whose retirement cannot be proven stops the sequence immediately: no
+// second carrier may be created while the earlier descriptor is unresolved, and
+// the token keeps the attempt's admission charge. A duplication failure that is
+// not an address observation acquired no descriptor, so it ends the attempt with
+// its cause and nothing is closed for it.
+func acquireConnectedCarrier(handle windows.Handle, deadline time.Time) (windows.Handle, error) {
+	var lastErr error
 	for {
-		ready, err := probeConnectedContext(handle)
-		if err != nil {
-			var unresolved *unresolvedSocketRetirement
-			if errors.As(err, &unresolved) {
-				return err
+		// Admission of the acquisition entry, including every replacement:
+		// once the shared budget is spent, no further native descriptor is
+		// created for this attempt.
+		if !adoptNow().Before(deadline) {
+			return 0, adoptionBudgetError(lastErr)
+		}
+		carrier, err := duplicateForAdoption(handle)
+		if err == nil {
+			// Success is admitted under the same deadline. A carrier that
+			// becomes ready only after the budget is retired exactly once
+			// through the carrier close contract and is never handed to
+			// the adoption bridge, so no adoption can outlive the attempt
+			// budget.
+			if !adoptNow().Before(deadline) {
+				return 0, retireFailedDuplicate(carrier, adoptionBudgetError(lastErr))
 			}
-			// The connected context was not observable yet: the duplicate was
-			// retired and this is the bounded precondition wait, not an
-			// adoption result.
-		} else if ready {
-			return nil
+			return carrier, nil
 		}
-		if time.Now().After(deadline) {
-			return nil
+		var unresolved *unresolvedSocketRetirement
+		if errors.As(err, &unresolved) {
+			return 0, err
 		}
-		time.Sleep(adoptContextPause)
+		var notVisible *connectedContextNotVisible
+		if !errors.As(err, &notVisible) {
+			return 0, err
+		}
+		lastErr = err
+		if !adoptNow().Before(deadline) {
+			return 0, adoptionBudgetError(lastErr)
+		}
+		adoptSleep(adoptContextPause)
 	}
 }
 
-// probeConnectedContext observes one readiness duplicate and retires it with
-// the only valid socket API. Readiness is an observation, not an adoption
-// guarantee: the single net.FileConn result stays authoritative. A probe whose
-// retirement is not proven stays an unresolved descriptor of this attempt; it
-// is never hidden by starting another probe.
-func probeConnectedContext(handle windows.Handle) (bool, error) {
-	probe, err := duplicateProbe(handle)
-	if err != nil {
-		return false, err
+// adoptionBudgetError is the single expiry error of the shared carrier budget.
+// It keeps the last connected-context observation as its cause when one was
+// made, so the exact Winsock observation is not replaced by the budget
+// message.
+func adoptionBudgetError(lastErr error) error {
+	const message = "desync: connected socket context not observable within the adoption budget"
+	if lastErr != nil {
+		return E.Cause(lastErr, message)
 	}
-	if closeErr := closeCarrierSocket(probe); closeErr != nil {
-		cause := E.Cause(closeErr, "desync: retire readiness probe")
-		if residual := retireSocketDescriptor(probe, closeErr, closeCarrierSocket); residual != nil {
-			return false, E.Errors(cause, residual)
-		}
-		return false, cause
-	}
-	return true, nil
+	return E.New(message)
 }
 
-// retireFailedDuplicate retires a duplicate that failed address validation. A
-// failed retirement is reported instead of being hidden, so the caller cannot
-// continue as if the descriptor had been released.
+// retireFailedDuplicate retires a duplicated carrier that must not be adopted:
+// one that failed address validation, or a carrier that became ready only after
+// the shared acquisition budget expired. A failed retirement is reported
+// instead of being hidden, so the caller cannot continue as if the descriptor
+// had been released.
 func retireFailedDuplicate(handle windows.Handle, cause error) error {
 	if closeErr := closeCarrierSocket(handle); closeErr != nil {
 		return E.Errors(cause, &unresolvedSocketRetirement{handle: handle, err: closeErr})
@@ -721,9 +870,26 @@ func retireFailedDuplicate(handle windows.Handle, cause error) error {
 	return cause
 }
 
+// connectedContextNotVisible reports that a freshly duplicated socket does not
+// expose the connected context yet: the descriptor exists, its retirement is
+// accounted for by the caller, and the socket itself is connected. It is the
+// only duplication outcome that the bounded acquisition may replace, because a
+// duplicate born in this state can stay unconnected for its whole life. The
+// message is the underlying address observation, so the diagnostic keeps the
+// exact Winsock cause.
+type connectedContextNotVisible struct {
+	cause error
+}
+
+func (e *connectedContextNotVisible) Error() string { return e.cause.Error() }
+
+func (e *connectedContextNotVisible) Unwrap() error { return e.cause }
+
 // duplicateConnectedSocket duplicates one socket and requires the duplicate to
 // expose both a local and a remote address. The returned handle is owned by the
-// caller and closed exactly once.
+// caller and closed exactly once. A duplicate whose own context is not visible
+// is retired before this function returns and is reported as
+// connectedContextNotVisible; every other failure is final for the attempt.
 func duplicateConnectedSocket(handle windows.Handle) (windows.Handle, error) {
 	var info windows.WSAProtocolInfo
 	if err := windows.WSADuplicateSocket(handle, windows.GetCurrentProcessId(), &info); err != nil {
@@ -734,10 +900,10 @@ func duplicateConnectedSocket(handle windows.Handle) (windows.Handle, error) {
 		return 0, E.Cause(err, "desync: duplicate connected socket handle")
 	}
 	if _, err = windows.Getsockname(duplicate); err != nil {
-		return 0, retireFailedDuplicate(duplicate, E.Cause(err, "desync: duplicated socket has no local address"))
+		return 0, retireFailedDuplicate(duplicate, &connectedContextNotVisible{cause: E.Cause(err, "desync: duplicated socket has no local address")})
 	}
 	if _, err = windows.Getpeername(duplicate); err != nil {
-		return 0, retireFailedDuplicate(duplicate, E.Cause(err, "desync: duplicated socket has no peer address"))
+		return 0, retireFailedDuplicate(duplicate, &connectedContextNotVisible{cause: E.Cause(err, "desync: duplicated socket has no peer address")})
 	}
 	return duplicate, nil
 }

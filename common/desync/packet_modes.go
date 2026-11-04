@@ -56,6 +56,37 @@ func parseTCPOptions(p *Packet) {
 	}
 }
 
+// templateTimestampEcho returns the TSecr word of the template's TCP timestamp
+// option. parseTCPOptions records TSVal as a fact; the pinned generator copies
+// the complete eight-byte timestamp block from the captured packet
+// (darkmagic.c:170-176) and forges only TSval, so the echo word must come from
+// the same option bytes this builder copies.
+func templateTimestampEcho(template *Packet) uint32 {
+	options := template.TCPOptions
+	for index := 0; index < len(options); {
+		kind := options[index]
+		if kind == 0 {
+			return 0
+		}
+		if kind == 1 {
+			index++
+			continue
+		}
+		if index+1 >= len(options) {
+			return 0
+		}
+		length := int(options[index+1])
+		if length < 2 || index+length > len(options) {
+			return 0
+		}
+		if kind == 8 && length == 10 {
+			return binary.BigEndian.Uint32(options[index+6:])
+		}
+		index += length
+	}
+	return 0
+}
+
 // BuildSpec is the complete parameter set of one generated TCP segment. It is
 // a direct expression of the upstream `prepare_tcp_segment` arguments plus the
 // IPv6 extension-header selector of `prepare_tcp_segment6`.
@@ -206,7 +237,10 @@ func BuildTCPEx(template *Packet, spec BuildSpec) ([]byte, error) {
 		if template.HasTimestamp {
 			out[cursor], out[cursor+1] = 8, 10
 			binary.BigEndian.PutUint32(out[cursor+2:], template.TSVal)
-			binary.BigEndian.PutUint32(out[cursor+6:], 0)
+			// Upstream copies the template's whole timestamp value and forges
+			// only TSval when fooling=ts (darkmagic.c:170-176), so the echoed
+			// TSecr word must survive the copy.
+			binary.BigEndian.PutUint32(out[cursor+6:], templateTimestampEcho(template))
 			if spec.Fooling.Timestamp {
 				binary.BigEndian.PutUint32(out[cursor+2:], template.TSVal+uint32(spec.TSIncrement))
 			}

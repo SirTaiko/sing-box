@@ -10,13 +10,15 @@ import (
 // header modes are final and drop the original only when no valid second stage
 // follows). origExt carries the fooling_orig extension chain that a following
 // second stage must propagate to every real segment.
-func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, random RandSource) (bool, []uint8, error) {
+func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, random RandSource, allocator *IPAllocator) (bool, []uint8, error) {
 	_, first, second := stageMethods(rule.Methods)
 	if first == nil {
 		return false, nil, nil
 	}
 	mods := rule.Mods.orDefault()
-	allocator := newIPAllocator(rule, packet, random)
+	if allocator == nil {
+		allocator = newIPAllocator(rule, packet, random)
+	}
 	ttl := mods.TTLFor(packet.Family, packet.TTL, facts.HopCount, facts.HaveHop)
 	switch first.Kind {
 	case MethodFake, MethodFakeKnown:
@@ -35,9 +37,11 @@ func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, rando
 		sent := 0
 		// Upstream DESYNC_FAKE transmits every fake at the captured packet's
 		// sequence (nfq/desync.c:1972 sequence0 = ntohl(dis->tcp->th_seq)) and
-		// repeats that exact packet (nfq/desync.c:2002 rawsend_rep). Only
-		// tcp_mod.seq advances the base, once per fake payload item, after all
-		// of that item's repeats (nfq/desync.c:2008).
+		// repeats that exact packet (nfq/desync.c:2002 rawsend_rep), so one
+		// fake payload item is built once and its repeats reuse the bytes and
+		// IP ID. Only tcp_mod.seq advances the base and the IPv4 ID cursor,
+		// once per fake payload item, after all of that item's repeats
+		// (nfq/desync.c:2007-2008).
 		sequence := packet.TCPSeq
 		for _, payload := range fake.Payloads {
 			if payload.Protocol != protocol {
@@ -50,26 +54,24 @@ func planFirstStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, rando
 					data = modified
 				}
 			}
-			for repeat := 0; repeat < fake.Repeats; repeat++ {
-				id, _ := allocator.Value()
-				flags := mods.RewriteFlags(packet.TCPFlags)
-				spec := BuildSpec{
-					Seq: &sequence, Flags: &flags, TTL: ttlValue(fake, packet, facts), TTLSet: true,
-					IPID: id, IPIDSet: true, CopyOptions: true, Rand: random,
-					TSIncrement: fake.TSIncrement, Fooling: mergeFooling(fake.Fooling, mods.Fooling),
-					BadSeq: mods.BadSeqIncrement, BadAck: mods.BadAckIncrement,
-					CorruptSum: fake.Fooling.BadChecksum || mods.Fooling.BadChecksum,
-					Payload:    data, ExtHeaders: foolingExtHeaders(packet.Family, mergeFooling(fake.Fooling, mods.Fooling)),
-				}
-				generated, err := BuildTCPEx(packet, spec)
-				if err != nil {
-					return false, nil, err
-				}
-				for copyIndex := 0; copyIndex < mods.Repeats; copyIndex++ {
-					batch.Packets = append(batch.Packets, generated)
-				}
-				sent++
+			id, _ := allocator.Value()
+			flags := mods.RewriteFlags(packet.TCPFlags)
+			spec := BuildSpec{
+				Seq: &sequence, Flags: &flags, TTL: ttlValue(fake, packet, facts), TTLSet: true,
+				IPID: id, IPIDSet: true, CopyOptions: true, Rand: random,
+				TSIncrement: fake.TSIncrement, Fooling: mergeFooling(fake.Fooling, mods.Fooling),
+				BadSeq: mods.BadSeqIncrement, BadAck: mods.BadAckIncrement,
+				CorruptSum: fake.Fooling.BadChecksum || mods.Fooling.BadChecksum,
+				Payload:    data, ExtHeaders: foolingExtHeaders(packet.Family, mergeFooling(fake.Fooling, mods.Fooling)),
 			}
+			generated, err := BuildTCPEx(packet, spec)
+			if err != nil {
+				return false, nil, err
+			}
+			for repeat := 0; repeat < fake.Repeats*mods.Repeats; repeat++ {
+				batch.Packets = append(batch.Packets, generated)
+			}
+			sent++
 			if fake.Seq {
 				sequence += uint32(len(data))
 			}
@@ -197,8 +199,11 @@ func ttlValue(fake *FakeSpec, packet *Packet, facts Facts) uint8 {
 	return packet.TTL
 }
 
-// planSecondStage ports the second-stage switch.
-func planSecondStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, offset int, random RandSource) error {
+// planSecondStage ports the second-stage switch. allocator is the per-captured-
+// packet IPv4 ID cursor the first stage may already have advanced; a nil
+// allocator means the first stage did not run for this packet (message offset
+// beyond the first segment) and the split builders create the cursor lazily.
+func planSecondStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, offset int, random RandSource, allocator *IPAllocator) error {
 	_, _, second := stageMethods(rule.Methods)
 	if second == nil {
 		return nil
@@ -214,14 +219,17 @@ func planSecondStage(rule *Rule, packet *Packet, facts Facts, batch *Batch, offs
 		if spec == nil {
 			return nil
 		}
+		if allocator == nil {
+			allocator = newIPAllocator(rule, packet, random)
+		}
 		var (
 			segments [][]byte
 			err      error
 		)
 		if second.Kind == MethodMultiSplit {
-			segments, err = planMultiSplit(spec, packet, facts, offset, offset+len(packet.Payload))
+			segments, err = planMultiSplit(spec, packet, facts, offset, offset+len(packet.Payload), allocator)
 		} else {
-			segments, err = planMultiDisorder(spec, packet, facts, offset, offset+len(packet.Payload))
+			segments, err = planMultiDisorder(spec, packet, facts, offset, offset+len(packet.Payload), allocator)
 		}
 		if err != nil {
 			return err
@@ -1079,8 +1087,17 @@ func PlanTCP(rule *Rule, packet *Packet, message []byte, offset int, facts Facts
 	if facts.MessageLength == 0 {
 		facts.MessageLength = offset + len(packet.Payload)
 	}
+	// Upstream fixes one IPv4 ID cursor per captured packet before the stage
+	// switch and advances it after every generated packet (desync.c:1429,
+	// :2007, :2301), so the first and second stage share the cursor. The first
+	// stage only runs for the message's first packet; later packets create
+	// their own cursor lazily inside the second stage.
+	var allocator *IPAllocator
 	if offset == 0 {
-		consumed, origExt, err := planFirstStage(rule, working, facts, batch, random)
+		if _, first, _ := stageMethods(rule.Methods); first != nil {
+			allocator = newIPAllocator(rule, working, random)
+		}
+		consumed, origExt, err := planFirstStage(rule, working, facts, batch, random, allocator)
 		if err != nil {
 			return nil, fmt.Errorf("desync: first stage: %w", err)
 		}
@@ -1091,7 +1108,7 @@ func PlanTCP(rule *Rule, packet *Packet, message []byte, offset int, facts Facts
 			facts.OrigExtHeaders = origExt
 		}
 	}
-	if err := planSecondStage(rule, working, facts, batch, offset, random); err != nil {
+	if err := planSecondStage(rule, working, facts, batch, offset, random, allocator); err != nil {
 		return nil, fmt.Errorf("desync: second stage: %w", err)
 	}
 	if err := planDup(rule, packet, working, facts, batch, random); err != nil {

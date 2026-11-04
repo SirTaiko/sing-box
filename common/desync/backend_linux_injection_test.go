@@ -45,6 +45,7 @@ var errInjectionModel = errors.New("injection model operation failure")
 
 func installInjectionModel(t *testing.T, c *linuxCapture, packet []byte) *injectionModel {
 	t.Helper()
+	forkInitModel(t, func() error { return nil })
 	m := &injectionModel{t: t, capture: c, target: c.owner.nsFD, current: make(map[int]int), origins: make(map[int]int), packet: append([]byte(nil), packet...)}
 	parsed, err := ParsePacket(packet)
 	if err != nil {

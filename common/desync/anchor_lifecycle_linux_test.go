@@ -1230,10 +1230,12 @@ func TestAnchorOwnQueueTotalMustBeZero(t *testing.T) {
 		nl:      data,
 		owner:   &anchorOwner{nsFD: 1},
 	}
-	if err := seams.kernel.control(data, capture.queue, nfqCfgCmdBind); err != nil {
+	// Acquire through the production caller so its confirmed-binding ledger
+	// and the model kernel agree; planned queue numbers are not own receipts.
+	if err := capture.bindQueueOn(capture.queue, FamilyIPv4, data); err != nil {
 		t.Fatal(err)
 	}
-	if err := seams.kernel.control(data, capture.inQueue, nfqCfgCmdBind); err != nil {
+	if err := capture.bindQueueOn(capture.inQueue, FamilyIPv4, data); err != nil {
 		t.Fatal(err)
 	}
 	if err := capture.observeOwnQueuesEmpty(); err != nil {
