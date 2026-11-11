@@ -140,6 +140,9 @@ func (e *linuxEngine) Start(ctx context.Context) error {
 	e.options.logger.Debug("zapret[", e.options.tag, "]: nfqws2 argv: ", strings.Join(arguments, " "))
 	e.cmd = exec.Command(e.options.profile.executable, arguments...)
 	e.cmd.Dir = e.options.profile.strategyDir
+	if err = prepareNetworkCommand(e.cmd, true); err != nil {
+		return err
+	}
 	writer := &linuxLineWriter{onLine: e.handleLine}
 	e.cmd.Stdout = writer
 	e.cmd.Stderr = writer

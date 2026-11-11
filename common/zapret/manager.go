@@ -262,7 +262,7 @@ func (m *Manager) fail(err error) {
 	engine := m.engine
 	m.mutex.Unlock()
 
-	m.logger.Error(err)
+	m.logger.Error(fmt.Errorf("zapret[%s]: state=failed: %w", m.tag, err))
 	for _, flow := range flows {
 		closeErr := flow.Close()
 		if closeErr != nil {

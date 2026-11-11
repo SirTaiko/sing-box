@@ -434,6 +434,9 @@ func runNftCommand(ctx context.Context, nftPath string, stdin string, arguments 
 	commandContext, cancel := context.WithTimeout(ctx, nftCommandTimeout)
 	defer cancel()
 	command := exec.CommandContext(commandContext, nftPath, arguments...)
+	if err := prepareNetworkCommand(command, false); err != nil {
+		return nftOutput{}, err
+	}
 	if stdin != "" {
 		command.Stdin = bytes.NewBufferString(stdin)
 	}

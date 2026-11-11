@@ -172,7 +172,7 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 		_, loaded := <-osSignals
 		if loaded {
 			cancel()
-			closeMonitor(startCtx)
+			closeMonitor(startCtx, options)
 		}
 	}()
 	err = instance.Start()
@@ -217,7 +217,7 @@ func run() error {
 			}
 			cancel()
 			closeCtx, closed := context.WithCancel(context.Background())
-			go closeMonitor(closeCtx)
+			go closeMonitor(closeCtx, options)
 			err = instance.Close()
 			closed()
 			if osSignal != syscall.SIGHUP {
@@ -235,8 +235,15 @@ func run() error {
 	}
 }
 
-func closeMonitor(ctx context.Context) {
-	time.Sleep(C.FatalStopTimeout)
+func closeMonitor(ctx context.Context, options option.Options) {
+	timeout := C.FatalStopTimeout
+	for _, outbound := range options.Outbounds {
+		if directOptions, ok := outbound.Options.(*option.DirectOutboundOptions); ok && directOptions.Zapret != nil {
+			// One engine may need two 10s waits and a 15s nft cleanup.
+			timeout += 40 * time.Second
+		}
+	}
+	time.Sleep(timeout)
 	select {
 	case <-ctx.Done():
 		return
