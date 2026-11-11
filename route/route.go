@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,8 +28,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/uot"
-
-	"golang.org/x/exp/slices"
 )
 
 var defaultPacketSniffers = []sniff.PacketSniffer{
@@ -44,12 +43,9 @@ var defaultPacketSniffers = []sniff.PacketSniffer{
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
 	done := make(chan any)
-	err := r.routeConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
+	r.RouteConnectionEx(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
-	if err != nil {
-		return err
-	}
 	select {
 	case <-done:
 	case <-r.ctx.Done():
@@ -109,6 +105,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 	if err != nil {
+		buf.ReleaseMulti(buffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -138,7 +135,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			}
 			return action.Error(ctx)
 		case *R.RuleActionHijackDNS:
-			for _, buffer := range buffers {
+			for _, buffer := range slices.Backward(buffers) {
 				conn = bufio.NewCachedConn(conn, buffer)
 			}
 			N.CloseOnHandshakeFailure(conn, onClose, r.hijackDNSStream(ctx, conn, metadata))
@@ -153,7 +150,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		buf.ReleaseMulti(buffers)
 		return err
 	}
-	for _, buffer := range buffers {
+	for _, buffer := range slices.Backward(buffers) {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
 	if selectedRule != nil {
@@ -215,17 +212,9 @@ func registerInterrupt(chain []adapter.Outbound, closer io.Closer, onClose N.Clo
 
 func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
 	done := make(chan any)
-	err := r.routePacketConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
+	r.RoutePacketConnectionEx(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
-	if err != nil {
-		conn.Close()
-		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
-			r.logger.DebugContext(ctx, "connection closed: ", err)
-		} else {
-			r.logger.ErrorContext(ctx, err)
-		}
-	}
 	select {
 	case <-done:
 	case <-r.ctx.Done():
@@ -277,6 +266,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 	if err != nil {
+		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
@@ -318,7 +308,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
-	for _, buffer := range packetBuffers {
+	for _, buffer := range slices.Backward(packetBuffers) {
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
