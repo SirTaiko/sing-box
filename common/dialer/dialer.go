@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"syscall"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -16,6 +17,21 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
+// SocketOwner is an optional per-outbound owner of the real OS sockets
+// created by this dialer. Sing-box uses it to associate every real socket
+// with the outbound ownership token before bind/connect/send and to close
+// owned flows when the owner stops. It must not be shared between outbounds.
+type SocketOwner interface {
+	// CheckAdmission rejects new sockets unless the owner is fully ready.
+	CheckAdmission() error
+	// Control is invoked before bind/connect on every real socket.
+	Control(network string, address string, conn syscall.RawConn) error
+	// TrackConn registers a created connection for forced close on stop.
+	TrackConn(conn net.Conn) net.Conn
+	// TrackPacketConn registers a created packet connection for forced close on stop.
+	TrackPacketConn(conn net.PacketConn) net.PacketConn
+}
+
 type Options struct {
 	Context                 context.Context
 	Options                 option.DialerOptions
@@ -26,6 +42,7 @@ type Options struct {
 	DisableEmptyDirectCheck bool
 	DirectOutbound          bool
 	DefaultOutbound         bool
+	SocketOwner             SocketOwner
 }
 
 // TODO: merge with NewWithOptions
@@ -57,7 +74,7 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 		}
 		dialer = NewDefaultOutboundDetour(outboundManager)
 	} else {
-		dialer, err = NewDefault(options.Context, dialOptions)
+		dialer, err = NewDefaultWithOwner(options.Context, dialOptions, options.SocketOwner)
 		if err != nil {
 			return nil, err
 		}

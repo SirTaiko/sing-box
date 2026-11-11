@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -45,6 +46,12 @@ type OptionsEntry struct {
 	options option.Options
 }
 
+// configDirectory is the directory of the first loaded configuration file. It
+// is recorded in the context so outbound options with relative file paths
+// resolve them against the configuration instead of the process working
+// directory.
+var configDirectory string
+
 func readConfigAt(path string) (*OptionsEntry, error) {
 	var (
 		configContent []byte
@@ -57,6 +64,12 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	}
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
+	}
+	if configDirectory == "" && path != "stdin" {
+		absolutePath, absoluteErr := filepath.Abs(path)
+		if absoluteErr == nil {
+			configDirectory = filepath.Dir(absolutePath)
+		}
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
@@ -137,7 +150,7 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 		}
 		options.Log.DisableColor = true
 	}
-	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
+	ctx, cancel := context.WithCancel(service.ExtendContext(adapter.ContextWithConfigDirectory(globalCtx, configDirectory)))
 	instance, err := box.New(box.Options{
 		Context:                    ctx,
 		Options:                    options,

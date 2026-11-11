@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/service"
 
@@ -31,7 +32,7 @@ func check() error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
+	ctx, cancel := context.WithCancel(service.ExtendContext(adapter.ContextWithConfigDirectory(globalCtx, configDirectory)))
 	instance, err := box.New(box.Options{
 		Context: ctx,
 		Options: options,

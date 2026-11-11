@@ -1,0 +1,6 @@
+{
+  "engine": "zapret2",
+  "executable": "../engine/winws2.exe",
+  "strategy_file": "../strategy/alt11-games-any.conf.json",
+  "reservation_ports": 256
+}

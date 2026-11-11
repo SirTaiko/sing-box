@@ -36,6 +36,7 @@ type DefaultDialer struct {
 	udpDialer4             net.Dialer
 	udpDialer6             net.Dialer
 	udpListener            net.ListenConfig
+	socketOwner            SocketOwner
 	udpAddr4               string
 	udpAddr6               string
 	netns                  string
@@ -54,6 +55,13 @@ type DefaultDialer struct {
 }
 
 func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDialer, error) {
+	return NewDefaultWithOwner(ctx, options, nil)
+}
+
+// NewDefaultWithOwner builds the default dialer with an optional per-outbound
+// socket owner. The owner control is attached to every real socket path
+// before bind/connect, including parallel and per-family copies.
+func NewDefaultWithOwner(ctx context.Context, options option.DialerOptions, socketOwner SocketOwner) (*DefaultDialer, error) {
 	connectionManager := service.FromContext[adapter.ConnectionManager](ctx)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
@@ -195,6 +203,14 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		dialer.Control = control.Append(dialer.Control, control.DisableUDPFragment())
 		listener.Control = control.Append(listener.Control, control.DisableUDPFragment())
 	}
+	if socketOwner != nil {
+		// The owner control must run on every real socket before bind/connect.
+		// It is appended last so the ownership token is applied on the same
+		// socket options pass, and it is copied into every per-family dialer
+		// and the packet listener below.
+		dialer.Control = control.Append(dialer.Control, socketOwner.Control)
+		listener.Control = control.Append(listener.Control, socketOwner.Control)
+	}
 	var (
 		dialer4    = dialer
 		udpDialer4 = dialer
@@ -223,6 +239,17 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpDialer6.LocalAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: int(options.UDPBindPort)}
 		udpAddr6 = M.SocksaddrFrom(netip.IPv6Unspecified(), options.UDPBindPort).String()
 	}
+	if socketOwner != nil {
+		// A connected UDP socket must bind explicitly so the reservation token
+		// is consumed by bind() instead of an implicit bind inside connect().
+		// Port 0 asks the reservation allocator for the next owned port.
+		if udpDialer4.LocalAddr == nil {
+			udpDialer4.LocalAddr = &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+		}
+		if udpDialer6.LocalAddr == nil {
+			udpDialer6.LocalAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: 0}
+		}
+	}
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
@@ -234,6 +261,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpDialer4:             udpDialer4,
 		udpDialer6:             udpDialer6,
 		udpListener:            listener,
+		socketOwner:            socketOwner,
 		udpAddr4:               udpAddr4,
 		udpAddr6:               udpAddr6,
 		netns:                  options.NetNs,
@@ -268,6 +296,11 @@ func setMarkWrapper(networkManager adapter.NetworkManager, mark uint32, isDefaul
 }
 
 func (d *DefaultDialer) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
+	if d.socketOwner != nil {
+		if err := d.socketOwner.CheckAdmission(); err != nil {
+			return nil, err
+		}
+	}
 	if !address.IsValid() {
 		return nil, E.New("invalid address")
 	} else if address.IsDomain() {
@@ -296,6 +329,11 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 }
 
 func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network string, address M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
+	if d.socketOwner != nil {
+		if err := d.socketOwner.CheckAdmission(); err != nil {
+			return nil, err
+		}
+	}
 	if strategy == nil {
 		strategy = d.networkStrategy
 	}
@@ -344,6 +382,11 @@ func (d *DefaultDialer) DialParallelInterface(ctx context.Context, network strin
 }
 
 func (d *DefaultDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if d.socketOwner != nil {
+		if err := d.socketOwner.CheckAdmission(); err != nil {
+			return nil, err
+		}
+	}
 	if d.networkStrategy == nil {
 		packetConn, err := listener.ListenNetworkNamespace[net.PacketConn](ctx, d.netns, func() (net.PacketConn, error) {
 			listenConfig := d.udpListener
@@ -385,6 +428,11 @@ func (d *DefaultDialer) ICMPControl() control.Func {
 }
 
 func (d *DefaultDialer) ListenSerialInterfacePacket(ctx context.Context, destination M.Socksaddr, strategy *C.NetworkStrategy, interfaceType []C.InterfaceType, fallbackInterfaceType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, error) {
+	if d.socketOwner != nil {
+		if err := d.socketOwner.CheckAdmission(); err != nil {
+			return nil, err
+		}
+	}
 	if strategy == nil {
 		strategy = d.networkStrategy
 	}
@@ -441,6 +489,13 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackConn(conn)
 	}
+	// The owner wrapper must sit below the recorder counter so the returned
+	// connection keeps the counter at the top of its chain, exactly like the
+	// ordinary no-owner path: connected raw-packet lookups then stop at the
+	// counter's missing replaceability and fall back to its counted Read/Write.
+	if d.socketOwner != nil {
+		conn = d.socketOwner.TrackConn(conn)
+	}
 	if d.powerManager != nil {
 		recorder := d.powerManager.Recorder()
 		if recorder != nil {
@@ -490,6 +545,9 @@ func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socks
 				recorder.Touch(powerreport.DirectionOutbound, int(n), attribution)
 			}}))
 		}
+	}
+	if d.socketOwner != nil {
+		conn = d.socketOwner.TrackPacketConn(conn)
 	}
 	return conn, nil
 }

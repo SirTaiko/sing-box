@@ -4,12 +4,14 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"path/filepath"
 	"reflect"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/zapret"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -38,15 +40,17 @@ var (
 
 type Outbound struct {
 	outbound.Adapter
-	ctx            context.Context
-	logger         logger.ContextLogger
-	network        adapter.NetworkManager
-	dialer         dialer.ParallelInterfaceDialer
-	domainStrategy C.DomainStrategy
-	fallbackDelay  time.Duration
-	isEmpty        bool
-	myAddresses    common.TypedValue[[]netip.Prefix]
-	icmpPort       *ping.Port
+	ctx             context.Context
+	logger          logger.ContextLogger
+	network         adapter.NetworkManager
+	dialer          dialer.ParallelInterfaceDialer
+	domainStrategy  C.DomainStrategy
+	fallbackDelay   time.Duration
+	isEmpty         bool
+	myAddresses     common.TypedValue[[]netip.Prefix]
+	icmpPort        *ping.Port
+	zapret          *zapret.Manager
+	zapretInterface string
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
@@ -54,11 +58,64 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.Detour != "" {
 		return nil, E.New("`detour` is not supported in direct context")
 	}
+	var (
+		zapretManager   *zapret.Manager
+		socketOwner     dialer.SocketOwner
+		zapretProfile   string
+		zapretInterface string
+	)
+	if options.Zapret != nil {
+		if options.Zapret.Profile == "" {
+			return nil, E.New("zapret: `profile` is required in `zapret`")
+		}
+		if options.BindInterface == "" {
+			return nil, E.New("zapret: `bind_interface` is required for a direct outbound with `zapret`")
+		}
+		if options.NetworkStrategy != nil {
+			return nil, E.New("zapret: `network_strategy` is not supported for a direct outbound with `zapret` because the physical egress must be pinned by `bind_interface`")
+		}
+		if options.RoutingMark != 0 {
+			return nil, E.New("zapret: `routing_mark` is not supported for a direct outbound with `zapret`: the unique ownership SO_MARK is managed by sing-box, and a user routing mark on the same sockets would be overwritten")
+		}
+		if options.NetNs != "" {
+			return nil, E.New("zapret: `netns` is not supported for a direct outbound with `zapret` in this slice: the ownership nftables table is installed in the sing-box network namespace, so sockets created in another namespace would not be captured")
+		}
+		networkManager := service.FromContext[adapter.NetworkManager](ctx)
+		if networkManager != nil {
+			if defaultMark := networkManager.DefaultOptions().RoutingMark; defaultMark != 0 {
+				return nil, E.New("zapret: `route.default_mark` is not supported with `zapret`: the unique ownership SO_MARK is managed by sing-box, and the default routing mark would be overwritten")
+			}
+			if networkManager.AutoRedirectOutputMark() != 0 {
+				return nil, E.New("zapret: `tun.auto_redirect` is not supported together with `zapret` in this slice: auto-redirect manages its own socket mark; use `auto_route` without `auto_redirect`")
+			}
+		}
+		zapretProfile = options.Zapret.Profile
+		if !filepath.IsAbs(zapretProfile) {
+			configDirectory := adapter.ConfigDirectoryFromContext(ctx)
+			if configDirectory == "" {
+				return nil, E.New("zapret: relative `profile` ", zapretProfile, " requires a loaded configuration directory; use an absolute path for programmatic use")
+			}
+			zapretProfile = filepath.Join(configDirectory, zapretProfile)
+		}
+		zapretInterface = options.BindInterface
+		var err error
+		zapretManager, err = zapret.NewManager(zapret.Options{
+			Tag:           tag,
+			ProfilePath:   zapretProfile,
+			BindInterface: zapretInterface,
+			Logger:        logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		socketOwner = zapretManager
+	}
 	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
 		Context:        ctx,
 		Options:        options.DialerOptions,
 		RemoteIsDomain: true,
 		DirectOutbound: true,
+		SocketOwner:    socketOwner,
 	})
 	if err != nil {
 		return nil, err
@@ -72,9 +129,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		domainStrategy: C.DomainStrategy(options.DomainStrategy),
 		fallbackDelay:  time.Duration(options.FallbackDelay),
 		dialer:         outboundDialer.(dialer.ParallelInterfaceDialer),
-		isEmpty: reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
+		isEmpty: options.Zapret == nil && reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
 		}),
+		zapret:          zapretManager,
+		zapretInterface: zapretInterface,
 	}
 	//nolint:staticcheck
 	if options.ProxyProtocol != 0 {
@@ -92,8 +151,18 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
+		if h.zapret != nil {
+			scope.Add(h.zapret.Close)
+		}
 		if h.icmpPort != nil {
 			scope.Add(h.icmpPort.Close)
+		}
+	case adapter.StartStateStart:
+		if h.zapret != nil {
+			err := h.startZapret()
+			if err != nil {
+				return err
+			}
 		}
 	case adapter.StartStatePostStart, adapter.StartStateStarted:
 		if len(h.myAddresses.Load()) == 0 {
@@ -101,6 +170,44 @@ func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 	}
 	return nil
+}
+
+func (h *Outbound) startZapret() error {
+	if h.network == nil {
+		return E.New("zapret: outbound ", h.Tag(), ": missing network manager")
+	}
+	if h.network.AutoRedirectOutputMark() != 0 {
+		return E.New("zapret: outbound ", h.Tag(), ": `tun.auto_redirect` is not supported together with `zapret` in this slice: auto-redirect manages its own socket mark; use `auto_route` without `auto_redirect`")
+	}
+	if defaultMark := h.network.DefaultOptions().RoutingMark; defaultMark != 0 {
+		return E.New("zapret: outbound ", h.Tag(), ": `route.default_mark` is not supported with `zapret`: the unique ownership SO_MARK is managed by sing-box, and the default routing mark would be overwritten")
+	}
+	networkInterface, err := h.network.InterfaceFinder().ByName(h.zapretInterface)
+	if err != nil {
+		return E.Cause(err, "zapret: outbound ", h.Tag(), ": find bind_interface ", h.zapretInterface)
+	}
+	if networkInterface.Index <= 0 {
+		return E.New("zapret: outbound ", h.Tag(), ": bind_interface ", h.zapretInterface, " has no valid interface index")
+	}
+	return h.zapret.Start(h.ctx, networkInterface.Index)
+}
+
+func (h *Outbound) checkZapretInterface() {
+	if h.zapret == nil || h.zapret.State() != zapret.StateReady {
+		return
+	}
+	if h.network == nil {
+		h.zapret.Fail(E.New("zapret: outbound ", h.Tag(), ": network manager unavailable after interface update"))
+		return
+	}
+	networkInterface, err := h.network.InterfaceFinder().ByName(h.zapretInterface)
+	if err != nil {
+		h.zapret.Fail(E.Cause(err, "zapret: outbound ", h.Tag(), ": bind_interface ", h.zapretInterface, " disappeared"))
+		return
+	}
+	if networkInterface.Index != h.zapret.InterfaceIndex() {
+		h.zapret.Fail(E.New("zapret: outbound ", h.Tag(), ": bind_interface ", h.zapretInterface, " index changed from ", h.zapret.InterfaceIndex(), " to ", networkInterface.Index, "; refusing to continue with a stale capture filter"))
+	}
 }
 
 func (h *Outbound) fetchMyAddresses() {
@@ -135,6 +242,7 @@ func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.icmpPort != nil {
 		h.icmpPort.Close()
 	}
+	h.checkZapretInterface()
 }
 
 func (h *Outbound) isMyLoopbackAddress(addresses ...netip.Addr) bool {

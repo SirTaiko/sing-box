@@ -1,0 +1,5 @@
+{
+  "engine": "zapret2",
+  "executable": "../engine/nfqws2",
+  "strategy_file": "../strategy/alt11-games-any.conf.json"
+}

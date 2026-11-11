@@ -43,6 +43,25 @@ Override the connection destination port.
 
 Protocol value can be `1` or `2`.
 
+#### zapret
+
+!!! warning "Local fork extension, Windows and Linux"
+
+    Not part of upstream sing-box. When present, sing-box manages an original
+    zapret2 engine for this outbound and owns its socket-level association.
+    Requires `bind_interface`. See [Zapret engine ownership](/configuration/outbound/direct-zapret/).
+
+```json
+{
+  "type": "direct",
+  "tag": "zapret-a",
+  "bind_interface": "Ethernet",
+  "zapret": {
+    "profile": "profiles/zapret-a.json"
+  }
+}
+```
+
 ### Dial Fields
 
 See [Dial Fields](/configuration/shared/dial/) for details.
