@@ -125,6 +125,13 @@ func (s *Scope) Start(name string, component Lifecycle, stage StartStage) error 
 	return nil
 }
 
+// Child returns the lifetime already assigned to a started component.
+func (s *Scope) Child(component Lifecycle) *Scope {
+	s.access.Lock()
+	defer s.access.Unlock()
+	return s.children[component]
+}
+
 func (s *Scope) Close() error {
 	s.access.Lock()
 	s.cancel()

@@ -151,7 +151,12 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 		options.Log.DisableColor = true
 	}
 	ctx, cancel := context.WithCancel(service.ExtendContext(adapter.ContextWithConfigDirectory(globalCtx, configDirectory)))
+	var runtimePath string
+	if len(configPaths) == 1 && len(configDirectories) == 0 && configPaths[0] != "stdin" {
+		runtimePath, _ = filepath.Abs(configPaths[0])
+	}
 	instance, err := box.New(box.Options{
+		RuntimeConfigPath:          runtimePath,
 		Context:                    ctx,
 		Options:                    options,
 		NetworkNamespaceHolderArgs: []string{"/proc/self/exe", commandNetnsHolder.Use},

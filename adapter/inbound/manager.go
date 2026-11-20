@@ -2,6 +2,7 @@ package inbound
 
 import (
 	"context"
+	"slices"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -71,4 +72,18 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	m.inbounds = append(m.inbounds, inbound)
 	m.inboundByTag[tag] = inbound
 	return nil
+}
+
+func (m *Manager) Replace(old, next adapter.Inbound) {
+	m.access.Lock()
+	defer m.access.Unlock()
+	inbounds := slices.Clone(m.inbounds)
+	for i, current := range inbounds {
+		if current == old {
+			inbounds[i] = next
+			break
+		}
+	}
+	m.inbounds = inbounds
+	m.inboundByTag[next.Tag()] = next
 }

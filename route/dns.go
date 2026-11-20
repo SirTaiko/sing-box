@@ -54,9 +54,13 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
 }
 
 func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, metadata adapter.InboundContext) {
+	r.HijackDNSPacketWithCompletion(ctx, payload, writer, metadata, func() {})
+}
+func (r *Router) HijackDNSPacketWithCompletion(ctx context.Context, payload []byte, writer N.PacketWriter, metadata adapter.InboundContext, done func()) {
 	var message mDNS.Msg
 	err := message.Unpack(payload)
 	if err != nil {
+		done()
 		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
 		return
 	}
@@ -64,6 +68,7 @@ func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.P
 	destination := metadata.Destination
 	metadata.Destination = M.Socksaddr{}
 	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+		defer done()
 		if exchangeErr == nil {
 			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
 		}

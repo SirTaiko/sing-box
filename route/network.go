@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,7 +42,7 @@ type NetworkManager struct {
 	networkInterfaces       common.TypedValue[[]adapter.NetworkInterface]
 	autoDetectInterface     bool
 	defaultOptions          adapter.NetworkOptions
-	autoRedirectOutputMark  uint32
+	autoRedirectOutputMark  atomic.Uint32
 	networkMonitor          tun.NetworkUpdateMonitor
 	interfaceMonitor        tun.DefaultInterfaceMonitor
 	packageManager          tun.PackageManager
@@ -258,6 +259,13 @@ func (r *NetworkManager) Initialize(ruleSets []adapter.RuleSet) {
 	}
 }
 
+// Called before startup for listeners whose desktop routing policy is mutable.
+func (r *NetworkManager) UseRoutingContext(ctx context.Context) {
+	r.ctx = ctx
+	r.endpoint = service.FromContext[adapter.EndpointManager](ctx)
+	r.outbound = service.FromContext[adapter.OutboundManager](ctx)
+}
+
 func (r *NetworkManager) InterfaceFinder() control.InterfaceFinder {
 	return r.interfaceFinder
 }
@@ -381,23 +389,27 @@ func (r *NetworkManager) DefaultOptions() adapter.NetworkOptions {
 }
 
 func (r *NetworkManager) RegisterAutoRedirectOutputMark(mark uint32) error {
-	if r.autoRedirectOutputMark > 0 {
+	if !r.autoRedirectOutputMark.CompareAndSwap(0, mark) {
 		return E.New("only one auto-redirect can be configured")
 	}
-	r.autoRedirectOutputMark = mark
 	return nil
 }
 
+func (r *NetworkManager) UnregisterAutoRedirectOutputMark(mark uint32) {
+	r.autoRedirectOutputMark.CompareAndSwap(mark, 0)
+}
+
 func (r *NetworkManager) AutoRedirectOutputMark() uint32 {
-	return r.autoRedirectOutputMark
+	return r.autoRedirectOutputMark.Load()
 }
 
 func (r *NetworkManager) AutoRedirectOutputMarkFunc() control.Func {
 	return func(network, address string, conn syscall.RawConn) error {
-		if r.autoRedirectOutputMark == 0 {
+		mark := r.autoRedirectOutputMark.Load()
+		if mark == 0 {
 			return nil
 		}
-		return control.RoutingMark(r.autoRedirectOutputMark)(network, address, conn)
+		return control.RoutingMark(mark)(network, address, conn)
 	}
 }
 

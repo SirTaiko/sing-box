@@ -98,7 +98,8 @@ type Manager struct {
 	engine         platformEngine
 	flows          map[*flowHandle]struct{}
 	closed         chan struct{}
-	closeOnce      sync.Once
+	closeOnce      *sync.Once
+	watchers       sync.WaitGroup
 }
 
 func NewManager(options Options) (*Manager, error) {
@@ -144,6 +145,7 @@ func NewManager(options Options) (*Manager, error) {
 		state:            StateNew,
 		flows:            make(map[*flowHandle]struct{}),
 		closed:           make(chan struct{}),
+		closeOnce:        new(sync.Once),
 	}, nil
 }
 
@@ -177,6 +179,7 @@ func (m *Manager) Start(ctx context.Context, interfaceIndex int) error {
 		m.mutex.Unlock()
 		return fmt.Errorf("zapret: outbound %q: cannot start manager in state %s", m.tag, state)
 	}
+	closed, closeOnce := m.closed, m.closeOnce
 	m.state = StateStarting
 	m.interfaceIndex = interfaceIndex
 	m.mutex.Unlock()
@@ -209,7 +212,7 @@ func (m *Manager) Start(ctx context.Context, interfaceIndex int) error {
 			m.failure = err
 		}
 		m.mutex.Unlock()
-		m.closeOnce.Do(func() { close(m.closed) })
+		closeOnce.Do(func() { close(closed) })
 		return err
 	}
 	m.mutex.Lock()
@@ -222,20 +225,21 @@ func (m *Manager) Start(ctx context.Context, interfaceIndex int) error {
 	}
 	m.state = StateReady
 	m.engine = engine
+	m.watchers.Add(1)
 	m.mutex.Unlock()
 	m.logger.Info("zapret[", m.tag, "]: engine ready on interface ", m.bindInterface, " (", interfaceIndex, ")")
-	go m.watchEngine(engine)
+	go func() { defer m.watchers.Done(); m.watchEngine(engine, closed) }()
 	return nil
 }
 
-func (m *Manager) watchEngine(engine platformEngine) {
+func (m *Manager) watchEngine(engine platformEngine, closed <-chan struct{}) {
 	select {
 	case err := <-engine.Exited():
 		if err == nil {
 			err = errors.New("engine exited unexpectedly")
 		}
 		m.fail(fmt.Errorf("zapret: outbound %q: original engine stopped: %w", m.tag, err))
-	case <-m.closed:
+	case <-closed:
 	}
 }
 
@@ -256,6 +260,7 @@ func (m *Manager) fail(err error) {
 		m.mutex.Unlock()
 		return
 	}
+	closed, closeOnce := m.closed, m.closeOnce
 	m.state = StateFailed
 	m.failure = err
 	flows := m.detachFlowsLocked()
@@ -275,7 +280,24 @@ func (m *Manager) fail(err error) {
 			m.logger.Error(fmt.Errorf("zapret: outbound %q: engine cleanup after failure: %w", m.tag, closeErr))
 		}
 	}
-	m.closeOnce.Do(func() { close(m.closed) })
+	closeOnce.Do(func() { close(closed) })
+}
+
+// PrepareRestart rearms a fully stopped manager after a failed profile
+// cutover. The dialer's SocketOwner continues to point to this same manager.
+func (m *Manager) PrepareRestart() error {
+	m.watchers.Wait()
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	if m.state != StateClosed {
+		return fmt.Errorf("zapret: cannot restore manager in state %s", m.state)
+	}
+	m.state = StateNew
+	m.failure = nil
+	m.engine = nil
+	m.closed = make(chan struct{})
+	m.closeOnce = new(sync.Once)
+	return nil
 }
 
 func (m *Manager) CheckAdmission() error {
@@ -371,16 +393,18 @@ func (m *Manager) detachFlowsLocked() []*flowHandle {
 // the port reservation anchors released.
 func (m *Manager) Close() error {
 	m.mutex.Lock()
+	closed, closeOnce := m.closed, m.closeOnce
 	switch m.state {
 	case StateClosed:
 		m.mutex.Unlock()
 		return nil
-	case StateFailed:
+	case StateFailed, StateStopping:
 		m.mutex.Unlock()
-		// Failure cleanup already ran (or is running); wait for it.
-		<-m.closed
+		<-closed
 		m.mutex.Lock()
-		m.state = StateClosed
+		if m.closed == closed {
+			m.state = StateClosed
+		}
 		m.mutex.Unlock()
 		return nil
 	}
@@ -402,9 +426,9 @@ func (m *Manager) Close() error {
 			errs = append(errs, closeErr)
 		}
 	}
-	m.closeOnce.Do(func() { close(m.closed) })
 	m.mutex.Lock()
 	m.state = StateClosed
+	closeOnce.Do(func() { close(closed) })
 	m.mutex.Unlock()
 	if len(errs) > 0 {
 		return fmt.Errorf("zapret: outbound %q: stop reported remaining resources: %w", m.tag, errors.Join(errs...))

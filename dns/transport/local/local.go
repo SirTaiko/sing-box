@@ -115,7 +115,7 @@ func (t *Transport) Reset() {
 	serverSet := t.serverSet.Load()
 	if serverSet != nil {
 		for _, serverTransport := range serverSet.transports {
-			serverTransport.Reset()
+			serverTransport.reset()
 		}
 	}
 	t.system.reset()

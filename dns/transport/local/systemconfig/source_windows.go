@@ -28,6 +28,7 @@ type Source struct {
 	updateCallback   *list.Element[tun.DefaultInterfaceUpdateCallback]
 	stale            bool
 	config           *Config
+	lastRead         time.Time
 }
 
 func NewSource(ctx context.Context) *Source {
@@ -43,11 +44,14 @@ func NewSource(ctx context.Context) *Source {
 func (s *Source) Configuration() *Config {
 	s.access.Lock()
 	defer s.access.Unlock()
-	if s.config != nil && !s.stale && s.updateCallback != nil {
+	// Changing adapter DNS (for example a DHCP renewal on the same Wi-Fi)
+	// need not change the default interface. Bound the age of its DNS list.
+	if s.config != nil && !s.stale && s.updateCallback != nil && time.Since(s.lastRead) < 5*time.Second {
 		return s.config
 	}
 	s.stale = false
 	config := s.readConfig()
+	s.lastRead = time.Now()
 	if s.config != nil && config.Equal(s.config) {
 		return s.config
 	}
@@ -84,30 +88,37 @@ func (s *Source) readConfig() *Config {
 		Timeout:  5 * time.Second,
 		Attempts: 2,
 	}
-	defer func() {
-		if len(config.Servers) == 0 {
-			config.Servers = defaultServers
+	config.Search = defaultSearch()
+	// A secondary adapter (including an old virtual adapter) can advertise an
+	// entirely different DNS policy. Only use the active network's servers.
+	var index uint32
+	if s.interfaceMonitor != nil {
+		if iif := s.interfaceMonitor.DefaultInterface(); iif != nil {
+			index = uint32(iif.Index)
 		}
-		if len(config.Search) == 0 {
-			config.Search = defaultSearch()
+	} else {
+		// Routing-table queries only. No packets are sent to these test addresses.
+		if err := windows.GetBestInterfaceEx(&windows.SockaddrInet4{Addr: [4]byte{192, 0, 2, 1}}, &index); err != nil {
+			_ = windows.GetBestInterfaceEx(&windows.SockaddrInet6{Addr: [16]byte{0x20, 0x01, 0x0d, 0xb8, 15: 1}}, &index)
 		}
-	}()
+	}
+	if index == 0 {
+		return config
+	}
 	addresses, err := adapterAddresses()
 	if err != nil {
 		return config
 	}
-	var dnsAddresses []struct {
-		ifName string
-		netip.Addr
+	var servers []M.Socksaddr
+	var myInterfaces []string
+	if s.interfaceMonitor != nil {
+		myInterfaces = s.interfaceMonitor.MyInterfaces()
 	}
 	for _, address := range addresses {
-		if address.OperStatus != windows.IfOperStatusUp {
+		if address.IfIndex != index && address.Ipv6IfIndex != index {
 			continue
 		}
-		if address.IfType == windows.IF_TYPE_TUNNEL {
-			continue
-		}
-		if address.FirstGatewayAddress == nil {
+		if address.OperStatus != windows.IfOperStatusUp || slices.Contains(myInterfaces, windows.UTF16PtrToString(address.FriendlyName)) {
 			continue
 		}
 		for dnsServerAddress := address.FirstDnsServerAddress; dnsServerAddress != nil; dnsServerAddress = dnsServerAddress.Next {
@@ -132,22 +143,8 @@ func (s *Source) readConfig() *Config {
 			default:
 				continue
 			}
-			dnsAddresses = append(dnsAddresses, struct {
-				ifName string
-				netip.Addr
-			}{ifName: windows.UTF16PtrToString(address.FriendlyName), Addr: dnsServerAddr})
+			servers = append(servers, M.SocksaddrFrom(dnsServerAddr, 53))
 		}
-	}
-	var myInterfaces []string
-	if s.interfaceMonitor != nil {
-		myInterfaces = s.interfaceMonitor.MyInterfaces()
-	}
-	var servers []M.Socksaddr
-	for _, address := range dnsAddresses {
-		if slices.Contains(myInterfaces, address.ifName) {
-			continue
-		}
-		servers = append(servers, M.SocksaddrFrom(address.Addr, 53))
 	}
 	config.Servers = common.Uniq(servers)
 	return config

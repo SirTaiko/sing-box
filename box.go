@@ -40,6 +40,7 @@ import (
 var _ adapter.SimpleLifecycle = (*Box)(nil)
 
 type Box struct {
+	live                *liveRuntime
 	createdAt           time.Time
 	debugOptions        option.DebugOptions
 	logFactory          log.Factory
@@ -62,6 +63,7 @@ type Box struct {
 }
 
 type Options struct {
+	RuntimeConfigPath string
 	option.Options
 	Context                    context.Context
 	PlatformLogWriter          log.PlatformWriter
@@ -248,6 +250,8 @@ func New(options Options) (*Box, error) {
 		var clashDefaultMode string
 		if experimentalOptions.ClashAPI != nil {
 			clashDefaultMode = experimentalOptions.ClashAPI.DefaultMode
+		} else if dnsOptions.DirectModeServer != "" {
+			clashDefaultMode = "Direct"
 		}
 		clashMode := clashmode.NewManager(ctx, logFactory.NewLogger("clash-mode"), clashDefaultMode, clashmode.CalculateModeList(options.Options))
 		service.MustRegisterPtr(ctx, clashMode)
@@ -283,6 +287,18 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize dns router")
 	}
+	var live *liveRuntime
+	var ingress adapter.Router = router
+	if options.RuntimeConfigPath != "" && common.Any(options.Services, func(s option.Service) bool { return s.Tag == "mvpn-api" && s.Type == C.TypeAPI }) {
+		live = newLiveRuntime(ctx, options.RuntimeConfigPath, options.Options, router, dnsRouter, outboundManager, endpointManager, dnsTransportManager)
+		ingress = &liveIngress{Router: router, live: live}
+		service.MustRegister[adapter.RuntimeConfig](ctx, live)
+	}
+	resourceCtx := ctx
+	if live != nil {
+		resourceCtx = service.ExtendContext(ctx)
+		service.MustRegister[adapter.DNSRouter](resourceCtx, liveDNS{dnsRouter, live})
+	}
 	for i, endpointOptions := range options.Endpoints {
 		var tag string
 		if endpointOptions.Tag != "" {
@@ -290,7 +306,7 @@ func New(options Options) (*Box, error) {
 		} else {
 			tag = F.ToString(i)
 		}
-		endpointCtx := ctx
+		endpointCtx := resourceCtx
 		if tag != "" {
 			// TODO: remove this
 			endpointCtx = adapter.WithContext(endpointCtx, &adapter.InboundContext{
@@ -299,7 +315,7 @@ func New(options Options) (*Box, error) {
 		}
 		err = endpointManager.Create(
 			endpointCtx,
-			router,
+			ingress,
 			logFactory.NewLogger(F.ToString("endpoint/", endpointOptions.Type, "[", tag, "]")),
 			tag,
 			endpointOptions.Type,
@@ -318,7 +334,7 @@ func New(options Options) (*Box, error) {
 		}
 		err = inboundManager.Create(
 			ctx,
-			router,
+			ingress,
 			logFactory.NewLogger(F.ToString("inbound/", inboundOptions.Type, "[", tag, "]")),
 			tag,
 			inboundOptions.Type,
@@ -353,7 +369,7 @@ func New(options Options) (*Box, error) {
 		} else {
 			tag = F.ToString(i)
 		}
-		outboundCtx := ctx
+		outboundCtx := resourceCtx
 		if tag != "" {
 			// TODO: remove this
 			outboundCtx = adapter.WithContext(outboundCtx, &adapter.InboundContext{
@@ -465,7 +481,8 @@ func New(options Options) (*Box, error) {
 		})
 		timeService.TimeService = ntpService
 	}
-	return &Box{
+	instance := &Box{
+		live:                live,
 		network:             networkManager,
 		endpoint:            endpointManager,
 		inbound:             inboundManager,
@@ -485,7 +502,18 @@ func New(options Options) (*Box, error) {
 		internalService:     internalServices,
 		ntpService:          ntpService,
 		scope:               adapter.NewScope(ctx, logFactory.Logger()),
-	}, nil
+	}
+	if live != nil {
+		live.box = instance
+		view := live.ServiceContext(ctx)
+		service.MustRegister[adapter.Router](view, ingress)
+		networkManager.UseRoutingContext(view)
+		if mode := service.PtrFromContext[clashmode.Manager](ctx); mode != nil {
+			mode.SetDNSRouter(liveDNS{dnsRouter, live})
+		}
+		referenceManager.Reconfigure(view, options.Options)
+	}
+	return instance, nil
 }
 
 func (s *Box) PreStart() error {
@@ -654,6 +682,10 @@ func (s *Box) start() error {
 }
 
 func (s *Box) Close() error {
+	if s.live != nil {
+		s.live.shutdown()
+		defer s.live.finishShutdown()
+	}
 	return s.scope.Close()
 }
 

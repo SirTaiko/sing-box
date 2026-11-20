@@ -19,7 +19,7 @@ type Manager struct {
 	dnsRouter    adapter.DNSRouter
 	mode         string
 	modeList     []string
-	updateAccess sync.Mutex
+	updateAccess sync.RWMutex
 	updateHooks  []*observable.Subscriber[struct{}]
 }
 
@@ -39,6 +39,9 @@ func NewManager(ctx context.Context, logger log.Logger, defaultMode string, mode
 	}
 }
 
+// SetDNSRouter is called before startup by a runtime with interchangeable DNS policy.
+func (m *Manager) SetDNSRouter(r adapter.DNSRouter) { m.dnsRouter = r }
+
 func (m *Manager) Name() string {
 	return "clash mode manager"
 }
@@ -53,13 +56,17 @@ func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if common.Any(m.modeList, func(it string) bool {
 			return strings.EqualFold(it, mode)
 		}) {
+			m.updateAccess.Lock()
 			m.mode = mode
+			m.updateAccess.Unlock()
 		}
 	}
 	return nil
 }
 
 func (m *Manager) Mode() string {
+	m.updateAccess.RLock()
+	defer m.updateAccess.RUnlock()
 	return m.mode
 }
 
@@ -82,11 +89,12 @@ func (m *Manager) SetMode(newMode string) {
 	if !common.Contains(m.modeList, newMode) {
 		return
 	}
+	m.updateAccess.Lock()
 	if newMode == m.mode {
+		m.updateAccess.Unlock()
 		return
 	}
 	m.mode = newMode
-	m.updateAccess.Lock()
 	for _, hook := range m.updateHooks {
 		hook.Emit(struct{}{})
 	}

@@ -404,3 +404,25 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 func (h *Outbound) IsEmpty() bool {
 	return h.isEmpty
 }
+
+// RuntimeReady reports whether the external engine can still admit sockets.
+func (h *Outbound) RuntimeReady() bool {
+	return h.zapret == nil || h.zapret.State() == zapret.StateReady
+}
+
+// SuspendRuntimeEngine releases the exclusive interception resources before
+// starting another strategy. Only connections owned by this outbound close.
+func (h *Outbound) SuspendRuntimeEngine() (func() error, error) {
+	if h.zapret == nil {
+		return nil, nil
+	}
+	if err := h.zapret.Close(); err != nil {
+		return nil, err
+	}
+	return func() error {
+		if err := h.zapret.PrepareRestart(); err != nil {
+			return err
+		}
+		return h.startZapret()
+	}, nil
+}

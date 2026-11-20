@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package daemon;
+option go_package = "github.com/sagernet/sing-box/daemon";
+
+service DNSLookup {
+  rpc LookupIPv4(IPv4LookupRequest) returns (IPv4LookupResponse);
+}
+
+message IPv4LookupRequest {
+  string name = 1;
+  string server = 2;
+}
+
+message IPv4LookupResponse {
+  repeated string addresses = 1;
+}

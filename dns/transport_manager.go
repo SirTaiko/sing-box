@@ -160,6 +160,11 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 	if err != nil {
 		return err
 	}
+	return m.Add(transport)
+}
+
+func (m *TransportManager) Add(transport adapter.DNSTransport) error {
+	tag := transport.Tag()
 	m.access.Lock()
 	defer m.access.Unlock()
 	_, loaded := m.transportByTag[tag]

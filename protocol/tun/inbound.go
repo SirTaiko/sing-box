@@ -52,6 +52,7 @@ type Inbound struct {
 	usePlatformInterface   bool
 	platformOptions        option.TunPlatformOptions
 	enableAutoRedirect     bool
+	ownsRedirectMark       bool
 	disableNFTables        bool
 	autoRedirect           tun.AutoRedirect
 	routeRuleSet           []adapter.RuleSet
@@ -270,6 +271,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			inbound.tunOptions.AutoRedirectMarkMode = true
 			if options.NetNs == "" {
 				err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMark)
+				inbound.ownsRedirectMark = err == nil
 				if err != nil {
 					return nil, err
 				}
@@ -322,6 +324,17 @@ func (t *Inbound) Tag() string {
 func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
+		if t.tunOptions.NetNs == "" {
+			if owner, ok := t.networkManager.(interface{ UnregisterAutoRedirectOutputMark(uint32) }); ok {
+				scope.Add(func() error {
+					if t.ownsRedirectMark {
+						owner.UnregisterAutoRedirectOutputMark(t.tunOptions.AutoRedirectOutputMark)
+						t.ownsRedirectMark = false
+					}
+					return nil
+				})
+			}
+		}
 		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
 			inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
 			inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
@@ -367,18 +380,7 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		var err error
 		if t.enableAutoRedirect {
-			t.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
-				TunOptions:             &t.tunOptions,
-				Context:                t.ctx,
-				Handler:                (*autoRedirectHandler)(t),
-				Logger:                 t.logger,
-				NetworkMonitor:         t.networkManager.NetworkMonitor(),
-				InterfaceFinder:        t.networkManager.InterfaceFinder(),
-				TableName:              "sing-box",
-				DisableNFTables:        t.disableNFTables,
-				RouteAddressSet:        &t.routeAddressSet,
-				RouteExcludeAddressSet: &t.routeExcludeAddressSet,
-			})
+			t.autoRedirect, err = t.newRedirect(&t.tunOptions)
 			if err != nil {
 				return E.Cause(err, "initialize auto-redirect")
 			}
@@ -462,10 +464,15 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if t.platformInterface != nil && t.platformInterface.UnderNetworkExtension() {
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
+		stackOptions := t.tunOptions
+		// The desktop can raise its IPv4 TUN MTU from 1400 to 1500 in place.
+		if service.FromContext[adapter.RuntimeConfig](t.ctx) != nil && t.stack == "system" && stackOptions.MTU < 1500 {
+			stackOptions.MTU = 1500
+		}
 		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
 			Context:                t.ctx,
 			Tun:                    tunInterface,
-			TunOptions:             t.tunOptions,
+			TunOptions:             stackOptions,
 			UDPTimeout:             t.udpTimeout,
 			ICMPTimeout:            C.ICMPTimeout,
 			UDPMapping:             t.udpMapping,
@@ -484,6 +491,14 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		t.tunStack = tunStack
 		t.logger.Info("started at ", t.tunOptions.Name)
 	case adapter.StartStatePostStart:
+		if service.FromContext[adapter.RuntimeConfig](t.ctx) != nil {
+			scope.Add(func() error {
+				if t.autoRedirect != nil {
+					return t.autoRedirect.Close()
+				}
+				return nil
+			})
+		}
 		monitor := taskmonitor.New(t.logger, C.StartTimeout)
 		monitor.Start("starting tun stack")
 		err := t.tunStack.Start()
@@ -498,7 +513,9 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			return E.Cause(err, "starting TUN interface")
 		}
 		if t.autoRedirect != nil {
-			scope.Add(t.autoRedirect.Close)
+			if service.FromContext[adapter.RuntimeConfig](t.ctx) == nil {
+				scope.Add(t.autoRedirect.Close)
+			}
 			monitor.Start("initialize auto-redirect")
 			err = t.autoRedirect.Start()
 			monitor.Finish()
@@ -637,4 +654,19 @@ func (t *autoRedirectHandler) NewPacketConnectionEx(ctx context.Context, conn N.
 
 func (t *autoRedirectHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
 	(*Inbound)(t).NewDNSPacket(payload, source, destination, writer)
+}
+
+func (t *Inbound) newRedirect(options *tun.Options) (tun.AutoRedirect, error) {
+	return tun.NewAutoRedirect(tun.AutoRedirectOptions{
+		TunOptions:             options,
+		Context:                t.ctx,
+		Handler:                (*autoRedirectHandler)(t),
+		Logger:                 t.logger,
+		NetworkMonitor:         t.networkManager.NetworkMonitor(),
+		InterfaceFinder:        t.networkManager.InterfaceFinder(),
+		TableName:              "sing-box",
+		DisableNFTables:        t.disableNFTables,
+		RouteAddressSet:        &t.routeAddressSet,
+		RouteExcludeAddressSet: &t.routeExcludeAddressSet,
+	})
 }

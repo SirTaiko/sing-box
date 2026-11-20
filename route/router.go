@@ -262,3 +262,8 @@ func (r *Router) ResetNetwork() {
 		r.processSearcher.ResetCache()
 	}
 }
+
+// CopyTrackersTo keeps connection accounting on the persistent desktop API.
+func (r *Router) CopyTrackersTo(next *Router) {
+	next.trackers = append(next.trackers, r.trackers...)
+}

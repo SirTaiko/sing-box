@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"slices"
+	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -41,22 +42,22 @@ type Selector struct {
 	selected                     common.TypedValue[adapter.Outbound]
 	history                      *urltest.HistoryStorage
 	interruptGroup               *interrupt.Group
-	interruptExternalConnections bool
+	interruptExternalConnections atomic.Bool
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
 	outbound := &Selector{
-		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, nil, options.Outbounds),
-		ctx:                          ctx,
-		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
-		logger:                       logger,
-		tags:                         options.Outbounds,
-		defaultTag:                   options.Default,
-		outbounds:                    make(map[string]adapter.Outbound),
-		history:                      service.PtrFromContext[urltest.HistoryStorage](ctx),
-		interruptGroup:               interrupt.NewGroup(),
-		interruptExternalConnections: options.InterruptExistConnections,
+		Adapter:        outbound.NewAdapter(C.TypeSelector, tag, nil, options.Outbounds),
+		ctx:            ctx,
+		outbound:       service.FromContext[adapter.OutboundManager](ctx),
+		logger:         logger,
+		tags:           options.Outbounds,
+		defaultTag:     options.Default,
+		outbounds:      make(map[string]adapter.Outbound),
+		history:        service.PtrFromContext[urltest.HistoryStorage](ctx),
+		interruptGroup: interruptGroupFor(ctx, tag),
 	}
+	outbound.SetInterruptExisting(options.InterruptExistConnections)
 	if len(outbound.tags) == 0 {
 		return nil, E.New("missing tags")
 	}
@@ -135,12 +136,21 @@ func (s *Selector) References() []string {
 	return []string{selected.Tag()}
 }
 
+func (s *Selector) SetInterruptExisting(enabled bool) { s.interruptExternalConnections.Store(enabled) }
+
 func (s *Selector) SelectOutbound(tag string) bool {
+	return s.selectOutbound(tag, "", false)
+}
+func (s *Selector) SelectRuntimeOutbound(tag, previousTag string) bool {
+	return s.selectOutbound(tag, previousTag, true)
+}
+func (s *Selector) selectOutbound(tag, previousTag string, restoring bool) bool {
 	detour, loaded := s.outbounds[tag]
 	if !loaded {
 		return false
 	}
-	if s.selected.Swap(detour) == detour {
+	previous := s.selected.Swap(detour)
+	if previous == detour && (!restoring || previousTag == tag) {
 		return true
 	}
 	if s.Tag() != "" {
@@ -152,7 +162,9 @@ func (s *Selector) SelectOutbound(tag string) bool {
 			}
 		}
 	}
-	s.interruptGroup.Interrupt(s.interruptExternalConnections)
+	if !restoring || previousTag != tag {
+		s.interruptGroup.Interrupt(s.interruptExternalConnections.Load())
+	}
 	if s.history != nil {
 		s.history.NotifyUpdated()
 	}
