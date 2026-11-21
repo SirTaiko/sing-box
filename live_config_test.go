@@ -273,6 +273,100 @@ func TestDesktopLiveRouting(t *testing.T) {
 	}
 }
 
+func TestDesktopLiveRouteChangeReconnectsAffectedFlows(t *testing.T) {
+	for _, scope := range []string{"domain", "default", "process"} {
+		t.Run(scope, func(t *testing.T) {
+			if scope == "process" && runtime.GOOS != "linux" && runtime.GOOS != "windows" {
+				t.Skip("mVPN desktop process lookup is tested on Linux and Windows")
+			}
+			s := newSession(t, nil)
+			if _, err := s.api.SetClashMode(s.ctx, &daemon.ClashMode{Mode: "Rule"}); err != nil {
+				t.Fatal(err)
+			}
+			route := s.cfg["route"].(object)
+			rules := []object{
+				{"clash_mode": "Direct", "outbound": "direct"},
+				{"domain": "unchanged.test", "outbound": "vpn-select"},
+			}
+			route["rules"] = rules
+			s.cfg["dns"].(object)["servers"].([]object)[0]["server_port"] = resolver(t, "127.0.0.1")
+			if err := s.apply(t, "a"); err != nil {
+				t.Fatal(err)
+			}
+			echo, err := net.Listen("tcp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = echo.Close() })
+			go func() {
+				for {
+					conn, err := echo.Accept()
+					if err != nil {
+						return
+					}
+					go func() { defer conn.Close(); _, _ = io.Copy(conn, conn) }()
+				}
+			}()
+			checkAddr := net.JoinHostPort("ip-check.test", strconv.Itoa(echo.Addr().(*net.TCPAddr).Port))
+			otherAddr := net.JoinHostPort("unchanged.test", strconv.Itoa(echo.Addr().(*net.TCPAddr).Port))
+			dial := func(addr string) net.Conn {
+				t.Helper()
+				conn, status := s.connection(t, addr)
+				if !strings.Contains(status, "200") {
+					t.Fatal(status)
+				}
+				return conn
+			}
+			roundtrip := func(conn net.Conn) {
+				t.Helper()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				if _, err := conn.Write([]byte("ok")); err != nil {
+					t.Fatal(err)
+				}
+				var response [2]byte
+				if _, err := io.ReadFull(conn, response[:]); err != nil || string(response[:]) != "ok" {
+					t.Fatalf("proxy roundtrip: %q (%v)", response, err)
+				}
+			}
+			affected, other := dial(checkAddr), dial(otherAddr)
+			roundtrip(affected)
+			roundtrip(other)
+			switch scope {
+			case "domain":
+				route["rules"] = append(slices.Clone(rules), object{"domain_suffix": []string{"ip-check.test"}, "outbound": "direct"})
+			case "process":
+				executable, err := os.Executable()
+				if err != nil {
+					t.Fatal(err)
+				}
+				route["rules"] = append(slices.Clone(rules), object{"process_name": filepath.Base(executable), "outbound": "direct"})
+			case "default":
+				route["final"] = "direct"
+			}
+			if err := s.apply(t, "a"); err != nil {
+				t.Fatal(err)
+			}
+			// The browser can retain this socket without another route lookup,
+			// so merely updating the rules does not change its next request.
+			_ = affected.SetReadDeadline(time.Now().Add(time.Second))
+			var data [1]byte
+			if _, err := affected.Read(data[:]); err == nil {
+				t.Fatal("old browser connection remained open")
+			} else if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+				t.Fatal("old browser connection timed out instead of closing")
+			}
+			roundtrip(other)
+			fresh := dial(checkAddr)
+			roundtrip(fresh)
+			if !slices.ContainsFunc(s.trackers.Connections(), func(flow *trafficcontrol.TrackerMetadata) bool {
+				return flow.Metadata.Destination.Fqdn == "ip-check.test" && flow.Metadata.RouteOutbound == "direct"
+			}) {
+				t.Fatal("the next browser connection did not use the direct route")
+			}
+		})
+	}
+}
+
 func TestDesktopLiveUDP(t *testing.T) {
 	s := newSession(t, nil)
 	if _, err := s.api.SetClashMode(s.ctx, &daemon.ClashMode{Mode: "Rule"}); err != nil {
@@ -354,6 +448,35 @@ func TestDesktopLiveUDP(t *testing.T) {
 	}
 	defer fresh.Close()
 	exchange(fresh)
+	id = ""
+	for _, tracker := range s.trackers.Connections() {
+		if tracker.Metadata.Network == "udp" && tracker.Metadata.RouteOutbound == "vpn-select" {
+			id = tracker.ID.String()
+		}
+	}
+	if id == "" {
+		t.Fatal("expected an active UDP association over VPN")
+	}
+	s.cfg["outbounds"].([]object)[3]["interrupt_exist_connections"] = false
+	route := s.cfg["route"].(object)
+	route["rules"] = append([]object{{"network": "udp", "port": target.Port, "outbound": "direct"}}, route["rules"].([]object)...)
+	if err = s.apply(t, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if hasOld() {
+		t.Fatal("old UDP association survived change from VPN to direct")
+	}
+	direct, err := proxy.ListenPacket(s.ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer direct.Close()
+	exchange(direct)
+	if !slices.ContainsFunc(s.trackers.Connections(), func(flow *trafficcontrol.TrackerMetadata) bool {
+		return flow.Metadata.Network == "udp" && flow.Metadata.RouteOutbound == "direct"
+	}) {
+		t.Fatal("expected the new UDP association to use the direct route")
+	}
 }
 
 // Read back forwarding prefixes from the OS, including /32s printed by iproute2

@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
 	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
@@ -271,6 +272,7 @@ func (h *liveRuntime) ApplyRuntimeConfig(ctx context.Context, digest []byte, sel
 	h.readers.Lock()
 	h.active.Store(p)
 	h.readers.Unlock()
+	h.closeReroutedConnections(old, p)
 	if p.dns != old.dns {
 		p.dns.ClearCache()
 	}
@@ -314,4 +316,32 @@ func (h *liveRuntime) ApplyRuntimeConfig(ctx context.Context, digest []byte, sel
 		history.NotifyUpdated()
 	}
 	return nil
+}
+
+func (h *liveRuntime) closeReroutedConnections(old, next *routingPolicy) {
+	if reflect.DeepEqual(old.config.Route, next.config.Route) {
+		return
+	}
+	manager := service.PtrFromContext[trafficcontrol.Manager](h.ctx)
+	if manager == nil {
+		return
+	}
+	for _, flow := range manager.Connections() {
+		if len(flow.Chain) == 0 {
+			continue
+		}
+		// Compare logical route tags. A server switch inside vpn-select has
+		// its own interruption policy.
+		activeTag := flow.Chain[len(flow.Chain)-1]
+		oldTag, known := old.router.TrackedOutboundTag(h.ctx, flow.Metadata)
+		if !known || oldTag != activeTag {
+			continue
+		}
+		newTag, known := next.router.TrackedOutboundTag(h.ctx, flow.Metadata)
+		if known && newTag != activeTag {
+			if tracked := manager.Connection(flow.ID); tracked != nil {
+				_ = tracked.Close()
+			}
+		}
+	}
 }

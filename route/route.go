@@ -723,6 +723,46 @@ match:
 	return
 }
 
+// TrackedOutboundTag evaluates outbound selection using an established flow's
+// metadata. Sniffing and DNS resolution have already run for this connection.
+// Leave flows with destination rewrites or non-routing actions alone.
+func (r *Router) TrackedOutboundTag(ctx context.Context, metadata adapter.InboundContext) (string, bool) {
+	if metadata.RouteOriginalDestination.IsValid() {
+		return "", false
+	}
+	r.searchProcessInfo(ctx, &metadata)
+	for _, rule := range r.rules {
+		metadata.ResetRuleCache()
+		if !rule.Match(&metadata) {
+			continue
+		}
+		switch action := rule.Action().(type) {
+		case *R.RuleActionRoute:
+			return action.Outbound, true
+		case *R.RuleActionBypass:
+			if action.Outbound != "" {
+				return action.Outbound, true
+			}
+		case *R.RuleActionRouteOptions:
+			if action.OverrideAddress.IsValid() || action.OverridePort != 0 {
+				return "", false
+			}
+		case *R.RuleActionSniff:
+			if action.OverrideDestination {
+				return "", false
+			}
+		case *R.RuleActionResolve:
+			// Use the addresses already resolved for this flow.
+		default:
+			return "", false
+		}
+	}
+	if outbound := r.outbound.Default(); outbound != nil {
+		return outbound.Tag(), true
+	}
+	return "", false
+}
+
 func (r *Router) actionSniff(
 	ctx context.Context, metadata *adapter.InboundContext, action *R.RuleActionSniff,
 	inputConn net.Conn, inputPacketConn N.PacketConn, inputBuffers []*buf.Buffer, inputPacketBuffers []*N.PacketBuffer,
