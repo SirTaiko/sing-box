@@ -3,8 +3,8 @@
 package zapret
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -41,11 +41,9 @@ const (
 	requiredLuaCompat     = "lua_compat_ver 6"
 
 	captureReadinessMarker = "windivert initialized. capture is started."
-	luaReadinessMarker     = "LUA INIT DONE"
 
 	versionProbeTimeout = 5 * time.Second
 	maxVersionOutput    = 64 * 1024
-	outputTailLines     = 24
 	// params.h: #define WINDIVERT_MAX 16384, the engine truncates the raw
 	// filter at that size, so a longer generated filter is an explicit error.
 	maxWindivertFilterLength = 16384 - 1
@@ -95,19 +93,22 @@ type windowsEngine struct {
 
 	mutex       sync.Mutex
 	waitErr     error
+	exited      bool
 	captureSeen bool
 	luaSeen     bool
-	tail        []string
-	readyOnce   sync.Once
+	tail        engineTail
+	ready       bool
+	readyToken  string
 	readyCh     chan struct{}
 }
 
 func newPlatformEngine(options platformOptions) (platformEngine, error) {
 	return &windowsEngine{
-		options: options,
-		done:    make(chan struct{}),
-		exitCh:  make(chan error, 1),
-		readyCh: make(chan struct{}),
+		options:    options,
+		done:       make(chan struct{}),
+		exitCh:     make(chan error, 1),
+		readyCh:    make(chan struct{}),
+		readyToken: "MVPN_READY_" + rand.Text(),
 	}, nil
 }
 
@@ -135,9 +136,7 @@ func (e *windowsEngine) Start(ctx context.Context) error {
 	e.cmd = exec.Command(e.options.profile.executable, arguments...)
 	e.cmd.Dir = e.options.profile.strategyDir
 	e.cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: winCreateNoWindow}
-	writer := &lineWriter{onLine: e.handleLine}
-	e.cmd.Stdout = writer
-	e.cmd.Stderr = writer
+	flushOutput := attachEngineOutput(e.cmd, e.options, e.handleLine)
 	err = e.cmd.Start()
 	if err != nil {
 		startErr := fmt.Errorf("zapret: outbound %q: start original engine %q: %w", e.options.tag, e.options.profile.executable, err)
@@ -150,14 +149,21 @@ func (e *windowsEngine) Start(ctx context.Context) error {
 		waitErr := e.cmd.Wait()
 		e.mutex.Lock()
 		e.waitErr = waitErr
+		e.exited = true
 		e.mutex.Unlock()
+		flushOutput()
 		close(e.done)
 		e.exitCh <- waitErr
 		close(e.exitCh)
 	}()
 	select {
 	case <-e.readyCh:
-		return nil
+		select {
+		case <-e.done:
+			return fmt.Errorf("zapret: outbound %q: engine exited during startup: %v; output: %s", e.options.tag, e.waitError(), e.outputTail())
+		default:
+			return nil
+		}
 	case <-e.done:
 		return fmt.Errorf("zapret: outbound %q: original engine exited before readiness: %v; output: %s", e.options.tag, e.waitError(), e.outputTail())
 	case <-time.After(e.options.startupTimeout):
@@ -425,12 +431,14 @@ func portRangePredicate(field string, reservations []*portReservation) string {
 
 func (e *windowsEngine) arguments() []string {
 	arguments := []string{
-		"--debug=1",
 		"--intercept=1",
 		"--wf-priority=0",
 		"--wf-raw=" + e.filter,
 	}
-	return append(arguments, e.options.profile.tokens...)
+	arguments = append(withEngineDebug(arguments), e.options.profile.tokens...)
+	// The stock one-shot timer runs in the receive loop, after Lua validates all
+	// referenced functions, even when there are no packets on the interface.
+	return append(arguments, fmt.Sprintf("--lua-init=timer_set('%s',function() DLOG_CONDUP('%s') end,10,true)", e.readyToken, e.readyToken))
 }
 
 func (e *windowsEngine) describeReservations() string {
@@ -442,40 +450,27 @@ func (e *windowsEngine) describeReservations() string {
 }
 
 func (e *windowsEngine) handleLine(line string) {
-	trimmed := strings.TrimSpace(line)
-	if trimmed != "" {
-		e.options.logger.Debug("zapret[", e.options.tag, "]: ", trimmed)
-	}
 	e.mutex.Lock()
-	if trimmed != "" {
-		e.tail = append(e.tail, trimmed)
-		if len(e.tail) > outputTailLines {
-			e.tail = e.tail[len(e.tail)-outputTailLines:]
-		}
+	defer e.mutex.Unlock()
+	e.tail.add(line)
+	if e.ready || e.exited {
+		return
 	}
-	captureSeen := e.captureSeen
-	luaSeen := e.luaSeen
-	if strings.Contains(trimmed, captureReadinessMarker) {
+	if line == captureReadinessMarker {
 		e.captureSeen = true
-		captureSeen = true
-	}
-	if strings.Contains(trimmed, luaReadinessMarker) {
+	} else if marker, found := strings.CutPrefix(line, "LUA: "); found && marker == e.readyToken {
 		e.luaSeen = true
-		luaSeen = true
 	}
-	e.mutex.Unlock()
-	if captureSeen && luaSeen {
-		e.readyOnce.Do(func() { close(e.readyCh) })
+	if e.captureSeen && e.luaSeen {
+		e.ready = true
+		close(e.readyCh)
 	}
 }
 
 func (e *windowsEngine) outputTail() string {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
-	if len(e.tail) == 0 {
-		return "<no output>"
-	}
-	return strings.Join(e.tail, " | ")
+	return e.tail.String()
 }
 
 func (e *windowsEngine) waitError() error {
@@ -518,31 +513,4 @@ func isExpectedTermination(err error) bool {
 		return true
 	}
 	return errors.Is(err, os.ErrProcessDone)
-}
-
-type lineWriter struct {
-	mutex  sync.Mutex
-	buffer []byte
-	onLine func(line string)
-}
-
-func (w *lineWriter) Write(p []byte) (int, error) {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	w.buffer = append(w.buffer, p...)
-	for {
-		index := bytes.IndexByte(w.buffer, '\n')
-		if index < 0 {
-			break
-		}
-		line := string(w.buffer[:index])
-		w.buffer = w.buffer[index+1:]
-		if w.onLine != nil {
-			w.onLine(line)
-		}
-	}
-	if len(w.buffer) > 8192 {
-		w.buffer = w.buffer[len(w.buffer)-4096:]
-	}
-	return len(p), nil
 }

@@ -3,7 +3,6 @@
 package zapret
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,7 +42,6 @@ const (
 
 	versionProbeTimeout = 5 * time.Second
 	maxVersionOutput    = 64 * 1024
-	outputTailLines     = 24
 	pidfilePollInterval = 50 * time.Millisecond
 	maxPidfileSize      = 64
 )
@@ -82,7 +80,7 @@ type linuxEngine struct {
 
 	mutex   sync.Mutex
 	waitErr error
-	tail    []string
+	tail    engineTail
 }
 
 var (
@@ -143,15 +141,14 @@ func (e *linuxEngine) Start(ctx context.Context) error {
 	if err = prepareNetworkCommand(e.cmd, true); err != nil {
 		return err
 	}
-	writer := &linuxLineWriter{onLine: e.handleLine}
-	e.cmd.Stdout = writer
-	e.cmd.Stderr = writer
+	flushOutput := attachEngineOutput(e.cmd, e.options, e.handleLine)
 	err = e.cmd.Start()
 	if err != nil {
 		return fmt.Errorf("zapret: outbound %q: start original engine %q: %w", e.options.tag, e.options.profile.executable, err)
 	}
 	go func() {
 		waitErr := e.cmd.Wait()
+		flushOutput()
 		e.mutex.Lock()
 		e.waitErr = waitErr
 		e.mutex.Unlock()
@@ -284,7 +281,6 @@ func readBoundNfqueues() map[int]struct{} {
 
 func (e *linuxEngine) arguments() []string {
 	arguments := []string{
-		"--debug=1",
 		"--intercept=1",
 		"--qnum=" + strconv.Itoa(e.queue),
 		"--fwmark=" + fmt.Sprintf("0x%08x", generatedMark),
@@ -292,7 +288,7 @@ func (e *linuxEngine) arguments() []string {
 		"--bind-fix4",
 		"--bind-fix6",
 	}
-	return append(arguments, e.options.profile.tokens...)
+	return append(withEngineDebug(arguments), e.options.profile.tokens...)
 }
 
 // waitReady waits for the fresh non-empty pidfile the original binary writes
@@ -462,27 +458,15 @@ func linuxExpectedTermination(err error) bool {
 }
 
 func (e *linuxEngine) handleLine(line string) {
-	trimmed := strings.TrimSpace(line)
-	if trimmed != "" {
-		e.options.logger.Debug("zapret[", e.options.tag, "]: ", trimmed)
-	}
 	e.mutex.Lock()
-	if trimmed != "" {
-		e.tail = append(e.tail, trimmed)
-		if len(e.tail) > outputTailLines {
-			e.tail = e.tail[len(e.tail)-outputTailLines:]
-		}
-	}
+	e.tail.add(line)
 	e.mutex.Unlock()
 }
 
 func (e *linuxEngine) outputTail() string {
 	e.mutex.Lock()
 	defer e.mutex.Unlock()
-	if len(e.tail) == 0 {
-		return "<no output>"
-	}
-	return strings.Join(e.tail, " | ")
+	return e.tail.String()
 }
 
 func (e *linuxEngine) waitError() error {
@@ -511,31 +495,4 @@ func tableNameFor(tag string) string {
 		name = "outbound"
 	}
 	return "sb_zapret_" + name
-}
-
-type linuxLineWriter struct {
-	mutex  sync.Mutex
-	buffer []byte
-	onLine func(line string)
-}
-
-func (w *linuxLineWriter) Write(p []byte) (int, error) {
-	w.mutex.Lock()
-	defer w.mutex.Unlock()
-	w.buffer = append(w.buffer, p...)
-	for {
-		index := bytes.IndexByte(w.buffer, '\n')
-		if index < 0 {
-			break
-		}
-		line := string(w.buffer[:index])
-		w.buffer = w.buffer[index+1:]
-		if w.onLine != nil {
-			w.onLine(line)
-		}
-	}
-	if len(w.buffer) > 8192 {
-		w.buffer = w.buffer[len(w.buffer)-4096:]
-	}
-	return len(p), nil
 }

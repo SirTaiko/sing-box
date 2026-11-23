@@ -30,8 +30,7 @@ const (
 // where this slice does not implement engine ownership.
 var ErrUnsupported = errors.New("zapret: original engine ownership is implemented for Windows and Linux only in this slice; remove the zapret field for the ordinary direct path")
 
-// Logger is the subset of the sing-box logger used by the manager. All engine
-// output is forwarded at debug level so ordinary product logs stay bounded.
+// Logger forwards ordinary engine output at debug level and preserves errors from stderr.
 type Logger interface {
 	Info(args ...any)
 	Debug(args ...any)
