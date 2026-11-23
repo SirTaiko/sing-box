@@ -37,6 +37,8 @@ func (r *Router) ReusableRuleSet(tag string) bool {
 }
 
 func (r *Router) InitializeLive(resourceCtx context.Context, rules []option.Rule, sets []option.RuleSet, scope *adapter.Scope, previous *Router, canReuse func(string) bool) error {
+	// The desktop cold start also has live rule sets. Only a replacement has a predecessor.
+	r.hotReload = previous != nil
 	r.liveSets = make(map[string]*liveRuleSet)
 	r.liveSetsBound = scope != nil
 	bind := func(tag string, asset *liveRuleSet) adapter.RuleSet {

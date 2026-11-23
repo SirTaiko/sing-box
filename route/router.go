@@ -41,6 +41,7 @@ type Router struct {
 	ruleSets          []adapter.RuleSet
 	liveSets          map[string]*liveRuleSet
 	liveSetsBound     bool
+	hotReload         bool
 	newSets           []adapter.RuleSet
 	ruleSetMap        map[string]adapter.RuleSet
 	ruleSetUpdater    *R.RuleSetUpdater
@@ -240,7 +241,9 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		for _, ruleSet := range r.ruleSets {
 			ruleSet.Cleanup()
 		}
-		runtime.GC()
+		if !r.hotReload {
+			runtime.GC()
+		}
 	}
 	return nil
 }

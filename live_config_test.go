@@ -914,3 +914,22 @@ func TestDesktopLazyDetourKeepsItsSelectedResource(t *testing.T) {
 		t.Fatal("late detour was redirected to another revision", err)
 	}
 }
+
+func TestDesktopOnlyColdRouterForcesGC(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	s := newSession(t, nil)
+	runtime.ReadMemStats(&after)
+	if after.NumForcedGC <= before.NumForcedGC {
+		t.Fatal("cold router did not collect after rule-set cleanup")
+	}
+	s.cfg["route"].(object)["rules"] = []object{{"domain": "new.test", "outbound": "a"}}
+	runtime.ReadMemStats(&before)
+	if err := s.apply(t, "a"); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if after.NumForcedGC != before.NumForcedGC {
+		t.Fatalf("hot apply forced %d collections", after.NumForcedGC-before.NumForcedGC)
+	}
+}
