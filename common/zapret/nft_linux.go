@@ -313,14 +313,48 @@ func (e *linuxEngine) rulesetScript() string {
 	write("add chain inet %s predefrag { type filter hook output priority -401; policy accept; }\n", e.table)
 	write("add rule inet %s predefrag meta mark & 0x%08x != 0 notrack comment \"zapret generated packets\"\n", e.table, generatedMark)
 	write("add chain inet %s postrouting { type filter hook postrouting priority srcnat + 1; policy accept; }\n", e.table)
-	for _, protocol := range []string{"tcp", "udp"} {
-		write("add rule inet %s postrouting oifname \"%s\" meta mark == 0x%08x meta l4proto %s counter queue num %d comment \"owned %s egress\"\n", e.table, e.options.bindInterface, e.mark, protocol, e.queue, protocol)
-	}
+	ports := e.options.profile.capturePorts()
+	egress := fmt.Sprintf("oifname \"%s\" meta mark == 0x%08x", e.options.bindInterface, e.mark)
+	e.writeQueueRules(write, "postrouting", egress, "egress", "dport", ports)
 	write("add chain inet %s input { type filter hook input priority filter; policy accept; }\n", e.table)
-	for _, protocol := range []string{"tcp", "udp"} {
-		write("add rule inet %s input iifname \"%s\" socket mark == 0x%08x meta l4proto %s counter queue num %d comment \"owned %s ingress\"\n", e.table, e.options.bindInterface, e.mark, protocol, e.queue, protocol)
-	}
+	ingress := fmt.Sprintf("iifname \"%s\" socket mark == 0x%08x", e.options.bindInterface, e.mark)
+	e.writeQueueRules(write, "input", ingress, "ingress", "sport", ports)
 	return builder.String()
+}
+
+func (e *linuxEngine) writeQueueRules(write func(string, ...any), chain, owner, direction, remote string, scope capturePorts) {
+	prefix := owner + " "
+	if scope.tcp != nil || scope.udp != nil {
+		owned := chain + "_owned"
+		write("add chain inet %s %s\n", e.table, owned)
+		write("add rule inet %s %s meta l4proto { tcp, udp } %s jump %s\n", e.table, chain, owner, owned)
+		chain, prefix = owned, ""
+	}
+	for _, item := range []struct {
+		protocol string
+		ports    []capturePortRange
+	}{{"tcp", scope.tcp}, {"udp", scope.udp}} {
+		if item.ports != nil {
+			values := make([]string, 0, len(item.ports))
+			for _, span := range item.ports {
+				value := fmt.Sprint(span.first)
+				if span.first != span.last {
+					value += fmt.Sprintf("-%d", span.last)
+				}
+				values = append(values, value)
+			}
+			set := "{ " + strings.Join(values, ", ") + " }"
+			outside := "tcp " + remote + " != " + set
+			if item.protocol == "udp" {
+				outside = "udp sport != " + set + " udp dport != " + set
+			}
+			// Port comparisons only on whole IPv4 datagrams and ordinary IPv6
+			// headers. Fragments and IPv6 extension chains retain the old path.
+			write("add rule inet %s %s ip frag-off & 0x3fff == 0 %s counter return comment \"outside %s %s\"\n", e.table, chain, outside, item.protocol, direction)
+			write("add rule inet %s %s ip6 nexthdr %s %s counter return comment \"outside %s %s\"\n", e.table, chain, item.protocol, outside, item.protocol, direction)
+		}
+		write("add rule inet %s %s %smeta l4proto %s counter queue num %d comment \"owned %s %s\"\n", e.table, chain, prefix, item.protocol, e.queue, item.protocol, direction)
+	}
 }
 
 // installTable applies the ownership table in one atomic transaction.

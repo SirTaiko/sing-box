@@ -399,15 +399,44 @@ func (e *windowsEngine) Control(network string, address string, conn syscall.Raw
 }
 
 func (e *windowsEngine) buildFilter() string {
-	tcpSource := portRangePredicate("tcp.SrcPort", e.reservationsFor("tcp"))
-	udpSource := portRangePredicate("udp.SrcPort", e.reservationsFor("udp"))
-	tcpDestination := portRangePredicate("tcp.DstPort", e.reservationsFor("tcp"))
-	udpDestination := portRangePredicate("udp.DstPort", e.reservationsFor("udp"))
+	scope := e.options.profile.capturePorts()
+	filter := e.ownershipFilter(scope)
+	if len(filter) >= maxWindivertFilterLength {
+		return e.ownershipFilter(capturePorts{})
+	}
+	return filter
+}
+
+func (e *windowsEngine) ownershipFilter(scope capturePorts) string {
+	owned := func(protocol, local, remote string, ports []capturePortRange) string {
+		owner := portRangePredicate(protocol+"."+local, e.reservationsFor(protocol))
+		if ports == nil {
+			return owner
+		}
+		nextHeader := 6
+		fields := []string{protocol + "." + remote}
+		if protocol == "udp" {
+			nextHeader = 17
+			// For an unconnected socket the peer may send the first datagram.
+			fields = append(fields, protocol+"."+local)
+		}
+		keep := []string{"fragment", fmt.Sprintf("(ipv6 and ipv6.NextHdr != %d)", nextHeader)}
+		for _, field := range fields {
+			for _, span := range ports {
+				if span.first == span.last {
+					keep = append(keep, fmt.Sprintf("%s == %d", field, span.first))
+				} else {
+					keep = append(keep, fmt.Sprintf("(%s >= %d and %s <= %d)", field, span.first, field, span.last))
+				}
+			}
+		}
+		return "(" + owner + ") and (" + strings.Join(keep, " or ") + ")"
+	}
 	return fmt.Sprintf(
 		"!impostor and !loopback and ifIdx == %d and subIfIdx == 0 and ((outbound and ((%s) or (%s))) or (inbound and ((%s) or (%s))))",
 		e.options.interfaceIndex,
-		tcpSource, udpSource,
-		tcpDestination, udpDestination,
+		owned("tcp", "SrcPort", "DstPort", scope.tcp), owned("udp", "SrcPort", "DstPort", scope.udp),
+		owned("tcp", "DstPort", "SrcPort", scope.tcp), owned("udp", "DstPort", "SrcPort", scope.udp),
 	)
 }
 
