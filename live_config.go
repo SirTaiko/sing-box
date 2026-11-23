@@ -26,6 +26,7 @@ import (
 )
 
 type liveRuntime struct {
+	view        *policyView
 	ctx         context.Context
 	path        string
 	box         *Box
@@ -41,19 +42,22 @@ type liveRuntime struct {
 }
 
 type routingPolicy struct {
-	live           *liveRuntime
-	config         option.Options
-	router         *route.Router
-	dns            *dns.Router
-	out            *outbound.Manager
-	end            *endpoint.Manager
-	transports     *dns.TransportManager
-	refs           atomic.Int64
-	drained        chan struct{}
-	assets         map[any]*policyAsset
-	resources      liveResources
-	flows          atomic.Pointer[flowAssetIndex]
-	restoreEngines []func() error
+	live              *liveRuntime
+	config            option.Options
+	router            *route.Router
+	dns               *dns.Router
+	out               *outbound.Manager
+	end               *endpoint.Manager
+	transports        *dns.TransportManager
+	refs              atomic.Int64
+	drained           chan struct{}
+	assets            map[any]*policyAsset
+	resources         liveResources
+	flows             atomic.Pointer[flowAssetIndex]
+	restoreEngines    []func() error
+	construction      *policyView
+	preparing         context.Context
+	cancelPreparation context.CancelFunc
 }
 
 // An unchanged transport (especially FakeIP), endpoint or outbound may be
@@ -90,6 +94,9 @@ func (a *policyAsset) dropFlow() {
 }
 
 func (p *routingPolicy) release() {
+	if p.cancelPreparation != nil {
+		p.cancelPreparation()
+	}
 	for _, asset := range p.assets {
 		if asset.users.Add(-1) != 0 || asset.scope == nil {
 			continue
@@ -118,6 +125,14 @@ func (p *routingPolicy) release() {
 	}
 }
 func (p *routingPolicy) abort(cause error) error {
+	if p.construction != nil {
+		p.live.readers.Lock()
+		p.construction.staged.Store(nil)
+		p.live.readers.Unlock()
+		p.cancelPreparation()
+		p.dropReader()
+		<-p.drained
+	}
 	p.release()
 	for _, restore := range p.restoreEngines {
 		cause = errors.Join(cause, restore())
@@ -130,33 +145,35 @@ func newLiveRuntime(ctx context.Context, path string, o option.Options, r *route
 	p := &routingPolicy{live: h, config: o, router: r, dns: d, out: out, end: end, transports: transports, assets: make(map[any]*policyAsset)}
 	p.drained = make(chan struct{})
 	p.refs.Store(1)
+	h.view = newPolicyView(h)
 	h.active.Store(p)
 	return h
 }
 func (h *liveRuntime) adoptInitial(p *routingPolicy) {
 	root := h.box.scope
-	p.own(p.router, root.Child(p.router))
-	p.own(p.dns, root.Child(p.dns))
+	p.own(p.router, root.UnlinkChild(h.box.router))
+	p.own(p.dns, root.UnlinkChild(h.box.dnsRouter))
 	add := func(manager adapter.Lifecycle, obj any) {
 		var scope *adapter.Scope
 		if life, ok := obj.(adapter.Lifecycle); ok {
 			if parent := root.Child(manager); parent != nil {
-				scope = parent.Child(life)
+				scope = parent.UnlinkChild(life)
 			}
 		}
 		p.own(obj, scope)
 	}
 	for _, ob := range p.out.Outbounds() {
-		add(p.out, ob)
+		add(h.box.outbound, ob)
 	}
 	for _, ep := range p.end.Endpoints() {
-		add(p.end, ep)
+		add(h.box.endpoint, ep)
 	}
 	for _, t := range p.transports.Transports() {
-		add(p.transports, t)
+		add(h.box.dnsTransport, t)
 	}
 	p.resources = describeLiveResources(p.config)
 	p.indexFlowAssets()
+	h.view.finishBindings(p)
 	h.initialized = true
 }
 func (p *routingPolicy) dropReader() {
@@ -311,33 +328,22 @@ func (h *liveRuntime) ApplyRuntimeConfig(ctx context.Context, digest []byte, sel
 		}
 		selector.SelectRuntimeOutbound(selected, previousTag)
 	}
+	p.construction.finishBindings(p)
 	h.readers.Lock()
 	h.active.Store(p)
+	p.construction.staged.Store(nil)
 	h.readers.Unlock()
 	h.closeReroutedConnections(old, p)
 	if p.dns != old.dns {
 		p.dns.ClearCache()
 	}
 	h.box.referenceManager.Reconfigure(h.ServiceContext(h.ctx), next)
-	// A retired corporate login or packet-interception process must stop even
-	// if another, unrelated connection still pins the previous routing rules.
+	// Stop new probes on retired groups. The policy assets own the actual
+	// scopes until lookup readers and in-flight connections release them.
 	for _, ob := range old.out.Outbounds() {
 		if g, ok := ob.(*group.URLTest); ok {
 			if _, shared := p.assets[ob]; !shared {
 				g.Retire()
-			}
-		}
-	}
-	for _, ep := range old.end.Endpoints() {
-		if _, kept := p.assets[ep]; !kept && old.assets[ep].scope != nil {
-			_ = old.assets[ep].scope.Close()
-		}
-	}
-	for _, ob := range old.config.Outbounds {
-		if d, ok := ob.Options.(*option.DirectOutboundOptions); ok && d.Zapret != nil {
-			obj, _ := old.out.Outbound(ob.Tag)
-			if _, kept := p.assets[obj]; !kept && old.assets[obj].scope != nil {
-				_ = old.assets[obj].scope.Close()
 			}
 		}
 	}

@@ -46,15 +46,15 @@ type Box struct {
 	logFactory          log.Factory
 	logger              log.ContextLogger
 	network             *route.NetworkManager
-	endpoint            *endpoint.Manager
+	endpoint            adapter.EndpointManager
 	inbound             *inbound.Manager
-	outbound            *outbound.Manager
+	outbound            adapter.OutboundManager
 	service             *boxService.Manager
 	certificateProvider *boxCertificate.Manager
-	dnsTransport        *dns.TransportManager
-	dnsRouter           *dns.Router
+	dnsTransport        adapter.DNSTransportManager
+	dnsRouter           adapter.DNSRouter
 	connection          *route.ConnectionManager
-	router              *route.Router
+	router              adapter.Router
 	referenceManager    *route.ReferenceManager
 	httpClientService   adapter.LifecycleService
 	internalService     []adapter.LifecycleService
@@ -211,23 +211,40 @@ func New(options Options) (*Box, error) {
 	internalServices = append(internalServices, netnsManager)
 	dnsOptions := common.PtrValueOrDefault(options.DNS)
 	endpointManager := endpoint.NewManager(endpointRegistry)
-	inboundManager := inbound.NewManager(inboundRegistry, endpointManager)
+
 	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, routeOptions.Final)
 	dnsTransportManager := dns.NewTransportManager(dnsTransportRegistry, outboundManager, dnsOptions.Final)
 	serviceManager := boxService.NewManager(serviceRegistry)
 	certificateProviderManager := boxCertificate.NewManager(certificateProviderRegistry)
-	service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
+	var live *liveRuntime
+	if hasRuntimeConfig {
+		live = newLiveRuntime(ctx, options.RuntimeConfigPath, options.Options, nil, nil, outboundManager, endpointManager, dnsTransportManager)
+		live.view.register(ctx)
+		service.MustRegister[adapter.RuntimeConfig](ctx, live)
+	} else {
+		service.MustRegister[adapter.EndpointManager](ctx, endpointManager)
+		service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
+		service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportManager)
+	}
+	inboundManager := inbound.NewManager(inboundRegistry, service.FromContext[adapter.EndpointManager](ctx))
 	service.MustRegister[adapter.InboundManager](ctx, inboundManager)
-	service.MustRegister[adapter.OutboundManager](ctx, outboundManager)
-	service.MustRegister[adapter.DNSTransportManager](ctx, dnsTransportManager)
 	service.MustRegister[adapter.ServiceManager](ctx, serviceManager)
 	service.MustRegister[adapter.CertificateProviderManager](ctx, certificateProviderManager)
-	dnsRouter, err := dns.NewRouter(ctx, logFactory, dnsOptions)
+	dnsCtx := ctx
+	if live != nil {
+		dnsCtx = policyContext(ctx)
+		service.MustRegister[adapter.DNSTransportManager](dnsCtx, dnsTransportManager)
+	}
+	dnsRouter, err := dns.NewRouter(dnsCtx, logFactory, dnsOptions)
 	if err != nil {
 		return nil, E.Cause(err, "initialize DNS router")
 	}
-	service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
-	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, dnsRouter)
+	if live != nil {
+		live.active.Load().dns = dnsRouter
+	} else {
+		service.MustRegister[adapter.DNSRouter](ctx, dnsRouter)
+		service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, dnsRouter)
+	}
 	connectionManager := route.NewConnectionManager(ctx, logFactory.NewLogger("connection"))
 	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
 	networkManager, err := route.NewNetworkManager(ctx, logFactory.NewLogger("network"), routeOptions, dnsOptions)
@@ -239,10 +256,21 @@ func New(options Options) (*Box, error) {
 	httpClientManager := httpclient.NewManager(ctx, logFactory.NewLogger("httpclient"), options.HTTPClients, routeOptions.DefaultHTTPClient)
 	service.MustRegister[adapter.HTTPClientManager](ctx, httpClientManager)
 	httpClientService := adapter.LifecycleService(httpClientManager)
-	router := route.NewRouter(ctx, logFactory, routeOptions, dnsOptions)
-	service.MustRegister[adapter.Router](ctx, router)
-	if hasRuntimeConfig {
-		err = router.InitializeLive(routeOptions.Rules, routeOptions.RuleSet, nil, nil, nil)
+	routeCtx := ctx
+	if live != nil {
+		routeCtx = policyContext(ctx)
+		p := live.active.Load()
+		p.registerManagers(routeCtx)
+	}
+	router := route.NewRouter(routeCtx, logFactory, routeOptions, dnsOptions)
+	service.MustRegister[adapter.Router](routeCtx, router)
+	if live != nil {
+		p := live.active.Load()
+		p.router = router
+		err = router.InitializeLive(ruleSetContext(ctx, p, dnsOptions.Rules), routeOptions.Rules, routeOptions.RuleSet, nil, nil, nil)
+		if err == nil {
+			bindDNSRuleSets(dnsCtx, &liveIngress{live.view}, p, dnsOptions.Rules)
+		}
 	} else {
 		err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
 	}
@@ -297,18 +325,8 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "initialize dns router")
 	}
-	var live *liveRuntime
-	var ingress adapter.Router = router
-	if hasRuntimeConfig {
-		live = newLiveRuntime(ctx, options.RuntimeConfigPath, options.Options, router, dnsRouter, outboundManager, endpointManager, dnsTransportManager)
-		ingress = &liveIngress{Router: router, live: live}
-		service.MustRegister[adapter.RuntimeConfig](ctx, live)
-	}
+	ingress := service.FromContext[adapter.Router](ctx)
 	resourceCtx := ctx
-	if live != nil {
-		resourceCtx = service.ExtendContext(ctx)
-		service.MustRegister[adapter.DNSRouter](resourceCtx, liveDNS{dnsRouter, live})
-	}
 	for i, endpointOptions := range options.Endpoints {
 		var tag string
 		if endpointOptions.Tag != "" {
@@ -388,7 +406,7 @@ func New(options Options) (*Box, error) {
 		}
 		err = outboundManager.Create(
 			outboundCtx,
-			router,
+			ingress,
 			logFactory.NewLogger(F.ToString("outbound/", outboundOptions.Type, "[", tag, "]")),
 			tag,
 			outboundOptions.Type,
@@ -419,7 +437,7 @@ func New(options Options) (*Box, error) {
 	outboundManager.Initialize(func() (adapter.Outbound, error) {
 		return direct.NewOutbound(
 			ctx,
-			router,
+			ingress,
 			logFactory.NewLogger("outbound/direct"),
 			"direct",
 			option.DirectOutboundOptions{},
@@ -515,11 +533,16 @@ func New(options Options) (*Box, error) {
 	}
 	if live != nil {
 		live.box = instance
+		instance.endpoint = liveEndpoints{live.view}
+		instance.outbound = liveOutbounds{live.view}
+		instance.dnsTransport = liveTransports{live.view}
+		instance.dnsRouter = liveDNS{live.view}
+		instance.router = ingress
 		view := live.ServiceContext(ctx)
 		service.MustRegister[adapter.Router](view, ingress)
 		networkManager.UseRoutingContext(view)
 		if mode := service.PtrFromContext[clashmode.Manager](ctx); mode != nil {
-			mode.SetDNSRouter(liveDNS{dnsRouter, live})
+			mode.SetDNSRouter(liveDNS{live.view})
 		}
 		referenceManager.Reconfigure(view, options.Options)
 	}
@@ -620,17 +643,15 @@ func (s *Box) preStart() error {
 	if err != nil {
 		return err
 	}
-	if s.live != nil {
-		s.live.mu.Lock()
-		if !s.live.initialized {
-			s.live.adoptInitial(s.live.active.Load())
-		}
-		s.live.mu.Unlock()
-	}
+
 	return nil
 }
 
 func (s *Box) start() error {
+	if s.live != nil {
+		s.live.mu.Lock()
+		defer s.live.mu.Unlock()
+	}
 	err := s.preStart()
 	if err != nil {
 		return err
@@ -695,6 +716,10 @@ func (s *Box) start() error {
 	if err != nil {
 		return err
 	}
+	if s.live != nil && !s.live.initialized {
+		s.live.adoptInitial(s.live.active.Load())
+	}
+
 	return nil
 }
 

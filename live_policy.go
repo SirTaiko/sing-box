@@ -63,7 +63,12 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 			err = p.abort(err)
 		}
 	}()
-	ctx := service.ExtendContext(h.box.scope.Context())
+	p.preparing, p.cancelPreparation = context.WithCancel(context.Background())
+	p.construction = newPolicyView(h)
+	p.construction.staged.Store(p)
+	assetCtx := policyContext(h.box.scope.Context())
+	p.construction.register(assetCtx)
+	ctx := policyContext(assetCtx)
 	ro := common.PtrValueOrDefault(opts.Route)
 	do := common.PtrValueOrDefault(opts.DNS)
 	oldRoute := common.PtrValueOrDefault(old.config.Route)
@@ -80,7 +85,7 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 			zapret = true
 		}
 	}
-	service.MustRegister[adapter.NetworkManager](ctx, policyNetwork{h.box.network, defaults, zapret})
+	service.MustRegister[adapter.NetworkManager](assetCtx, policyNetwork{h.box.network, defaults, zapret})
 	if shared {
 		p.resources = old.resources
 		p.flows.Store(old.flows.Load())
@@ -100,11 +105,7 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 		reuse = p.resources.reusable(old, reflect.DeepEqual(dnsPolicyOptions(do), dnsPolicyOptions(common.PtrValueOrDefault(old.config.DNS))))
 		p.end = endpoint.NewManager(service.FromContext[adapter.EndpointRegistry](ctx))
 		p.out = outbound.NewManager(service.FromContext[adapter.OutboundRegistry](ctx), p.end, ro.Final)
-		p.transports = dns.NewTransportManager(service.FromContext[adapter.DNSTransportRegistry](ctx), p.out, do.Final)
 	}
-	service.MustRegister[adapter.OutboundManager](ctx, p.out)
-	service.MustRegister[adapter.EndpointManager](ctx, p.end)
-	service.MustRegister[adapter.DNSTransportManager](ctx, p.transports)
 	var sets map[string]bool
 	shareDNS := shared
 	if !shared {
@@ -113,22 +114,26 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 	}
 	if !shared && shareDNS {
 		p.dns = old.dns
+		p.transports = old.transports
 		p.borrow(old, old.dns)
+	} else if !shareDNS {
+		p.transports = dns.NewTransportManager(service.FromContext[adapter.DNSTransportRegistry](ctx), p.out, do.Final)
 	}
+	dnsCtx := policyContext(assetCtx)
+	service.MustRegister[adapter.DNSTransportManager](dnsCtx, p.transports)
 	if !shareDNS {
-		p.dns, err = dns.NewRouter(ctx, h.box.logFactory, do)
+		p.dns, err = dns.NewRouter(dnsCtx, h.box.logFactory, do)
 		if err != nil {
 			return nil, err
 		}
-		p.own(p.dns, adapter.NewScope(ctx, h.box.logger))
+		p.own(p.dns, adapter.NewScope(dnsCtx, h.box.logger))
 	}
-	service.MustRegister[adapter.DNSRouter](ctx, p.dns)
-	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, p.dns)
+	p.registerManagers(ctx)
 	p.router = route.NewRouter(ctx, h.box.logFactory, ro, do)
-	h.box.router.CopyTrackersTo(p.router)
+	old.router.CopyTrackersTo(p.router)
 	p.own(p.router, adapter.NewScope(ctx, h.box.logger))
 	service.MustRegister[adapter.Router](ctx, p.router)
-	if err = p.router.InitializeLive(ro.Rules, ro.RuleSet, p.assets[p.router].scope, old.router, func(tag string) bool {
+	if err = p.router.InitializeLive(ruleSetContext(assetCtx, p, do.Rules), ro.Rules, ro.RuleSet, p.assets[p.router].scope, old.router, func(tag string) bool {
 		// A source with a different DNS validator must be rebuilt when either
 		// validator uses DNS rules. Both empty validators are equivalent.
 		return shared || (sets[tag] && (shareDNS || (len(do.Rules) == 0 && len(common.PtrValueOrDefault(old.config.DNS).Rules) == 0)))
@@ -137,11 +142,12 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 	}
 	var resources []adapter.Lifecycle
 	if !shared {
-		resources, err = h.buildPolicyResources(ctx, old, p, reuse)
+		resources, err = h.buildPolicyResources(assetCtx, old, p, reuse)
 		if err != nil {
 			return nil, err
 		}
 		if !shareDNS {
+			bindDNSRuleSets(dnsCtx, &liveIngress{p.construction}, p, do.Rules)
 			if err = p.dns.Initialize(do.Rules); err != nil {
 				return nil, err
 			}
@@ -219,39 +225,43 @@ func orderedResources[T interface {
 func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingPolicy, reuse map[liveResourceKey]bool) ([]adapter.Lifecycle, error) {
 	var start []adapter.Lifecycle
 	logger := h.box.logFactory
-	resourceCtx := service.ExtendContext(ctx)
-	service.MustRegister[adapter.DNSRouter](resourceCtx, liveDNS{p.dns, h})
-	ingress := &liveIngress{Router: p.router, live: h}
+	ingress := &liveIngress{p.construction}
 	// Dialer construction resolves explicit DNS transport tags immediately.
 	// Populate the staged transport registry before constructing any endpoint or outbound.
 	do := common.PtrValueOrDefault(p.config.DNS)
 	servers := desktopDNSServers(do)
-	for _, t := range servers {
-		if t.Type == C.DNSTypeFakeIP && old.transports.FakeIP() != nil {
-			existing := old.transports.FakeIP()
-			if existing.Tag() != t.Tag {
-				return nil, errors.New("cannot change the live fake-IP pool")
-			}
-			if err := p.transports.Add(existing); err != nil {
+	if p.transports == old.transports {
+		for _, t := range p.transports.Transports() {
+			p.borrow(old, t)
+		}
+	} else {
+		for _, t := range servers {
+			if t.Type == C.DNSTypeFakeIP && old.transports.FakeIP() != nil {
+				existing := old.transports.FakeIP()
+				if existing.Tag() != t.Tag {
+					return nil, errors.New("cannot change the live fake-IP pool")
+				}
+				if err := p.transports.Add(existing); err != nil {
+					return nil, err
+				}
+				p.borrow(old, existing)
+			} else if reuse[transportKey(t.Tag)] {
+				existing, _ := old.transports.Transport(t.Tag)
+				if err := p.transports.Add(existing); err != nil {
+					return nil, err
+				}
+				p.borrow(old, existing)
+			} else if err := p.transports.Create(ctx, logger.NewLogger("dns/"+t.Tag), t.Tag, t.Type, t.Options); err != nil {
 				return nil, err
 			}
-			p.borrow(old, existing)
-		} else if reuse[transportKey(t.Tag)] {
-			existing, _ := old.transports.Transport(t.Tag)
-			if err := p.transports.Add(existing); err != nil {
+		}
+		// OS and browsers may still use addresses issued before switching to legacy DNS.
+		if previous := old.transports.FakeIP(); previous != nil && p.transports.FakeIP() == nil {
+			if err := p.transports.Add(previous); err != nil {
 				return nil, err
 			}
-			p.borrow(old, existing)
-		} else if err := p.transports.Create(ctx, logger.NewLogger("dns/"+t.Tag), t.Tag, t.Type, t.Options); err != nil {
-			return nil, err
+			p.borrow(old, previous)
 		}
-	}
-	// OS and browsers may still use addresses issued before switching to legacy DNS.
-	if previous := old.transports.FakeIP(); previous != nil && p.transports.FakeIP() == nil {
-		if err := p.transports.Add(previous); err != nil {
-			return nil, err
-		}
-		p.borrow(old, previous)
 	}
 	for _, e := range p.config.Endpoints {
 		if e.Type != C.TypeOpenConnect {
@@ -263,7 +273,7 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 				return nil, err
 			}
 			p.borrow(old, existing)
-		} else if err := p.end.Create(resourceCtx, ingress, logger.NewLogger("endpoint/"+e.Tag), e.Tag, e.Type, e.Options); err != nil {
+		} else if err := p.end.Create(ctx, ingress, logger.NewLogger("endpoint/"+e.Tag), e.Tag, e.Type, e.Options); err != nil {
 			return nil, err
 		}
 	}
@@ -277,7 +287,7 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 				return nil, err
 			}
 			p.borrow(old, existing)
-		} else if err := p.out.Create(resourceCtx, p.router, logger.NewLogger("outbound/"+ob.Tag), ob.Tag, ob.Type, ob.Options); err != nil {
+		} else if err := p.out.Create(ctx, ingress, logger.NewLogger("outbound/"+ob.Tag), ob.Tag, ob.Type, ob.Options); err != nil {
 			return nil, err
 		}
 	}
@@ -323,4 +333,12 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 		return nil, errors.New("missing default DNS transport")
 	}
 	return start, nil
+}
+
+func (p *routingPolicy) registerManagers(ctx context.Context) {
+	service.MustRegister[adapter.OutboundManager](ctx, p.out)
+	service.MustRegister[adapter.EndpointManager](ctx, p.end)
+	service.MustRegister[adapter.DNSTransportManager](ctx, p.transports)
+	service.MustRegister[adapter.DNSRouter](ctx, p.dns)
+	service.MustRegister[adapter.DNSRuleSetUpdateValidator](ctx, p.dns)
 }

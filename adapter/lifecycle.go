@@ -132,6 +132,17 @@ func (s *Scope) Child(component Lifecycle) *Scope {
 	return s.children[component]
 }
 
+// UnlinkChild lets the live policy own the component without keeping the
+// component as a map key until process exit. The root's idempotent cleanup
+// remains as a fallback, preserving shutdown order for still-active assets.
+func (s *Scope) UnlinkChild(component Lifecycle) *Scope {
+	s.access.Lock()
+	defer s.access.Unlock()
+	child := s.children[component]
+	delete(s.children, component)
+	return child
+}
+
 func (s *Scope) Close() error {
 	s.access.Lock()
 	s.cancel()

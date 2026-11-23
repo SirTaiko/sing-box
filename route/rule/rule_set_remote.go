@@ -36,7 +36,6 @@ type RemoteRuleSet struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	logger         logger.ContextLogger
-	outbound       adapter.OutboundManager
 	tag            string
 	url            string
 	urlHash        [32]byte
@@ -72,7 +71,6 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 	return &RemoteRuleSet{
 		ctx:            ctx,
 		cancel:         cancel,
-		outbound:       service.FromContext[adapter.OutboundManager](ctx),
 		logger:         logger,
 		tag:            tag,
 		url:            url,

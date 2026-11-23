@@ -25,6 +25,7 @@ import (
 	mdns "github.com/miekg/dns"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
@@ -836,5 +837,80 @@ func TestDesktopLiveLongFlowsReleaseLookupPolicy(t *testing.T) {
 		for _, existing := range flows {
 			echo(existing)
 		}
+	}
+}
+
+func TestDesktopRetiredManagersAreCollectible(t *testing.T) {
+	s := newSession(t, nil)
+	servers := s.cfg["dns"].(object)["servers"].([]object)
+	s.cfg["dns"].(object)["servers"] = append(servers, object{"type": "udp", "tag": "changing", "server": "127.0.0.1", "server_port": 53})
+	spare := s.cfg["dns"].(object)["servers"].([]object)[1]
+	route := s.cfg["route"].(object)
+	route["rule_set"] = []object{{"type": "inline", "tag": "kept", "rules": []object{{"domain": []string{"kept.test"}}}}}
+	route["rules"] = []object{{"rule_set": "kept", "outbound": "a"}}
+	var downloads atomic.Int32
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		io.WriteString(w, `{"version":3,"rules":[{"domain":"remote.test"}]}`)
+	}))
+	defer remote.Close()
+	route["rule_set"] = append(route["rule_set"].([]object), object{"type": "remote", "tag": "remote", "format": "source", "url": remote.URL, "download_detour": "a"})
+	route["rules"] = []object{{"rule_set": []string{"kept", "remote"}, "outbound": "a"}}
+	obs := append(s.cfg["outbounds"].([]object), object{"type": "vless", "tag": "t", "server": "127.0.0.1", "server_port": 12345, "uuid": "00000000-0000-4000-8000-000000000001"})
+	if C.WithQUIC {
+		obs = append(obs, object{"type": "hysteria2", "tag": "h", "server": "127.0.0.1", "server_port": 12346, "password": "test-only", "tls": object{"enabled": true, "insecure": true}})
+	}
+	s.cfg["outbounds"] = obs
+	var generations []func() [5]bool
+	for i := 0; i < 12; i++ {
+		generations = append(generations, s.core.PolicyObjectsForTest())
+		spare["server_port"] = 20000 + i
+		if err := s.apply(t, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if downloads.Load() != 1 {
+		t.Fatalf("unchanged remote list downloaded %d times", downloads.Load())
+	}
+	var alive [5]int
+	for end := time.Now().Add(2 * time.Second); ; {
+		runtime.GC() // Only the reachability test requests a collection.
+		alive = [5]int{}
+		for _, probe := range generations {
+			for k, kept := range probe() {
+				if kept {
+					alive[k]++
+				}
+			}
+		}
+		if alive == ([5]int{}) {
+			break
+		}
+		if time.Now().After(end) {
+			t.Fatalf("retired router/DNS/outbound/endpoint/transport managers still reachable: %v", alive)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	runtime.KeepAlive(s)
+}
+
+func TestDesktopLazyDetourKeepsItsSelectedResource(t *testing.T) {
+	s := newSession(t, nil)
+	manager := service.FromContext[adapter.OutboundManager](s.view)
+	old, _ := manager.Outbound("a")
+	lazy := dialer.NewDetour(manager, "a", true).(*dialer.DetourDialer)
+	for _, ob := range s.cfg["outbounds"].([]object) {
+		if ob["tag"] == "a" {
+			ob["connect_timeout"] = "3s"
+		}
+	}
+	if err := s.apply(t, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if now, _ := manager.Outbound("a"); now == old {
+		t.Fatal("fixture did not replace the outbound")
+	}
+	if pinned, err := lazy.Dialer(); err != nil || pinned != old {
+		t.Fatal("late detour was redirected to another revision", err)
 	}
 }

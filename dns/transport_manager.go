@@ -17,7 +17,6 @@ var _ adapter.DNSTransportManager = (*TransportManager)(nil)
 
 type TransportManager struct {
 	registry                 adapter.DNSTransportRegistry
-	outbound                 adapter.OutboundManager
 	defaultTag               string
 	access                   sync.RWMutex
 	transports               []adapter.DNSTransport
@@ -27,10 +26,9 @@ type TransportManager struct {
 	fakeIPTransport          adapter.FakeIPTransport
 }
 
-func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter.OutboundManager, defaultTag string) *TransportManager {
+func NewTransportManager(registry adapter.DNSTransportRegistry, _ adapter.OutboundManager, defaultTag string) *TransportManager {
 	return &TransportManager{
 		registry:       registry,
-		outbound:       outbound,
 		defaultTag:     defaultTag,
 		transportByTag: make(map[string]adapter.DNSTransport),
 	}

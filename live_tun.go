@@ -55,7 +55,7 @@ func (h *liveRuntime) replaceTun(current adapter.Inbound, before, after option.I
 	ctx := h.box.scope.Context()
 	registry := service.FromContext[adapter.InboundRegistry](ctx)
 	open := func(o option.Inbound) (adapter.Inbound, *adapter.Scope, error) {
-		ingress := &liveIngress{Router: h.box.router, live: h}
+		ingress := &liveIngress{h.view}
 		t, err := registry.Create(ctx, ingress, h.box.logger, o.Tag, o.Type, o.Options)
 		if err != nil {
 			return nil, nil, err
