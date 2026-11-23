@@ -35,6 +35,7 @@ var (
 )
 
 type Manager struct {
+	routeTraffic            *routeTrafficShards
 	connections             compatible.Map[uuid.UUID, Tracker]
 	closedConnectionsAccess sync.Mutex
 	closedConnections       list.List[TrackerMetadata]

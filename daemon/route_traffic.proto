@@ -1,0 +1,18 @@
+syntax = "proto3";
+package daemon;
+import "google/protobuf/empty.proto";
+option go_package = "github.com/sagernet/sing-box/daemon";
+
+// Cumulative application route counters from the local mVPN API.
+service RouteTraffic {
+  rpc Subscribe(google.protobuf.Empty) returns (stream RouteTrafficTotals);
+}
+
+message RouteTrafficTotals {
+  uint64 vpn_upload = 1;
+  uint64 vpn_download = 2;
+  uint64 direct_upload = 3;
+  uint64 direct_download = 4;
+  // Monotonic interval between snapshots. Zero starts a new baseline.
+  uint64 elapsed_nanos = 5;
+}

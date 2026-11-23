@@ -10,6 +10,7 @@ import (
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/log"
@@ -82,6 +83,9 @@ func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	grpcServer := daemon.NewServer(startedService, s.options.Secret)
 	if runtime != nil {
 		daemon.RegisterRuntimeConfigServer(grpcServer, &runtimeConfig{host: runtime})
+		if manager := service.PtrFromContext[trafficcontrol.Manager](ctx); manager != nil {
+			daemon.RegisterRouteTrafficServer(grpcServer, &routeTrafficService{manager: manager})
+		}
 	}
 	if s.options.Secret != "" {
 		daemon.RegisterDNSLookupServer(grpcServer, &dnsLookup{

@@ -165,6 +165,9 @@ func New(options Options) (*Box, error) {
 	needAPIService := common.Any(options.Services, func(it option.Service) bool {
 		return it.Type == C.TypeAPI
 	})
+	hasRuntimeConfig := options.RuntimeConfigPath != "" && common.Any(options.Services, func(it option.Service) bool {
+		return it.Type == C.TypeAPI && it.Tag == "mvpn-api"
+	})
 	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
 		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
 	}
@@ -244,6 +247,9 @@ func New(options Options) (*Box, error) {
 	}
 	if needClashAPI || needAPIService || options.PlatformLogWriter != nil {
 		trafficManager := trafficcontrol.NewManager()
+		if hasRuntimeConfig {
+			trafficManager.EnableRouteTraffic()
+		}
 		service.MustRegisterPtr(ctx, trafficManager)
 		router.AppendTracker(trafficManager)
 		internalServices = append(internalServices, trafficManager)
@@ -289,7 +295,7 @@ func New(options Options) (*Box, error) {
 	}
 	var live *liveRuntime
 	var ingress adapter.Router = router
-	if options.RuntimeConfigPath != "" && common.Any(options.Services, func(s option.Service) bool { return s.Tag == "mvpn-api" && s.Type == C.TypeAPI }) {
+	if hasRuntimeConfig {
 		live = newLiveRuntime(ctx, options.RuntimeConfigPath, options.Options, router, dnsRouter, outboundManager, endpointManager, dnsTransportManager)
 		ingress = &liveIngress{Router: router, live: live}
 		service.MustRegister[adapter.RuntimeConfig](ctx, live)
