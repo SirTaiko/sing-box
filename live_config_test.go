@@ -933,3 +933,127 @@ func TestDesktopOnlyColdRouterForcesGC(t *testing.T) {
 		t.Fatalf("hot apply forced %d collections", after.NumForcedGC-before.NumForcedGC)
 	}
 }
+
+// Hold a background fetch while reusing and then removing the real rule set.
+// The old TCP connection must survive both successful and failed refreshes.
+func TestDesktopLiveRemoteUpdaterLifetime(t *testing.T) {
+	s := newSession(t, nil)
+	var calls atomic.Int32
+	began := make(chan time.Time, 32)
+	blocked, cancelled := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		began <- time.Now()
+		switch n {
+		case 1:
+			io.WriteString(w, `{"version":3,"rules":[{"domain":"old.test"}]}`)
+		case 2, 3:
+			http.Error(w, "temporary fixture error", http.StatusServiceUnavailable)
+		case 4:
+			io.WriteString(w, `{"version":3,"rules":[{"domain":"new.test"}]}`)
+		case 5:
+			close(blocked)
+			select {
+			case <-r.Context().Done():
+				close(cancelled)
+			case <-release:
+			}
+		default:
+			http.Error(w, "extra updater", http.StatusConflict)
+		}
+	}))
+	t.Cleanup(server.Close)
+	const interval = 100 * time.Millisecond
+	route := s.cfg["route"].(object)
+	route["rule_set"] = []object{{"type": "remote", "tag": "changed-list", "format": "source", "url": server.URL, "download_detour": "a", "update_interval": "100ms"}}
+	makeRules := func(i int) []object {
+		return []object{{"rule_set": "changed-list", "outbound": "b"}, {"domain": fmt.Sprintf("other-%d.test", i), "outbound": "a"}}
+	}
+	route["rules"] = makeRules(0)
+	if err := s.apply(t, "direct"); err != nil {
+		t.Fatal(err)
+	}
+	set, found := s.core.Router().RuleSet("changed-list")
+	if !found {
+		t.Fatal("missing remote resource")
+	}
+	echo, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		conn, e := echo.Accept()
+		if e == nil {
+			defer conn.Close()
+			io.Copy(conn, conn)
+		}
+	}()
+	c, _ := s.connection(t, echo.Addr().String())
+	defer c.Close()
+	ping := func() {
+		t.Helper()
+		c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, e := c.Write([]byte("ok")); e != nil {
+			t.Fatal(e)
+		}
+		var b [2]byte
+		if _, e := io.ReadFull(c, b[:]); e != nil || string(b[:]) != "ok" {
+			t.Fatal("connection interrupted", e)
+		}
+	}
+	ping()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	select {
+	case <-blocked:
+	case <-time.After(4 * time.Second):
+		t.Fatal("no periodic fetch")
+	}
+	for i := 0; i < 4; i++ {
+		route["rules"] = makeRules(i + 1)
+		if err := s.apply(t, "direct"); err != nil {
+			t.Fatal(err)
+		}
+		if next, _ := s.core.Router().RuleSet("changed-list"); next != set {
+			t.Fatal("updater resource replaced during reuse")
+		}
+		ping()
+	}
+	if !set.Match(&adapter.InboundContext{Domain: "new.test"}) {
+		t.Fatal("successful refresh was not installed")
+	}
+	var previous time.Time
+	for i := 0; i < 5; i++ {
+		now := <-began
+		if i > 0 && now.Sub(previous) < interval*3/4 {
+			t.Fatal("retry before next interval", now.Sub(previous))
+		}
+		previous = now
+	}
+	time.Sleep(2 * interval)
+	if calls.Load() != 5 {
+		t.Fatal("more than one updater", calls.Load())
+	}
+	runtime.ReadMemStats(&after)
+	if after.NumForcedGC != before.NumForcedGC {
+		t.Errorf("updater forced %d GC cycles", after.NumForcedGC-before.NumForcedGC)
+	}
+	delete(route, "rule_set")
+	route["rules"] = []object{}
+	if err := s.apply(t, "direct"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("last release did not cancel HTTP request")
+	}
+	time.Sleep(2 * interval)
+	if calls.Load() != 5 {
+		t.Fatal("fetch after last release")
+	}
+	ping()
+}

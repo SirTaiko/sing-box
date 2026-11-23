@@ -232,12 +232,12 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	return nil
 }
 
-func (s *RemoteRuleSet) updateOnce() {
-	err := s.fetch(s.ctx, false)
+func (s *RemoteRuleSet) updateOnce(ctx context.Context) {
+	err := s.fetch(ctx, false)
 	if err != nil {
 		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
-	} else if s.refs.Load() == 0 {
-		s.rules = nil
+	} else {
+		s.Cleanup()
 	}
 }
 

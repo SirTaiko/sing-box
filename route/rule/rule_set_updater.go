@@ -2,7 +2,7 @@ package rule
 
 import (
 	"context"
-	"runtime"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -12,6 +12,8 @@ type RuleSetUpdater struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	ruleSets []*RemoteRuleSet
+	start    sync.Once
+	done     chan struct{}
 }
 
 func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSetUpdater {
@@ -30,19 +32,24 @@ func NewRuleSetUpdater(ctx context.Context, ruleSets []adapter.RuleSet) *RuleSet
 		ctx:      ctx,
 		cancel:   cancel,
 		ruleSets: remoteRuleSets,
+		done:     make(chan struct{}),
 	}
 }
 
 func (u *RuleSetUpdater) Start() {
-	go u.loopUpdate()
+	u.start.Do(func() { go u.loopUpdate() })
 }
 
 func (u *RuleSetUpdater) Close() error {
 	u.cancel()
+	// Also finish a resource discarded before its Started stage.
+	u.start.Do(func() { close(u.done) })
+	<-u.done
 	return nil
 }
 
 func (u *RuleSetUpdater) loopUpdate() {
+	defer close(u.done)
 	nextUpdates := make([]time.Time, len(u.ruleSets))
 	for i, ruleSet := range u.ruleSets {
 		nextUpdates[i] = ruleSet.lastUpdated.Add(ruleSet.updateInterval)
@@ -56,17 +63,15 @@ func (u *RuleSetUpdater) loopUpdate() {
 		case <-timer.C:
 		}
 		now := time.Now()
-		var updated bool
 		for i, ruleSet := range u.ruleSets {
+			if u.ctx.Err() != nil {
+				return
+			}
 			if now.Before(nextUpdates[i]) {
 				continue
 			}
-			ruleSet.updateOnce()
+			ruleSet.updateOnce(u.ctx)
 			nextUpdates[i] = now.Add(ruleSet.updateInterval)
-			updated = true
-		}
-		if updated {
-			runtime.GC()
 		}
 		timer.Reset(waitUntilNext(nextUpdates))
 	}
