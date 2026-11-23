@@ -41,6 +41,7 @@ type liveRuntime struct {
 }
 
 type routingPolicy struct {
+	live           *liveRuntime
 	config         option.Options
 	router         *route.Router
 	dns            *dns.Router
@@ -50,18 +51,25 @@ type routingPolicy struct {
 	refs           atomic.Int64
 	drained        chan struct{}
 	assets         map[any]*policyAsset
+	resources      liveResources
+	flows          atomic.Pointer[flowAssetIndex]
 	restoreEngines []func() error
 }
 
 // An unchanged transport (especially FakeIP), endpoint or outbound may be
 // referenced by several routing revisions. Its lifetime ends with its last user.
 type policyAsset struct {
-	scope *adapter.Scope
-	users atomic.Int32
+	scope   *adapter.Scope
+	users   atomic.Int32
+	flows   atomic.Int64
+	drained chan struct{}
 }
 
 func (p *routingPolicy) own(obj any, scope *adapter.Scope) {
 	a := &policyAsset{scope: scope}
+	if scope != nil {
+		a.drained = make(chan struct{})
+	}
 	a.users.Store(1)
 	p.assets[obj] = a
 }
@@ -70,10 +78,42 @@ func (p *routingPolicy) borrow(old *routingPolicy, obj any) {
 	a.users.Add(1)
 	p.assets[obj] = a
 }
+
+// Mark retirement in the same atomic word as the flow count: a transient
+// zero while policies can still accept flows must never signal final drain.
+const retiredAsset int64 = 1 << 62
+
+func (a *policyAsset) dropFlow() {
+	if a.flows.Add(-1) == retiredAsset {
+		close(a.drained)
+	}
+}
+
 func (p *routingPolicy) release() {
-	for _, a := range p.assets {
-		if a.users.Add(-1) == 0 && a.scope != nil {
-			_ = a.scope.Close()
+	for _, asset := range p.assets {
+		if asset.users.Add(-1) != 0 || asset.scope == nil {
+			continue
+		}
+		if asset.flows.Add(retiredAsset) == retiredAsset {
+			_ = asset.scope.Close()
+			continue
+		}
+		live := p.live
+		select {
+		case <-live.stop:
+			_ = asset.scope.Close()
+		default:
+			// Closing an outbound can wait for I/O. Keep it off the flow's
+			// own close callback and retain only this asset while waiting.
+			live.cleanup.Add(1)
+			go func(a *policyAsset) {
+				defer live.cleanup.Done()
+				select {
+				case <-a.drained:
+				case <-live.stop:
+				}
+				_ = a.scope.Close()
+			}(asset)
 		}
 	}
 }
@@ -87,7 +127,7 @@ func (p *routingPolicy) abort(cause error) error {
 func newLiveRuntime(ctx context.Context, path string, o option.Options, r *route.Router, d *dns.Router, out *outbound.Manager, end *endpoint.Manager, transports *dns.TransportManager) *liveRuntime {
 	h := &liveRuntime{ctx: ctx, path: path, stop: make(chan struct{})}
 	service.MustRegisterPtr(ctx, new(group.RuntimeInterrupts))
-	p := &routingPolicy{config: o, router: r, dns: d, out: out, end: end, transports: transports, assets: make(map[any]*policyAsset)}
+	p := &routingPolicy{live: h, config: o, router: r, dns: d, out: out, end: end, transports: transports, assets: make(map[any]*policyAsset)}
 	p.drained = make(chan struct{})
 	p.refs.Store(1)
 	h.active.Store(p)
@@ -115,6 +155,8 @@ func (h *liveRuntime) adoptInitial(p *routingPolicy) {
 	for _, t := range p.transports.Transports() {
 		add(p.transports, t)
 	}
+	p.resources = describeLiveResources(p.config)
+	p.indexFlowAssets()
 	h.initialized = true
 }
 func (p *routingPolicy) dropReader() {

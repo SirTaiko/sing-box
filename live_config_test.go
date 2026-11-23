@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -16,12 +18,15 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	mdns "github.com/miekg/dns"
 	box "github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/option"
@@ -67,6 +72,7 @@ func resolver(t *testing.T, ip string) int {
 }
 
 type session struct {
+	view     context.Context
 	path     string
 	cfg      object
 	ctx      context.Context
@@ -124,7 +130,8 @@ func newSession(t *testing.T, tun object) *session {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer local-test-only")
-	return &session{trackers: service.PtrFromContext[trafficcontrol.Manager](ctxRegistry), path: path, cfg: cfg, core: instance, ctx: ctx, rpc: daemon.NewRuntimeConfigClient(conn), api: daemon.NewStartedServiceClient(conn), dns: daemon.NewDNSLookupClient(conn), proxy: proxy}
+	view := service.FromContext[adapter.RuntimeConfig](ctxRegistry).ServiceContext(ctxRegistry)
+	return &session{view: view, trackers: service.PtrFromContext[trafficcontrol.Manager](ctxRegistry), path: path, cfg: cfg, core: instance, ctx: ctx, rpc: daemon.NewRuntimeConfigClient(conn), api: daemon.NewStartedServiceClient(conn), dns: daemon.NewDNSLookupClient(conn), proxy: proxy}
 }
 func (s *session) apply(t *testing.T, selected string) error {
 	t.Helper()
@@ -594,4 +601,240 @@ func TestDesktopLiveTun(t *testing.T) {
 	}
 	check(1500)
 	t.Logf("pid=%d core_started_at=%d tun_index=%d MTU=1500/1400/1500", os.Getpid(), start.GetStartedAt(), original.Index)
+}
+
+func TestDesktopLiveResourceDependencies(t *testing.T) {
+	s := newSession(t, nil)
+	dnsConfig := s.cfg["dns"].(object)
+	dnsConfig["rules"] = []object{{"domain": "fixture.test", "server": "resolver"}}
+	dnsServers := append(dnsConfig["servers"].([]object), object{"type": "udp", "tag": "spare", "server": "127.0.0.1", "server_port": resolver(t, "192.0.2.5")})
+	dnsConfig["servers"] = dnsServers
+	outbounds := s.cfg["outbounds"].([]object)
+	makeVless := func(tag, server string) object {
+		return object{"type": "vless", "tag": tag, "server": server, "server_port": 12345, "uuid": "00000000-0000-4000-8000-000000000001"}
+	}
+	explicit := makeVless("explicit", "node.test")
+	explicit["domain_resolver"] = "resolver"
+	numeric := makeVless("numeric", "127.0.0.1")
+	detour := makeVless("detoured", "127.0.0.1")
+	detour["detour"] = "numeric"
+	outbounds = append(outbounds, explicit, numeric, detour)
+	if C.WithQUIC {
+		outbounds = append(outbounds, object{"type": "hysteria2", "tag": "quic-test", "server": "127.0.0.1", "server_port": 12348, "password": "local-fixture", "tls": object{"enabled": true, "insecure": true}})
+	}
+	s.cfg["outbounds"] = outbounds
+	apply := func() {
+		t.Helper()
+		if err := s.apply(t, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply()
+	out := service.FromContext[adapter.OutboundManager](s.view)
+	transport := service.FromContext[adapter.DNSTransportManager](s.view)
+	get := func(tag string) adapter.Outbound {
+		it, ok := out.Outbound(tag)
+		if !ok {
+			t.Fatalf("missing %s", tag)
+		}
+		return it
+	}
+	getDNS := func(tag string) adapter.DNSTransport {
+		it, ok := transport.Transport(tag)
+		if !ok {
+			t.Fatalf("missing DNS %s", tag)
+		}
+		return it
+	}
+	startNumeric, startExplicit, startDetour, startGroup := get("numeric"), get("explicit"), get("detoured"), get("vpn-select")
+	startDNS, startSpare := getDNS("resolver"), getDNS("spare")
+	var quic adapter.Outbound
+	if C.WithQUIC {
+		quic = get("quic-test")
+	}
+	dnsServers[1]["server_port"] = resolver(t, "192.0.2.6")
+	apply()
+	if getDNS("spare") == startSpare || getDNS("resolver") != startDNS || get("vpn-select") != startGroup || get("numeric") != startNumeric || get("explicit") != startExplicit || get("detoured") != startDetour {
+		t.Fatal("changing an unrelated resolver rebuilt existing bindings or kept the changed one")
+	}
+	dnsServers[0]["server_port"] = resolver(t, "192.0.2.7")
+	apply()
+	if getDNS("resolver") == startDNS || get("explicit") == startExplicit || get("vpn-select") == startGroup || get("numeric") != startNumeric || get("detoured") != startDetour {
+		t.Fatal("resolver dependency did not propagate to the correct outbounds")
+	}
+	if quic != nil && get("quic-test") != quic {
+		t.Fatal("unrelated resolver replaced numeric Hysteria2 outbound")
+	}
+	startExplicit = get("explicit")
+	numeric["server_port"] = 12346
+	apply()
+	if get("numeric") == startNumeric || get("detoured") == startDetour || get("explicit") != startExplicit {
+		t.Fatal("detour dependency did not propagate independently")
+	}
+	groupBeforeModeChange := get("vpn-select")
+	dnsConfig["direct_mode_server"] = "spare"
+	apply()
+	if get("vpn-select") == groupBeforeModeChange || get("explicit") != startExplicit {
+		t.Fatal("changing the implicit direct-mode resolver did not preserve explicit bindings")
+	}
+}
+
+func TestDesktopLiveRuleSetSources(t *testing.T) {
+	s := newSession(t, nil)
+	s.cfg["outbounds"].([]object)[1]["inet4_bind_address"] = "127.0.0.1"
+	var downloads atomic.Int32
+	remote := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		downloads.Add(1)
+		io.WriteString(w, `{"version":3,"rules":[{"domain":["unused.test"]}]}`)
+	}))
+	defer remote.Close()
+	file := filepath.Join(t.TempDir(), "addresses.json")
+	writeSet := func(cidr string) {
+		t.Helper()
+		if err := os.WriteFile(file, []byte(fmt.Sprintf(`{"version":3,"rules":[{"ip_cidr":[%q]}]}`, cidr)), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeSet("127.0.0.1/32")
+	route := s.cfg["route"].(object)
+	remoteSet := object{"tag": "download", "type": "remote", "format": "source", "url": remote.URL + "/v1", "http_client": object{"detour": "a"}}
+	localSet := object{"tag": "addresses", "type": "local", "format": "source", "path": file}
+	route["rule_set"] = []object{remoteSet, localSet}
+	route["rules"] = []object{{"rule_set": "download", "outbound": "direct"}, {"rule_set": "addresses", "outbound": "a"}, {"network": "tcp", "outbound": "b"}}
+	apply := func() {
+		t.Helper()
+		if err := s.apply(t, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	apply()
+	if n := downloads.Load(); n != 1 {
+		t.Fatalf("initial downloads %d", n)
+	}
+	route["rules"] = append([]object{{"domain": "unused2.test", "outbound": "a"}}, route["rules"].([]object)...)
+	apply()
+	route["rule_set"] = []object{localSet, remoteSet, {"type": "inline", "tag": "extra", "rules": []object{{"ip_cidr": "127.0.0.1/32"}}}}
+	apply()
+	if n := downloads.Load(); n != 1 {
+		t.Fatalf("unchanged source downloaded %d times", n)
+	}
+	echo, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echo.Close()
+	go func() {
+		for {
+			c, err := echo.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	match := func() string {
+		t.Helper()
+		c, _ := s.connection(t, echo.Addr().String())
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		var result [1]byte
+		if _, err := io.ReadFull(c, result[:]); err != nil || result[0] != 'x' {
+			t.Fatalf("probe failed: %v", err)
+		}
+		port := uint16(c.LocalAddr().(*net.TCPAddr).Port)
+		for _, flow := range s.trackers.Connections() {
+			if flow.Metadata.Source.Port == port {
+				return flow.Outbound
+			}
+		}
+		t.Fatal("active test connection missing")
+		return ""
+	}
+	if got := match(); got != "a" {
+		t.Fatalf("initial matched outbound %q", got)
+	}
+	working := route["rules"]
+	route["rules"] = []object{{"rule_set": "missing", "outbound": "a"}}
+	if s.apply(t, "a") == nil {
+		t.Fatal("invalid staged rule was accepted")
+	}
+	route["rules"] = working
+	if got := match(); got != "a" {
+		t.Fatalf("rollback changed the old rule set: %s", got)
+	}
+	writeSet("192.0.2.0/24")
+	until := time.Now().Add(4 * time.Second)
+	for match() != "b" {
+		if time.Now().After(until) {
+			t.Fatal("shared file watcher did not update the current router")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	route["rules"] = append([]object{{"rule_set": "extra", "outbound": "direct"}}, working.([]object)...)
+	apply()
+	if got := match(); got != "direct" {
+		t.Fatalf("previously unused set did not reload: %s", got)
+	}
+	remoteSet["url"] = remote.URL + "/v2"
+	apply()
+	if n := downloads.Load(); n != 2 {
+		t.Fatalf("changed source downloads %d", n)
+	}
+}
+
+func TestDesktopLiveLongFlowsReleaseLookupPolicy(t *testing.T) {
+	s := newSession(t, nil)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		for {
+			c, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	var flows []net.Conn
+	defer func() {
+		for _, c := range flows {
+			c.Close()
+		}
+	}()
+	echo := func(c net.Conn) {
+		t.Helper()
+		c.SetDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+		var reply [1]byte
+		if _, err := io.ReadFull(c, reply[:]); err != nil || reply[0] != 'x' {
+			t.Fatalf("previous flow failed: %v", err)
+		}
+	}
+	route := s.cfg["route"].(object)
+	for i := 0; i < 8; i++ {
+		c, _ := s.connection(t, listener.Addr().String())
+		flows = append(flows, c)
+		echo(c)
+		drained := s.core.RoutingPolicyDrainedForTest()
+		route["rules"] = []object{{"domain": fmt.Sprintf("unmatched-%d.test", i), "outbound": "b"}}
+		if err := s.apply(t, "direct"); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-drained:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("generation %d retained after dispatch", i)
+		}
+		for _, existing := range flows {
+			echo(existing)
+		}
+	}
 }

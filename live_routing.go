@@ -14,32 +14,88 @@ import (
 )
 
 // The listeners and the authenticated API keep their lifetimes. Each accepted
-// flow pins its routing policy until the connection manager calls onClose.
+// flow holds the matching policy during lookup and its outbound dependencies during I/O.
 type liveIngress struct {
 	adapter.Router
 	live *liveRuntime
 }
 
+// The close callback can run concurrently with handoff, including on an error.
+type flowLease struct {
+	mu      sync.Mutex
+	release func()
+}
+
+func (l *flowLease) replace(next func()) {
+	l.mu.Lock()
+	previous := l.release
+	if previous != nil {
+		l.release = next
+	}
+	l.mu.Unlock()
+	if previous != nil {
+		previous()
+	} else if next != nil {
+		next()
+	}
+}
+
+func (p *routingPolicy) leaseForFlow(onClose N.CloseHandlerFunc) (N.CloseHandlerFunc, func([]adapter.Outbound)) {
+	p.refs.Add(1)
+	lease := &flowLease{release: p.dropReader}
+	closeFlow := N.OnceClose(N.AppendClose(onClose, func(error) { lease.replace(nil) }))
+	return closeFlow, func(chain []adapter.Outbound) {
+		index := p.flows.Load()
+		if index == nil || len(chain) == 0 {
+			return
+		}
+		assets, known := (*index)[chain[0]]
+		if !known {
+			return
+		}
+		for _, a := range assets {
+			a.flows.Add(1)
+		}
+		lease.replace(func() {
+			for _, a := range assets {
+				a.dropFlow()
+			}
+		})
+	}
+}
+
 func (r *liveIngress) RouteConnectionEx(ctx context.Context, conn net.Conn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	p, done := r.live.acquire()
-	p.router.RouteConnectionEx(ctx, conn, md, N.OnceClose(N.AppendClose(onClose, func(error) { done() })))
+	defer done()
+	closeFlow, handoff := p.leaseForFlow(onClose)
+	p.router.RouteConnectionWithHandoff(ctx, conn, md, closeFlow, handoff)
 }
 
 func (r *liveIngress) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, md adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	p, done := r.live.acquire()
-	p.router.RoutePacketConnectionEx(ctx, conn, md, N.OnceClose(N.AppendClose(onClose, func(error) { done() })))
+	defer done()
+	closeFlow, handoff := p.leaseForFlow(onClose)
+	p.router.RoutePacketConnectionWithHandoff(ctx, conn, md, closeFlow, handoff)
 }
 
 func (r *liveIngress) RouteConnection(ctx context.Context, conn net.Conn, md adapter.InboundContext) error {
-	p, done := r.live.acquire()
-	defer done()
-	return p.router.RouteConnection(ctx, conn, md)
+	done := make(chan struct{})
+	r.RouteConnectionEx(ctx, conn, md, func(error) { close(done) })
+	select {
+	case <-done:
+	case <-r.live.stop:
+	}
+	return nil
 }
 
 func (r *liveIngress) RoutePacketConnection(ctx context.Context, conn N.PacketConn, md adapter.InboundContext) error {
-	p, done := r.live.acquire()
-	defer done()
-	return p.router.RoutePacketConnection(ctx, conn, md)
+	done := make(chan struct{})
+	r.RoutePacketConnectionEx(ctx, conn, md, func(error) { close(done) })
+	select {
+	case <-done:
+	case <-r.live.stop:
+	}
+	return nil
 }
 
 func (r *liveIngress) PreMatch(md adapter.InboundContext, packet []byte) adapter.PreMatchResult {

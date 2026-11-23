@@ -241,7 +241,11 @@ func New(options Options) (*Box, error) {
 	httpClientService := adapter.LifecycleService(httpClientManager)
 	router := route.NewRouter(ctx, logFactory, routeOptions, dnsOptions)
 	service.MustRegister[adapter.Router](ctx, router)
-	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
+	if hasRuntimeConfig {
+		err = router.InitializeLive(routeOptions.Rules, routeOptions.RuleSet, nil, nil, nil)
+	} else {
+		err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
+	}
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
 	}
@@ -615,6 +619,13 @@ func (s *Box) preStart() error {
 	)
 	if err != nil {
 		return err
+	}
+	if s.live != nil {
+		s.live.mu.Lock()
+		if !s.live.initialized {
+			s.live.adoptInitial(s.live.active.Load())
+		}
+		s.live.mu.Unlock()
 	}
 	return nil
 }

@@ -89,6 +89,8 @@ func (s *RemoteRuleSet) Name() string {
 }
 
 func (s *RemoteRuleSet) String() string {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return strings.Join(F.MapToString(s.rules), " ")
 }
 
@@ -160,7 +162,15 @@ func (s *RemoteRuleSet) DecRef() {
 	}
 }
 
+func (s *RemoteRuleSet) HasLoadedRules() bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return len(s.rules) != 0
+}
+
 func (s *RemoteRuleSet) Cleanup() {
+	s.access.Lock()
+	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
 		s.rules = nil
 	}
@@ -324,15 +334,21 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 }
 
 func (s *RemoteRuleSet) Close() error {
+	s.access.Lock()
 	s.rules = nil
+	s.access.Unlock()
 	s.cancel()
 	return nil
 }
 
 func (s *RemoteRuleSet) Match(metadata *adapter.InboundContext) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return matchAnyHeadlessRule(s.rules, metadata)
 }
 
 func (s *RemoteRuleSet) mergeableRule() *DefaultHeadlessRule {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return mergeableRuleIn(s.rules)
 }

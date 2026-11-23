@@ -82,6 +82,8 @@ func (s *LocalRuleSet) Name() string {
 }
 
 func (s *LocalRuleSet) String() string {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return strings.Join(F.MapToString(s.rules), " ")
 }
 
@@ -175,7 +177,15 @@ func (s *LocalRuleSet) DecRef() {
 	}
 }
 
+func (s *LocalRuleSet) HasLoadedRules() bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
+	return len(s.rules) != 0
+}
+
 func (s *LocalRuleSet) Cleanup() {
+	s.access.Lock()
+	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
 		s.rules = nil
 	}
@@ -194,14 +204,20 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
 }
 
 func (s *LocalRuleSet) Close() error {
+	s.access.Lock()
 	s.rules = nil
+	s.access.Unlock()
 	return common.Close(common.PtrOrNil(s.watcher))
 }
 
 func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return matchAnyHeadlessRule(s.rules, metadata)
 }
 
 func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return mergeableRuleIn(s.rules)
 }

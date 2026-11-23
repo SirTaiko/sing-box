@@ -55,8 +55,9 @@ func withoutInterrupt(ob []option.Outbound) []option.Outbound {
 }
 
 func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy, opts option.Options) (_ *routingPolicy, err error) {
-	p := &routingPolicy{config: opts, assets: make(map[any]*policyAsset), drained: make(chan struct{})}
+	p := &routingPolicy{live: h, config: opts, assets: make(map[any]*policyAsset), drained: make(chan struct{})}
 	p.refs.Store(1)
+	var reuse map[liveResourceKey]bool
 	defer func() {
 		if err != nil {
 			err = p.abort(err)
@@ -81,6 +82,8 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 	}
 	service.MustRegister[adapter.NetworkManager](ctx, policyNetwork{h.box.network, defaults, zapret})
 	if shared {
+		p.resources = old.resources
+		p.flows.Store(old.flows.Load())
 		p.out, p.end, p.transports, p.dns = old.out, old.end, old.transports, old.dns
 		for obj := range old.assets {
 			if obj != old.router {
@@ -93,6 +96,8 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 			return p, nil
 		}
 	} else {
+		p.resources = describeLiveResources(opts)
+		reuse = p.resources.reusable(old, reflect.DeepEqual(dnsPolicyOptions(do), dnsPolicyOptions(common.PtrValueOrDefault(old.config.DNS))))
 		p.end = endpoint.NewManager(service.FromContext[adapter.EndpointRegistry](ctx))
 		p.out = outbound.NewManager(service.FromContext[adapter.OutboundRegistry](ctx), p.end, ro.Final)
 		p.transports = dns.NewTransportManager(service.FromContext[adapter.DNSTransportRegistry](ctx), p.out, do.Final)
@@ -100,7 +105,17 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 	service.MustRegister[adapter.OutboundManager](ctx, p.out)
 	service.MustRegister[adapter.EndpointManager](ctx, p.end)
 	service.MustRegister[adapter.DNSTransportManager](ctx, p.transports)
+	var sets map[string]bool
+	shareDNS := shared
 	if !shared {
+		sets = reusableRuleSets(old, p, reuse)
+		shareDNS = sameDNSBindings(old, p, reuse, sets)
+	}
+	if !shared && shareDNS {
+		p.dns = old.dns
+		p.borrow(old, old.dns)
+	}
+	if !shareDNS {
 		p.dns, err = dns.NewRouter(ctx, h.box.logFactory, do)
 		if err != nil {
 			return nil, err
@@ -113,17 +128,23 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 	h.box.router.CopyTrackersTo(p.router)
 	p.own(p.router, adapter.NewScope(ctx, h.box.logger))
 	service.MustRegister[adapter.Router](ctx, p.router)
-	if err = p.router.Initialize(ro.Rules, ro.RuleSet); err != nil {
+	if err = p.router.InitializeLive(ro.Rules, ro.RuleSet, p.assets[p.router].scope, old.router, func(tag string) bool {
+		// A source with a different DNS validator must be rebuilt when either
+		// validator uses DNS rules. Both empty validators are equivalent.
+		return shared || (sets[tag] && (shareDNS || (len(do.Rules) == 0 && len(common.PtrValueOrDefault(old.config.DNS).Rules) == 0)))
+	}); err != nil {
 		return nil, err
 	}
 	var resources []adapter.Lifecycle
 	if !shared {
-		resources, err = h.buildPolicyResources(ctx, old, p)
+		resources, err = h.buildPolicyResources(ctx, old, p, reuse)
 		if err != nil {
 			return nil, err
 		}
-		if err = p.dns.Initialize(do.Rules); err != nil {
-			return nil, err
+		if !shareDNS {
+			if err = p.dns.Initialize(do.Rules); err != nil {
+				return nil, err
+			}
 		}
 	}
 	for _, stage := range adapter.ListStartStages {
@@ -156,11 +177,14 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 		if err = p.router.Start(stage, p.assets[p.router].scope); err != nil {
 			return nil, err
 		}
-		if !shared {
+		if !shareDNS {
 			if err = p.dns.Start(stage, p.assets[p.dns].scope); err != nil {
 				return nil, err
 			}
 		}
+	}
+	if !shared {
+		p.indexFlowAssets()
 	}
 	return p, nil
 }
@@ -192,7 +216,7 @@ func orderedResources[T interface {
 	return ordered, nil
 }
 
-func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingPolicy) ([]adapter.Lifecycle, error) {
+func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingPolicy, reuse map[liveResourceKey]bool) ([]adapter.Lifecycle, error) {
 	var start []adapter.Lifecycle
 	logger := h.box.logFactory
 	resourceCtx := service.ExtendContext(ctx)
@@ -201,16 +225,19 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 	// Dialer construction resolves explicit DNS transport tags immediately.
 	// Populate the staged transport registry before constructing any endpoint or outbound.
 	do := common.PtrValueOrDefault(p.config.DNS)
-	servers := do.Servers
-	if len(servers) == 0 {
-		servers = []option.DNSServerOptions{{Tag: "local", Type: C.DNSTypeLocal, Options: &option.LocalDNSServerOptions{}}}
-	}
+	servers := desktopDNSServers(do)
 	for _, t := range servers {
 		if t.Type == C.DNSTypeFakeIP && old.transports.FakeIP() != nil {
 			existing := old.transports.FakeIP()
 			if existing.Tag() != t.Tag {
 				return nil, errors.New("cannot change the live fake-IP pool")
 			}
+			if err := p.transports.Add(existing); err != nil {
+				return nil, err
+			}
+			p.borrow(old, existing)
+		} else if reuse[transportKey(t.Tag)] {
+			existing, _ := old.transports.Transport(t.Tag)
 			if err := p.transports.Add(existing); err != nil {
 				return nil, err
 			}
@@ -226,15 +253,11 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 		}
 		p.borrow(old, previous)
 	}
-	oldEnds := map[string]option.Endpoint{}
-	for _, e := range old.config.Endpoints {
-		oldEnds[e.Tag] = e
-	}
 	for _, e := range p.config.Endpoints {
 		if e.Type != C.TypeOpenConnect {
 			return nil, errors.New("unsupported desktop endpoint")
 		}
-		if prev, ok := oldEnds[e.Tag]; ok && reflect.DeepEqual(prev, e) {
+		if reuse[outboundKey(e.Tag)] {
 			existing, _ := old.end.Get(e.Tag)
 			if err := p.end.Add(existing); err != nil {
 				return nil, err
@@ -244,17 +267,12 @@ func (h *liveRuntime) buildPolicyResources(ctx context.Context, old, p *routingP
 			return nil, err
 		}
 	}
-	oldOut := map[string]option.Outbound{}
-	for _, ob := range old.config.Outbounds {
-		oldOut[ob.Tag] = ob
-	}
 	for _, ob := range p.config.Outbounds {
 		if !slices.Contains([]string{C.TypeDirect, C.TypeVLESS, C.TypeHysteria2, C.TypeSelector, C.TypeURLTest}, ob.Type) {
 			return nil, errors.New("unsupported desktop outbound")
 		}
 		existing, _ := old.out.Outbound(ob.Tag)
-		ready, hasState := existing.(interface{ RuntimeReady() bool })
-		if d, ok := ob.Options.(*option.DirectOutboundOptions); ok && d.Zapret != nil && reflect.DeepEqual(oldOut[ob.Tag], ob) && hasState && ready.RuntimeReady() {
+		if reuse[outboundKey(ob.Tag)] {
 			if err := p.out.Add(existing); err != nil {
 				return nil, err
 			}
