@@ -3,6 +3,8 @@ package box
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"weak"
@@ -53,6 +55,19 @@ func (s *Box) PolicyObjectsForTest() func() [5]bool {
 	}
 }
 
+// Observe retirement without holding the outbound or its routing generation.
+func (s *Box) OutboundScopeDoneForTest(tag string) <-chan struct{} {
+	p := s.live.active.Load()
+	ob, _ := p.out.Outbound(tag)
+	return p.assets[ob].scope.Context().Done()
+}
+
+func (s *Box) DNSScopeDoneForTest(tag string) <-chan struct{} {
+	p := s.live.active.Load()
+	transport, _ := p.transports.Transport(tag)
+	return p.assets[transport].scope.Context().Done()
+}
+
 // Exercise the normal flow handoff without requiring an external corporate gateway.
 func (s *Box) HoldEndpointFlowForTest(tag string) (func(), <-chan struct{}) {
 	p := s.live.active.Load()
@@ -92,5 +107,20 @@ func TestAbortCancelsOnlyCandidateDNSReaders(t *testing.T) {
 	}
 	if stableQuery.Err() != nil || h.active.Load() != active {
 		t.Fatal("rollback cancelled an active query or published the candidate")
+	}
+}
+
+func TestConcurrentFlowHandoffAndCloseBalanceBothReferences(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		var policy, assets atomic.Int32
+		lease := flowLease{release: func() { policy.Add(1) }}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); lease.replace(func() { assets.Add(1) }) }()
+		go func() { defer wg.Done(); lease.replace(nil) }()
+		wg.Wait()
+		if policy.Load() != 1 || assets.Load() != 1 {
+			t.Fatal("unbalanced release", policy.Load(), assets.Load())
+		}
 	}
 }

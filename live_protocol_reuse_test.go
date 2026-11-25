@@ -5,10 +5,13 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,14 +98,17 @@ func TestDesktopExistingProtocolSessionsSurviveManagerReplacement(t *testing.T) 
 			obs := s.cfg["outbounds"].([]object)
 			for _, ob := range obs {
 				if ob["tag"] == "vpn-select" {
-					ob["outbounds"] = []string{"direct", "transport"}
+					ob["outbounds"] = []string{"direct", "nested", "b"}
 				}
 			}
-			s.cfg["outbounds"] = append(obs, out)
+			out["detour"] = "hop"
+			s.cfg["outbounds"] = append(obs, out,
+				object{"type": "direct", "tag": "hop", "domain_resolver": "resolver"},
+				object{"type": "selector", "tag": "nested", "outbounds": []string{"transport", "b"}, "default": "transport"})
 			spare := object{"type": "udp", "tag": "spare", "server": "127.0.0.1", "server_port": 21100}
 			dns := s.cfg["dns"].(object)
 			dns["servers"] = append(dns["servers"].([]object), spare)
-			if err = s.apply(t, "transport"); err != nil {
+			if err = s.apply(t, "nested"); err != nil {
 				t.Fatal(err)
 			}
 			initial, _ := service.FromContext[adapter.OutboundManager](s.view).Outbound("transport")
@@ -166,16 +172,69 @@ func TestDesktopExistingProtocolSessionsSurviveManagerReplacement(t *testing.T) 
 			if serverFlows["tcp"] == "" || serverFlows["udp"] == "" {
 				t.Fatal("protocol peer did not receive both flows")
 			}
+			// Exercise a DNS-only revision independently of selector changes.
 			for i := 0; i < 32; i++ {
 				spare["server_port"] = 21101 + i
-				if err = s.apply(t, "transport"); err != nil {
+				if err = s.apply(t, "nested"); err != nil {
 					t.Fatal(err)
 				}
 				echo()
 			}
+			freshPeer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "new-b") }))
+			defer freshPeer.Close()
+			for i := 0; i < 32; i++ {
+				oldB := s.core.OutboundScopeDoneForTest("b")
+				obs[2]["connect_timeout"] = fmt.Sprintf("%dms", 1000+i)
+				if err = s.apply(t, "nested"); err != nil {
+					t.Fatal(err)
+				}
+				select {
+				case <-oldB:
+				case <-time.After(2 * time.Second):
+					t.Fatal("unselected outbound kept by live transport")
+				}
+				echo()
+			}
+			s.selectTag(t, "b")
+			fresh, _ := s.connection(t, freshPeer.Listener.Addr().String())
+			_, err = io.WriteString(fresh, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+			body, readErr := io.ReadAll(fresh)
+			fresh.Close()
+			if err != nil || readErr != nil || !strings.HasSuffix(string(body), "new-b") {
+				t.Fatal("updated B did not carry new flow", err, readErr)
+			}
+			echo()
 			if current, _ := service.FromContext[adapter.OutboundManager](s.view).Outbound("transport"); current != initial || !reflect.DeepEqual(ids(), serverFlows) {
 				t.Fatal("unrelated changes replaced the live transport or its sessions")
 			}
+			oldHop := s.core.OutboundScopeDoneForTest("hop")
+			oldDNS := s.core.DNSScopeDoneForTest("resolver")
+			route := s.cfg["route"].(object)
+			final := route["final"]
+			route["final"] = "missing"
+			if err = s.apply(t, "b"); err == nil {
+				t.Fatal("invalid replacement accepted")
+			}
+			route["final"] = final
+			echo()
+			for _, ob := range s.cfg["outbounds"].([]object) {
+				if ob["tag"] == "hop" {
+					ob["connect_timeout"] = "4s"
+				}
+			}
+			dns["servers"].([]object)[0]["server_port"] = resolver(t, "192.0.2.9")
+			if err = s.apply(t, "b"); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-oldHop:
+				t.Fatal("retired the live transport's detour")
+			case <-oldDNS:
+				t.Fatal("retired the live transport's resolver")
+			default:
+			}
+			echo()
+
 		})
 	}
 }

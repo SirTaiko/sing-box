@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1056,4 +1058,127 @@ func TestDesktopLiveRemoteUpdaterLifetime(t *testing.T) {
 		t.Fatal("fetch after last release")
 	}
 	ping()
+}
+
+func TestDesktopSelectedURLTestKeepsItsProbeDependencies(t *testing.T) {
+	s := newSession(t, nil)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }))
+	defer peer.Close()
+	obs := s.cfg["outbounds"].([]object)
+	obs[3]["outbounds"] = []string{"direct", "probes"}
+	s.cfg["outbounds"] = append(obs, object{"type": "urltest", "tag": "probes", "outbounds": []string{"a", "b"}, "url": peer.URL, "interval": "1m", "probe_domain_resolvers": object{"a": "resolver", "b": "resolver"}})
+	if err := s.apply(t, "probes"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.api.SetClashMode(s.ctx, &daemon.ClashMode{Mode: "Rule"}); err != nil {
+		t.Fatal(err)
+	}
+	long, line := s.connection(t, peer.Listener.Addr().String())
+	if !strings.Contains(line, "200") {
+		t.Fatal(line)
+	}
+	// CONNECT can be acknowledged before the outbound has carried data.
+	// A successful round trip fixes the observed chain for this open flow.
+	if _, err := io.WriteString(long, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := http.ReadResponse(bufio.NewReader(long), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusNoContent {
+		t.Fatalf("initial response %d", r.StatusCode)
+	}
+	alternative := ""
+	for _, flow := range s.trackers.Connections() {
+		if flow.Metadata.Inbound == "proxy" && slices.Contains(flow.Chain, "probes") {
+			switch flow.Chain[0] {
+			case "a":
+				alternative = "b"
+			case "b":
+				alternative = "a"
+			}
+		}
+	}
+	if alternative == "" {
+		t.Fatal("missing actual URLTest chain")
+	}
+	oldAlternative := s.core.OutboundScopeDoneForTest(alternative)
+	for _, ob := range obs {
+		if ob["tag"] == alternative {
+			ob["connect_timeout"] = "4s"
+		}
+	}
+	if err := s.apply(t, "probes"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-oldAlternative:
+		t.Fatal("selected URLTest lost an alternative still reachable by its probes")
+	default:
+	}
+	if _, err := io.WriteString(long, "GET / HTTP/1.0\r\nHost: localhost\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	response, err := io.ReadAll(long)
+	if err != nil || !strings.Contains(string(response), "204 No Content") {
+		t.Fatal("old connection failed", err)
+	}
+	long.Close()
+	select {
+	case <-oldAlternative:
+	case <-time.After(2 * time.Second):
+		t.Fatal("retired alternative stayed open after the flow closed")
+	}
+}
+
+func TestDesktopConcurrentReloadAndShortConnections(t *testing.T) {
+	s := newSession(t, nil)
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "echo") }))
+	defer peer.Close()
+	if _, err := s.api.SetClashMode(s.ctx, &daemon.ClashMode{Mode: "Rule"}); err != nil {
+		t.Fatal(err)
+	}
+	s.selectTag(t, "a")
+	proxy := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", fmt.Sprint(s.proxy))}
+	transport := &http.Transport{Proxy: http.ProxyURL(proxy), DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	client := http.Client{Transport: transport, Timeout: 3 * time.Second}
+	var workers sync.WaitGroup
+	errors := make(chan error, 4)
+	start := make(chan struct{})
+	for range 4 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for range 80 {
+				r, err := client.Get(peer.URL)
+				if err != nil {
+					errors <- err
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				r.Body.Close()
+				if err != nil || r.StatusCode != 200 || string(body) != "echo" {
+					errors <- fmt.Errorf("short flow: status %d, body %q, error %v", r.StatusCode, body, err)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	defer workers.Wait()
+	for i := range 64 {
+		s.cfg["outbounds"].([]object)[2]["connect_timeout"] = fmt.Sprintf("%dms", 1500+i)
+		if err := s.apply(t, "a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		t.Error(err)
+	}
 }

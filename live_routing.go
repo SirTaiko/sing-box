@@ -10,6 +10,7 @@ import (
 	mdns "github.com/miekg/dns"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/protocol/group"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 )
@@ -48,6 +49,16 @@ func (p *routingPolicy) leaseForFlow(onClose N.CloseHandlerFunc) (N.CloseHandler
 		index := p.flows.Load()
 		if index == nil || len(chain) == 0 {
 			return
+		}
+		// The router already attached each selector's interrupt registration and
+		// will dial the concrete chain it handed us. A selector owns no I/O
+		// after handoff. Stop at URLTest and other groups: their background or
+		// lazy work may still need alternatives, DNS and detours.
+		for len(chain) > 1 {
+			if _, transparent := chain[0].(*group.Selector); !transparent {
+				break
+			}
+			chain = chain[1:]
 		}
 		assets, known := (*index)[chain[0]]
 		if !known {
