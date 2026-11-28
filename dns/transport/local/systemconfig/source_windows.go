@@ -27,8 +27,8 @@ type Source struct {
 	access           sync.Mutex
 	updateCallback   *list.Element[tun.DefaultInterfaceUpdateCallback]
 	stale            bool
+	lastChecked      time.Time
 	config           *Config
-	lastRead         time.Time
 }
 
 func NewSource(ctx context.Context) *Source {
@@ -44,14 +44,13 @@ func NewSource(ctx context.Context) *Source {
 func (s *Source) Configuration() *Config {
 	s.access.Lock()
 	defer s.access.Unlock()
-	// Changing adapter DNS (for example a DHCP renewal on the same Wi-Fi)
-	// need not change the default interface. Bound the age of its DNS list.
-	if s.config != nil && !s.stale && s.updateCallback != nil && time.Since(s.lastRead) < 5*time.Second {
+	now := time.Now()
+	if s.config != nil && !s.stale && s.updateCallback != nil && s.lastChecked.After(now.Add(-5*time.Second)) {
 		return s.config
 	}
 	s.stale = false
+	s.lastChecked = now
 	config := s.readConfig()
-	s.lastRead = time.Now()
 	if s.config != nil && config.Equal(s.config) {
 		return s.config
 	}

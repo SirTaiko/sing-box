@@ -57,6 +57,7 @@ func (t *Inbound) UpdateDesktopOptions(before, after *option.TunInboundOptions) 
 				return err
 			}
 
+			t.dnsHijackByPort.Store(opts.AutoRedirectMarkMode && opts.DNSModeOrDefault() == tun.DNSModeHijack && len(opts.DNSAddress) == 0)
 			if opts.AutoRedirectMarkMode {
 				if err := t.networkManager.RegisterAutoRedirectOutputMark(opts.AutoRedirectOutputMark); err != nil {
 					return err

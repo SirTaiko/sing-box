@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -45,6 +46,8 @@ type Inbound struct {
 	udpFiltering           tun.NATFiltering
 	udpNATMax              uint32
 	dnsHijackAddress       []netip.Addr
+	dnsHijackByPort        atomic.Bool
+	redirectDNSAddress     netip.Addr
 	stack                  string
 	tunIf                  tun.Tun
 	tunStack               tun.Stack
@@ -257,6 +260,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.routeExcludeRuleSet = append(inbound.routeExcludeRuleSet, ruleSet)
 	}
+	if inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) > 0 {
+		inet6DNSAddress, _ := inbound.tunOptions.Inet6DNSAddress()
+		if len(inet6DNSAddress) > 0 {
+			inbound.redirectDNSAddress = inet6DNSAddress[0]
+		}
+	}
 	if options.AutoRedirect {
 		if !options.AutoRoute {
 			return nil, E.New("`auto_route` is required by `auto_redirect`")
@@ -267,6 +276,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		disableNFTables, parseErr := strconv.ParseBool(os.Getenv("DISABLE_NFTABLES"))
 		inbound.enableAutoRedirect = true
 		inbound.disableNFTables = parseErr == nil && disableNFTables
+		inbound.dnsHijackByPort.Store(inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) == 0)
 		if !C.IsAndroid {
 			inbound.tunOptions.AutoRedirectMarkMode = true
 			if options.NetNs == "" {
@@ -565,7 +575,18 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 		}
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
+	if t.dnsHijackByPort.Load() && destination.Port() == 53 &&
+		(network == uint8(header.TCPProtocolNumber) || network == uint8(header.UDPProtocolNumber)) {
+		if network == uint8(header.UDPProtocolNumber) {
+			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
+		}
+		return tun.FlowVerdict{Action: tun.ActionAccept}
+	}
 	return adapter.JudgeFlow(t.router, t.tag, C.TypeTun, network, source, destination, firstPacket)
+}
+
+func (t *Inbound) isDNSHijackDestination(destination M.Socksaddr) bool {
+	return slices.Contains(t.dnsHijackAddress, destination.Addr) || t.dnsHijackByPort.Load() && destination.Port == 53
 }
 
 func (t *Inbound) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
@@ -588,7 +609,7 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
-	if slices.Contains(t.dnsHijackAddress, destination.Addr) {
+	if t.isDNSHijackDestination(destination) {
 		metadata.Protocol = C.ProtocolDNS
 	}
 	if metadata.Protocol == C.ProtocolDNS {
@@ -607,10 +628,8 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
-	for _, dnsHijackAddress := range t.dnsHijackAddress {
-		if destination.Addr == dnsHijackAddress {
-			metadata.Protocol = C.ProtocolDNS
-		}
+	if t.isDNSHijackDestination(destination) {
+		metadata.Protocol = C.ProtocolDNS
 	}
 	if metadata.Protocol == C.ProtocolDNS {
 		t.logger.InfoContext(ctx, "inbound DNS packet connection from ", metadata.Source)
@@ -627,17 +646,22 @@ func (t *autoRedirectHandler) JudgeFlow(network uint8, source netip.AddrPort, de
 	return (*Inbound)(t).JudgeFlow(network, source, destination, firstPacket)
 }
 
+func (t *autoRedirectHandler) redirectDNSDestination(source M.Socksaddr, destination M.Socksaddr) M.Socksaddr {
+	if t.redirectDNSAddress.IsValid() && destination.Port == 53 && source.Addr.Is6() && source.Addr.IsLinkLocalUnicast() {
+		return M.SocksaddrFrom(t.redirectDNSAddress, 53)
+	}
+	return destination
+}
+
 func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	ctx = log.ContextWithNewID(ctx)
 	var metadata adapter.InboundContext
 	metadata.Inbound = t.tag
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
-	metadata.Destination = destination
-	for _, dnsHijackAddress := range t.dnsHijackAddress {
-		if destination.Addr == dnsHijackAddress {
-			metadata.Protocol = C.ProtocolDNS
-		}
+	metadata.Destination = t.redirectDNSDestination(source, destination)
+	if (*Inbound)(t).isDNSHijackDestination(metadata.Destination) {
+		metadata.Protocol = C.ProtocolDNS
 	}
 	if metadata.Protocol == C.ProtocolDNS {
 		t.logger.InfoContext(ctx, "inbound redirect DNS connection from ", metadata.Source)
@@ -653,7 +677,7 @@ func (t *autoRedirectHandler) NewPacketConnectionEx(ctx context.Context, conn N.
 }
 
 func (t *autoRedirectHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
-	(*Inbound)(t).NewDNSPacket(payload, source, destination, writer)
+	(*Inbound)(t).NewDNSPacket(payload, source, t.redirectDNSDestination(source, destination), writer)
 }
 
 func (t *Inbound) newRedirect(options *tun.Options) (tun.AutoRedirect, error) {

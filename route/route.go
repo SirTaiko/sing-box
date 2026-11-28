@@ -398,13 +398,6 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 				}
 				continue
 			}
-			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
-				metadata.Destination = M.Socksaddr{
-					Fqdn: metadata.Domain,
-					Port: metadata.Destination.Port,
-				}
-			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {
@@ -604,13 +597,15 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
 				Port: metadata.Destination.Port,
 			}
 			metadata.FakeIP = true
+			metadata.ECHPublicName = r.dns.LookupECHPublicName(domain)
 			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
 		}
 	} else if metadata.Domain == "" {
 		domain, loaded := r.dns.LookupReverseMapping(metadata.Destination.Addr)
 		if loaded {
 			metadata.Domain = domain
-			r.logger.DebugContext(ctx, "found reserve mapped domain: ", metadata.Domain)
+			metadata.ECHPublicName = r.dns.LookupECHPublicName(domain)
+			r.logger.DebugContext(ctx, "found reverse mapped domain: ", metadata.Domain)
 		}
 	}
 	if metadata.Destination.IsIPv4() {
@@ -667,12 +662,6 @@ match:
 			applyRouteOptionsOverride(metadata, routeOptions)
 			if routeOptions.NetworkStrategy != nil {
 				metadata.NetworkStrategy = routeOptions.NetworkStrategy
-			}
-			if len(routeOptions.NetworkType) > 0 {
-				metadata.NetworkType = routeOptions.NetworkType
-			}
-			if len(routeOptions.FallbackNetworkType) > 0 {
-				metadata.FallbackNetworkType = routeOptions.FallbackNetworkType
 			}
 			if routeOptions.FallbackDelay != 0 {
 				metadata.FallbackDelay = routeOptions.FallbackDelay
@@ -761,12 +750,8 @@ func (r *Router) TrackedOutboundTag(ctx context.Context, metadata adapter.Inboun
 			if action.OverrideAddress.IsValid() || action.OverridePort != 0 {
 				return "", false
 			}
-		case *R.RuleActionSniff:
-			if action.OverrideDestination {
-				return "", false
-			}
-		case *R.RuleActionResolve:
-			// Use the addresses already resolved for this flow.
+		case *R.RuleActionSniff, *R.RuleActionResolve:
+			// The established flow already carries the sniffed or resolved metadata.
 		default:
 			return "", false
 		}
@@ -821,13 +806,6 @@ func (r *Router) actionSniff(
 		metadata.SnifferNames = action.SnifferNames
 		metadata.SniffError = err
 		if err == nil {
-			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
-				metadata.Destination = M.Socksaddr{
-					Fqdn: metadata.Domain,
-					Port: metadata.Destination.Port,
-				}
-			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {
@@ -944,13 +922,6 @@ func (r *Router) actionSniff(
 		}
 	finally:
 		if err == nil {
-			//goland:noinspection GoDeprecation
-			if action.OverrideDestination && M.IsDomainName(metadata.Domain) {
-				metadata.Destination = M.Socksaddr{
-					Fqdn: metadata.Domain,
-					Port: metadata.Destination.Port,
-				}
-			}
 			if metadata.Domain != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.Domain, ", client: ", metadata.Client)
 			} else if metadata.Domain != "" {

@@ -199,6 +199,11 @@ func (v liveDNS) LookupReverseMapping(ip netip.Addr) (string, bool) {
 	defer done()
 	return p.dns.LookupReverseMapping(ip)
 }
+func (v liveDNS) LookupECHPublicName(domain string) string {
+	p, done := v.acquire()
+	defer done()
+	return p.dns.LookupECHPublicName(domain)
+}
 func (v liveDNS) ClearCache()   { p, done := v.acquire(); defer done(); p.dns.ClearCache() }
 func (v liveDNS) ResetNetwork() { p, done := v.acquire(); defer done(); p.dns.ResetNetwork() }
 

@@ -153,6 +153,9 @@ func (h *liveRuntime) preparePolicy(request context.Context, old *routingPolicy,
 			}
 		}
 	}
+	if err = p.router.ValidateRuleActions(); err != nil {
+		return nil, err
+	}
 	for _, stage := range adapter.ListStartStages {
 		if err = request.Err(); err != nil {
 			return nil, err

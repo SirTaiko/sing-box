@@ -19,7 +19,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/x/list"
@@ -43,13 +42,12 @@ type RemoteRuleSet struct {
 	options        option.RuleSet
 	updateInterval time.Duration
 	httpClient     *http.Client
-	access         sync.RWMutex
-	rules          []adapter.HeadlessRule
-	metadata       adapter.RuleSetMetadata
+	content        atomic.Pointer[ruleSetContent]
 	lastUpdated    time.Time
 	lastEtag       string
 	cacheFile      adapter.CacheFile
 	pauseManager   pause.Manager
+	access         sync.Mutex
 	callbacks      list.List[adapter.RuleSetUpdateCallback]
 	refs           atomic.Int32
 }
@@ -68,7 +66,7 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		initialPath, _ = filepath.Abs(initialPath)
 	}
 	url := strings.ReplaceAll(options.RemoteOptions.URL, C.RuleSetTagPlaceholder, tag)
-	return &RemoteRuleSet{
+	ruleSet := &RemoteRuleSet{
 		ctx:            ctx,
 		cancel:         cancel,
 		logger:         logger,
@@ -79,7 +77,9 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 		options:        options,
 		updateInterval: updateInterval,
 		pauseManager:   service.FromContext[pause.Manager](ctx),
-	}, nil
+	}
+	ruleSet.content.Store(&ruleSetContent{})
+	return ruleSet, nil
 }
 
 func (s *RemoteRuleSet) Name() string {
@@ -87,9 +87,7 @@ func (s *RemoteRuleSet) Name() string {
 }
 
 func (s *RemoteRuleSet) String() string {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return strings.Join(F.MapToString(s.rules), " ")
+	return s.content.Load().String()
 }
 
 func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -139,15 +137,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 }
 
 func (s *RemoteRuleSet) Metadata() adapter.RuleSetMetadata {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return s.metadata
+	return s.content.Load().metadata
 }
 
 func (s *RemoteRuleSet) ExtractIPSet() []*netipx.IPSet {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return common.FlatMap(s.rules, extractIPSetFromRule)
+	return common.FlatMap(s.content.Load().rules, extractIPSetFromRule)
 }
 
 func (s *RemoteRuleSet) IncRef() {
@@ -161,16 +155,14 @@ func (s *RemoteRuleSet) DecRef() {
 }
 
 func (s *RemoteRuleSet) HasLoadedRules() bool {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return len(s.rules) != 0
+	return len(s.content.Load().rules) != 0
 }
 
 func (s *RemoteRuleSet) Cleanup() {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
-		s.rules = nil
+		s.content.Store(&ruleSetContent{})
 	}
 }
 
@@ -221,9 +213,8 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	if err != nil {
 		return err
 	}
+	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
 	s.access.Lock()
-	s.metadata = metadata
-	s.rules = rules
 	callbacks := s.callbacks.Array()
 	s.access.Unlock()
 	for _, callback := range callbacks {
@@ -332,21 +323,15 @@ func (s *RemoteRuleSet) resolveTransport() (adapter.HTTPTransport, error) {
 }
 
 func (s *RemoteRuleSet) Close() error {
-	s.access.Lock()
-	s.rules = nil
-	s.access.Unlock()
+	s.content.Store(&ruleSetContent{})
 	s.cancel()
 	return nil
 }
 
 func (s *RemoteRuleSet) Match(metadata *adapter.InboundContext) bool {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return matchAnyHeadlessRule(s.rules, metadata)
+	return s.content.Load().Match(metadata)
 }
 
-func (s *RemoteRuleSet) mergeableRule() *DefaultHeadlessRule {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return mergeableRuleIn(s.rules)
+func (s *RemoteRuleSet) loadContent() *ruleSetContent {
+	return s.content.Load()
 }

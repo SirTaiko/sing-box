@@ -41,14 +41,18 @@ var (
 	_ adapter.InterfaceUpdateListener    = (*Outbound)(nil)
 )
 
+type parallelResolveDialer interface {
+	dialer.ParallelNetworkDialer
+	dialer.PacketDialerWithDestination
+}
+
 type Outbound struct {
 	outbound.Adapter
 	ctx             context.Context
 	logger          logger.ContextLogger
 	network         adapter.NetworkManager
-	dialer          dialer.ParallelInterfaceResolveDialer
+	dialer          parallelResolveDialer
 	domainStrategy  C.DomainStrategy
-	fallbackDelay   time.Duration
 	isEmpty         bool
 	myAddresses     common.TypedValue[[]netip.Prefix]
 	icmpPort        *ping.Port
@@ -130,8 +134,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		network: service.FromContext[adapter.NetworkManager](ctx),
 		//nolint:staticcheck
 		domainStrategy: C.DomainStrategy(options.DomainStrategy),
-		fallbackDelay:  time.Duration(options.FallbackDelay),
-		dialer:         outboundDialer.(dialer.ParallelInterfaceResolveDialer),
+		dialer:         outboundDialer.(parallelResolveDialer),
 		isEmpty: options.Zapret == nil && reflect.DeepEqual(options.DialerOptions, option.DialerOptions{
 			AbstractDialerOptions: option.AbstractDialerOptions{UDPFragmentDefault: true},
 		}),
@@ -146,7 +149,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		icmpControl := defaultDialer.ICMPControl()
 		outbound.icmpPort = ping.NewPort(ctx, logger, func(destination netip.Addr) control.Func {
 			return icmpControl
-		}, 0)
+		}, C.ICMPTimeout, C.ICMPFlowMax)
 	}
 	return outbound, nil
 }
@@ -350,7 +353,7 @@ func (h *Outbound) WritePackets(packets [][]byte) error {
 }
 
 func (h *Outbound) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
-	if h.isMyLoopbackAddress(destinationAddresses...) {
+	if h.isMyLoopbackAddress(destinationAddresses...) || destination.IsIP() && h.isMyLoopbackAddress(destination.Addr) {
 		return nil, E.New("loopback connection to TUN range")
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
@@ -363,11 +366,11 @@ func (h *Outbound) DialParallel(ctx context.Context, network string, destination
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), nil, nil, nil, h.fallbackDelay)
+	return h.dialer.DialParallelNetwork(ctx, network, destination, destinationAddresses, nil, nil, nil, 0)
 }
 
 func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.Conn, error) {
-	if h.isMyLoopbackAddress(destinationAddresses...) {
+	if h.isMyLoopbackAddress(destinationAddresses...) || destination.IsIP() && h.isMyLoopbackAddress(destination.Addr) {
 		return nil, E.New("loopback connection to TUN range")
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
@@ -380,21 +383,18 @@ func (h *Outbound) DialParallelNetwork(ctx context.Context, network string, dest
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	if fallbackDelay == 0 {
-		fallbackDelay = h.fallbackDelay
-	}
-	return dialer.DialParallelNetwork(ctx, h.dialer, network, destination, destinationAddresses, len(destinationAddresses) > 0 && destinationAddresses[0].Is6(), networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+	return h.dialer.DialParallelNetwork(ctx, network, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
 }
 
 func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.Socksaddr, destinationAddresses []netip.Addr, networkStrategy *C.NetworkStrategy, networkType []C.InterfaceType, fallbackNetworkType []C.InterfaceType, fallbackDelay time.Duration) (net.PacketConn, netip.Addr, error) {
-	if h.isMyLoopbackAddress(destinationAddresses...) {
+	if h.isMyLoopbackAddress(destinationAddresses...) || destination.IsIP() && h.isMyLoopbackAddress(destination.Addr) {
 		return nil, netip.Addr{}, E.New("loopback connection to TUN range")
 	}
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
 	h.logger.InfoContext(ctx, "outbound packet connection")
-	conn, newDestination, err := dialer.ListenSerialNetworkPacket(ctx, h.dialer, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
+	conn, newDestination, err := h.dialer.ListenSerialNetworkPacket(ctx, destination, destinationAddresses, networkStrategy, networkType, fallbackNetworkType, fallbackDelay)
 	if err != nil {
 		return nil, netip.Addr{}, err
 	}

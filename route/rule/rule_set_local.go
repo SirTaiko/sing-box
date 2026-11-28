@@ -14,7 +14,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
-	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/x/list"
@@ -29,11 +28,10 @@ type LocalRuleSet struct {
 	ctx        context.Context
 	logger     logger.Logger
 	tag        string
-	access     sync.RWMutex
-	rules      []adapter.HeadlessRule
-	metadata   adapter.RuleSetMetadata
+	content    atomic.Pointer[ruleSetContent]
 	fileFormat string
 	watcher    *fswatch.Watcher
+	access     sync.Mutex
 	callbacks  list.List[adapter.RuleSetUpdateCallback]
 	refs       atomic.Int32
 }
@@ -82,9 +80,7 @@ func (s *LocalRuleSet) Name() string {
 }
 
 func (s *LocalRuleSet) String() string {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return strings.Join(F.MapToString(s.rules), " ")
+	return s.content.Load().String()
 }
 
 func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -144,9 +140,8 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 	if err != nil {
 		return err
 	}
+	s.content.Store(&ruleSetContent{rules: rules, metadata: metadata})
 	s.access.Lock()
-	s.rules = rules
-	s.metadata = metadata
 	callbacks := s.callbacks.Array()
 	s.access.Unlock()
 	for _, callback := range callbacks {
@@ -156,15 +151,11 @@ func (s *LocalRuleSet) reloadRules(headlessRules []option.HeadlessRule) error {
 }
 
 func (s *LocalRuleSet) Metadata() adapter.RuleSetMetadata {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return s.metadata
+	return s.content.Load().metadata
 }
 
 func (s *LocalRuleSet) ExtractIPSet() []*netipx.IPSet {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return common.FlatMap(s.rules, extractIPSetFromRule)
+	return common.FlatMap(s.content.Load().rules, extractIPSetFromRule)
 }
 
 func (s *LocalRuleSet) IncRef() {
@@ -178,16 +169,14 @@ func (s *LocalRuleSet) DecRef() {
 }
 
 func (s *LocalRuleSet) HasLoadedRules() bool {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return len(s.rules) != 0
+	return len(s.content.Load().rules) != 0
 }
 
 func (s *LocalRuleSet) Cleanup() {
 	s.access.Lock()
 	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
-		s.rules = nil
+		s.content.Store(&ruleSetContent{})
 	}
 }
 
@@ -204,20 +193,14 @@ func (s *LocalRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetU
 }
 
 func (s *LocalRuleSet) Close() error {
-	s.access.Lock()
-	s.rules = nil
-	s.access.Unlock()
+	s.content.Store(&ruleSetContent{})
 	return common.Close(common.PtrOrNil(s.watcher))
 }
 
 func (s *LocalRuleSet) Match(metadata *adapter.InboundContext) bool {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return matchAnyHeadlessRule(s.rules, metadata)
+	return s.content.Load().Match(metadata)
 }
 
-func (s *LocalRuleSet) mergeableRule() *DefaultHeadlessRule {
-	s.access.RLock()
-	defer s.access.RUnlock()
-	return mergeableRuleIn(s.rules)
+func (s *LocalRuleSet) loadContent() *ruleSetContent {
+	return s.content.Load()
 }
