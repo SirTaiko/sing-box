@@ -17,7 +17,6 @@ var _ adapter.DNSTransportManager = (*TransportManager)(nil)
 
 type TransportManager struct {
 	registry         adapter.DNSTransportRegistry
-	outbound         adapter.OutboundManager
 	defaultTag       string
 	access           sync.RWMutex
 	transports       []adapter.DNSTransport
@@ -27,10 +26,9 @@ type TransportManager struct {
 	sortedTransports []adapter.DNSTransport
 }
 
-func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter.OutboundManager, defaultTag string) *TransportManager {
+func NewTransportManager(registry adapter.DNSTransportRegistry, _ adapter.OutboundManager, defaultTag string) *TransportManager {
 	return &TransportManager{
 		registry:       registry,
-		outbound:       outbound,
 		defaultTag:     defaultTag,
 		transportByTag: make(map[string]adapter.DNSTransport),
 	}
@@ -155,6 +153,11 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 	if err != nil {
 		return err
 	}
+	return m.Add(transport)
+}
+
+func (m *TransportManager) Add(transport adapter.DNSTransport) error {
+	tag := transport.Tag()
 	m.access.Lock()
 	defer m.access.Unlock()
 	_, loaded := m.transportByTag[tag]

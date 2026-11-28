@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -48,7 +49,7 @@ type Inbound struct {
 	udpFiltering            tun.NATFiltering
 	udpNATMax               uint32
 	dnsHijackAddress        []netip.Addr
-	dnsHijackByPort         bool
+	dnsHijackByPort         atomic.Bool
 	redirectDNSAddress      netip.Addr
 	stack                   string
 	tunIf                   tun.Tun
@@ -57,6 +58,7 @@ type Inbound struct {
 	usePlatformInterface    bool
 	platformOptions         option.TunPlatformOptions
 	enableAutoRedirect      bool
+	ownsRedirectMark        bool
 	usePlatformAutoRedirect bool
 	disableNFTables         bool
 	autoRedirect            tun.AutoRedirect
@@ -286,6 +288,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		}
 		inbound.routeExcludeRuleSet = append(inbound.routeExcludeRuleSet, ruleSet)
 	}
+	if inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) > 0 {
+		inet6DNSAddress, _ := inbound.tunOptions.Inet6DNSAddress()
+		if len(inet6DNSAddress) > 0 {
+			inbound.redirectDNSAddress = inet6DNSAddress[0]
+		}
+	}
 	if options.AutoRedirect {
 		if !options.AutoRoute {
 			return nil, E.New("`auto_route` is required by `auto_redirect`")
@@ -298,15 +306,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.usePlatformAutoRedirect = platformInterface != nil && platformInterface.UsePlatformAutoRedirect()
 		inbound.disableNFTables = parseErr == nil && disableNFTables
 		inbound.tunOptions.AutoRedirectMarkMode = true
-		inbound.dnsHijackByPort = inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) == 0
-		if inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) > 0 {
-			inet6DNSAddress, _ := inbound.tunOptions.Inet6DNSAddress()
-			if len(inet6DNSAddress) > 0 {
-				inbound.redirectDNSAddress = inet6DNSAddress[0]
-			}
-		}
+		inbound.dnsHijackByPort.Store(inbound.tunOptions.DNSModeOrDefault() == tun.DNSModeHijack && len(options.DNSAddress) == 0)
 		if !inbound.usePlatformAutoRedirect && options.NetNs == "" {
 			err = networkManager.RegisterAutoRedirectOutputMark(inbound.tunOptions.AutoRedirectOutputMarkOrDefault())
+			inbound.ownsRedirectMark = err == nil
 			if err != nil {
 				return nil, err
 			}
@@ -358,6 +361,17 @@ func (t *Inbound) Tag() string {
 func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
+		if t.tunOptions.NetNs == "" {
+			if owner, ok := t.networkManager.(interface{ UnregisterAutoRedirectOutputMark(uint32) }); ok {
+				scope.Add(func() error {
+					if t.ownsRedirectMark {
+						owner.UnregisterAutoRedirectOutputMark(t.tunOptions.AutoRedirectOutputMarkOrDefault())
+						t.ownsRedirectMark = false
+					}
+					return nil
+				})
+			}
+		}
 		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
 			inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
 			inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
@@ -404,20 +418,7 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 		var err error
 		if t.enableAutoRedirect {
-			if t.usePlatformAutoRedirect {
-				t.autoRedirect, err = newPlatformAutoRedirect(t)
-			} else {
-				t.autoRedirect, err = tun.NewAutoRedirect(tun.AutoRedirectOptions{
-					TunOptions:      &t.tunOptions,
-					Context:         t.ctx,
-					Handler:         (*autoRedirectHandler)(t),
-					Logger:          t.logger,
-					NetworkMonitor:  t.networkManager.NetworkMonitor(),
-					InterfaceFinder: t.networkManager.InterfaceFinder(),
-					TableName:       "sing-box",
-					DisableNFTables: t.disableNFTables,
-				})
-			}
+			t.autoRedirect, err = t.newRedirect(&t.tunOptions)
 			if err != nil {
 				return E.Cause(err, "initialize auto-redirect")
 			}
@@ -508,6 +509,11 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if t.platformInterface != nil && t.platformInterface.UnderNetworkExtension() {
 			includeAllNetworks = t.platformInterface.NetworkExtensionIncludeAllNetworks()
 		}
+		stackOptions := t.tunOptions
+		// The desktop can raise its IPv4 TUN MTU from 1400 to 1500 in place.
+		if service.FromContext[adapter.RuntimeConfig](t.ctx) != nil && t.stack == "system" && stackOptions.MTU < 1500 {
+			stackOptions.MTU = 1500
+		}
 		var memoryPressure func() tun.MemoryPressure
 		oomKiller := service.FromContext[*oomkiller.Service](t.ctx)
 		if oomKiller != nil {
@@ -516,7 +522,7 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		tunStack, err := tun.NewStack(t.stack, tun.StackOptions{
 			Context:                t.ctx,
 			Tun:                    tunInterface,
-			TunOptions:             t.tunOptions,
+			TunOptions:             stackOptions,
 			UDPTimeout:             t.udpTimeout,
 			ICMPTimeout:            C.ICMPTimeout,
 			UDPMapping:             t.udpMapping,
@@ -536,6 +542,14 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		t.tunStack = tunStack
 		t.logger.Info("started at ", t.tunOptions.Name)
 	case adapter.StartStatePostStart:
+		if service.FromContext[adapter.RuntimeConfig](t.ctx) != nil {
+			scope.Add(func() error {
+				if t.autoRedirect != nil {
+					return t.autoRedirect.Close()
+				}
+				return nil
+			})
+		}
 		monitor := taskmonitor.New(t.logger, C.StartTimeout)
 		monitor.Start("starting tun stack")
 		err := t.tunStack.Start()
@@ -553,7 +567,9 @@ func (t *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			t.networkManager.RegisterHostPort(routedPort)
 		}
 		if t.autoRedirect != nil {
-			scope.Add(t.autoRedirect.Close)
+			if service.FromContext[adapter.RuntimeConfig](t.ctx) == nil {
+				scope.Add(t.autoRedirect.Close)
+			}
 			monitor.Start("initialize auto-redirect")
 			err = t.autoRedirect.Start()
 			monitor.Finish()
@@ -626,7 +642,7 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 		}
 		return tun.FlowVerdict{Action: tun.ActionAccept}
 	}
-	if t.dnsHijackByPort && destination.Port() == 53 &&
+	if t.dnsHijackByPort.Load() && destination.Port() == 53 &&
 		(network == uint8(header.TCPProtocolNumber) || network == uint8(header.UDPProtocolNumber)) {
 		if network == uint8(header.UDPProtocolNumber) {
 			return tun.FlowVerdict{Action: tun.ActionHijackDNS}
@@ -652,7 +668,7 @@ func (t *Inbound) JudgeFlow(network uint8, source netip.AddrPort, destination ne
 }
 
 func (t *Inbound) isDNSHijackDestination(destination M.Socksaddr) bool {
-	return slices.Contains(t.dnsHijackAddress, destination.Addr) || t.dnsHijackByPort && destination.Port == 53
+	return slices.Contains(t.dnsHijackAddress, destination.Addr) || t.dnsHijackByPort.Load() && destination.Port == 53
 }
 
 func (t *Inbound) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
@@ -743,3 +759,23 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 }
 
 var _ tun.AutoRedirectHandler = (*autoRedirectHandler)(nil)
+
+func (t *Inbound) newRedirect(options *tun.Options) (tun.AutoRedirect, error) {
+	if t.usePlatformAutoRedirect {
+		return newPlatformAutoRedirect(t)
+	}
+	return tun.NewAutoRedirect(tun.AutoRedirectOptions{
+		TunOptions:      options,
+		Context:         t.ctx,
+		Handler:         (*autoRedirectHandler)(t),
+		Logger:          t.logger,
+		NetworkMonitor:  t.networkManager.NetworkMonitor(),
+		InterfaceFinder: t.networkManager.InterfaceFinder(),
+		TableName:       "sing-box",
+		DisableNFTables: t.disableNFTables,
+		RouteAddressSet: func() ([]netip.Prefix, []netip.Prefix, error) {
+			include, exclude := t.routeAddressSetPrefixes()
+			return include, exclude, nil
+		},
+	})
+}

@@ -170,6 +170,11 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
+	return m.Add(outbound)
+}
+
+func (m *Manager) Add(outbound adapter.Outbound) error {
+	tag := outbound.Tag()
 	m.access.Lock()
 	defer m.access.Unlock()
 	_, loaded := m.outboundByTag[tag]

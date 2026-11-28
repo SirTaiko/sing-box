@@ -67,6 +67,11 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
+	return m.Add(endpoint)
+}
+
+func (m *Manager) Add(endpoint adapter.Endpoint) error {
+	tag := endpoint.Tag()
 	m.access.Lock()
 	defer m.access.Unlock()
 	_, loaded := m.endpointByTag[tag]

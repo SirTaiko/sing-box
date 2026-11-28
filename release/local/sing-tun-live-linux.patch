@@ -1,0 +1,48 @@
+diff --git a/tun_desktop_linux.go b/tun_desktop_linux.go
+new file mode 100644
+--- /dev/null
++++ b/tun_desktop_linux.go
+@@ -0,0 +1,43 @@
++package tun
++
++import (
++	"errors"
++	"os"
++
++	"github.com/sagernet/netlink"
++)
++
++// UpdateDesktopRouteOptions changes the policy rules when turning auto-redirect
++// on or off without closing the TUN device or re-registering its DNS interface.
++func (t *NativeTun) UpdateDesktopRouteOptions(options Options) error {
++	if t.options.AutoRedirectMarkMode == options.AutoRedirectMarkMode {
++		return t.UpdateRouteOptions(options)
++	}
++	if t.options.FileDescriptor != 0 || t.options.EXP_ExternalConfiguration || !t.options.AutoRoute {
++		return os.ErrInvalid
++	}
++	return runInNetworkNamespace(t.options.NetNs, func() error {
++		link, err := netlink.LinkByName(t.options.Name)
++		if err != nil {
++			return err
++		}
++		old := t.options
++		set := func(next Options) error {
++			if err := t.unsetRules(); err != nil {
++				return err
++			}
++			if err := t.unsetRoute0(link); err != nil {
++				return err
++			}
++			t.options = next
++			if err := t.setRoute(link); err != nil {
++				return err
++			}
++			return t.setRules()
++		}
++		if err := set(options); err != nil {
++			return errors.Join(err, set(old))
++		}
++		return nil
++	})
++}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box"
+	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -45,6 +46,12 @@ type OptionsEntry struct {
 	options option.Options
 }
 
+// configDirectory is the directory of the first loaded configuration file. It
+// is recorded in the context so outbound options with relative file paths
+// resolve them against the configuration instead of the process working
+// directory.
+var configDirectory string
+
 func readConfigAt(path string) (*OptionsEntry, error) {
 	var (
 		configContent []byte
@@ -57,6 +64,12 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	}
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
+	}
+	if configDirectory == "" && path != "stdin" {
+		absolutePath, absoluteErr := filepath.Abs(path)
+		if absoluteErr == nil {
+			configDirectory = filepath.Dir(absolutePath)
+		}
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
@@ -137,8 +150,13 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 		}
 		options.Log.DisableColor = true
 	}
-	ctx, cancel := context.WithCancel(service.ExtendContext(globalCtx))
+	ctx, cancel := context.WithCancel(service.ExtendContext(adapter.ContextWithConfigDirectory(globalCtx, configDirectory)))
+	var runtimePath string
+	if len(configPaths) == 1 && len(configDirectories) == 0 && configPaths[0] != "stdin" {
+		runtimePath, _ = filepath.Abs(configPaths[0])
+	}
 	instance, err := box.New(box.Options{
+		RuntimeConfigPath:          runtimePath,
 		Context:                    ctx,
 		Options:                    options,
 		NetworkNamespaceHolderArgs: []string{"/proc/self/exe", commandNetnsHolder.Use},
@@ -159,7 +177,7 @@ func create(options option.Options) (*box.Box, context.CancelFunc, error) {
 		_, loaded := <-osSignals
 		if loaded {
 			cancel()
-			closeMonitor(startCtx)
+			closeMonitor(startCtx, options)
 		}
 	}()
 	err = instance.Start()
@@ -204,7 +222,7 @@ func run() error {
 			}
 			cancel()
 			closeCtx, closed := context.WithCancel(context.Background())
-			go closeMonitor(closeCtx)
+			go closeMonitor(closeCtx, options)
 			err = instance.Close()
 			closed()
 			if osSignal != syscall.SIGHUP {
@@ -222,8 +240,15 @@ func run() error {
 	}
 }
 
-func closeMonitor(ctx context.Context) {
-	time.Sleep(C.FatalStopTimeout)
+func closeMonitor(ctx context.Context, options option.Options) {
+	timeout := C.FatalStopTimeout
+	for _, outbound := range options.Outbounds {
+		if directOptions, ok := outbound.Options.(*option.DirectOutboundOptions); ok && directOptions.Zapret != nil {
+			// One engine may need two 10s waits and a 15s nft cleanup.
+			timeout += 40 * time.Second
+		}
+	}
+	time.Sleep(timeout)
 	select {
 	case <-ctx.Done():
 		return

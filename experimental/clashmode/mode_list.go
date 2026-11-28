@@ -11,7 +11,11 @@ import (
 func CalculateModeList(options option.Options) []string {
 	var clashModes []string
 	clashModes = append(clashModes, extraClashModeFromRule(common.PtrValueOrDefault(options.Route).Rules)...)
-	clashModes = append(clashModes, extraClashModeFromDNSRule(common.PtrValueOrDefault(options.DNS).Rules)...)
+	dnsOptions := common.PtrValueOrDefault(options.DNS)
+	clashModes = append(clashModes, extraClashModeFromDNSRule(dnsOptions.Rules)...)
+	if dnsOptions.DirectModeServer != "" {
+		clashModes = append(clashModes, "Rule", "Direct")
+	}
 	clashModes = common.FilterNotDefault(common.Uniq(clashModes))
 	predefinedOrder := []string{
 		"Rule", "Global", "Direct",

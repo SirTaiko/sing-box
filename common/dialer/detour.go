@@ -17,7 +17,7 @@ type DirectDialer interface {
 }
 
 type DetourDialer struct {
-	outboundManager         adapter.OutboundManager
+	lookup                  func() (adapter.Outbound, bool)
 	detour                  string
 	defaultOutbound         bool
 	disableEmptyDirectCheck bool
@@ -27,18 +27,23 @@ type DetourDialer struct {
 }
 
 func NewDetour(outboundManager adapter.OutboundManager, detour string, disableEmptyDirectCheck bool) N.Dialer {
-	return &DetourDialer{
-		outboundManager:         outboundManager,
-		detour:                  detour,
-		disableEmptyDirectCheck: disableEmptyDirectCheck,
-	}
+	return &DetourDialer{lookup: bindDetour(outboundManager, detour), detour: detour, disableEmptyDirectCheck: disableEmptyDirectCheck}
 }
 
 func NewDefaultOutboundDetour(outboundManager adapter.OutboundManager) N.Dialer {
-	return &DetourDialer{
-		outboundManager: outboundManager,
-		defaultOutbound: true,
+	return &DetourDialer{lookup: bindDetour(outboundManager, ""), defaultOutbound: true}
+}
+
+func bindDetour(manager adapter.OutboundManager, tag string) func() (adapter.Outbound, bool) {
+	if binder, ok := manager.(interface {
+		BindOutbound(string) func() (adapter.Outbound, bool)
+	}); ok {
+		return binder.BindOutbound(tag)
 	}
+	if tag != "" {
+		return func() (adapter.Outbound, bool) { return manager.Outbound(tag) }
+	}
+	return func() (adapter.Outbound, bool) { ob := manager.Default(); return ob, ob != nil }
 }
 
 func InitializeDetour(dialer N.Dialer) error {
@@ -55,16 +60,10 @@ func (d *DetourDialer) Dialer() (N.Dialer, error) {
 }
 
 func (d *DetourDialer) init() {
-	var dialer adapter.Outbound
-	if d.detour != "" {
-		var loaded bool
-		dialer, loaded = d.outboundManager.Outbound(d.detour)
-		if !loaded {
-			d.initErr = E.New("outbound detour not found: ", d.detour)
-			return
-		}
-	} else {
-		dialer = d.outboundManager.Default()
+	dialer, found := d.lookup()
+	if !found {
+		d.initErr = E.New("outbound detour not found: ", d.detour)
+		return
 	}
 	if !d.defaultOutbound && !d.disableEmptyDirectCheck {
 		if directDialer, isDirect := dialer.(DirectDialer); isDirect {

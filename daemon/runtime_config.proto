@@ -1,0 +1,16 @@
+syntax = "proto3";
+package daemon;
+import "google/protobuf/empty.proto";
+option go_package = "github.com/sagernet/sing-box/daemon";
+
+// Applies the same local configuration file the CLI opened at startup.
+service RuntimeConfig {
+  rpc Apply(ApplyRuntimeConfigRequest) returns (google.protobuf.Empty);
+  rpc Status(google.protobuf.Empty) returns (RuntimeRevision);
+}
+message ApplyRuntimeConfigRequest {
+  bytes sha256 = 1;
+  string selected_outbound = 2;
+}
+
+message RuntimeRevision { bytes sha256 = 1; }

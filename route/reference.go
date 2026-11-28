@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"slices"
+	"sync"
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -18,6 +19,7 @@ import (
 var _ adapter.LifecycleService = (*ReferenceManager)(nil)
 
 type ReferenceManager struct {
+	access                 sync.Mutex
 	ctx                    context.Context
 	logger                 log.ContextLogger
 	rules                  []option.Rule
@@ -145,6 +147,8 @@ func (m *ReferenceManager) loop() {
 }
 
 func (m *ReferenceManager) update() {
+	m.access.Lock()
+	defer m.access.Unlock()
 	var mode string
 	clashMode := service.PtrFromContext[clashmode.Manager](m.ctx)
 	if clashMode != nil {
@@ -341,6 +345,8 @@ func (m *ReferenceManager) applyKeepIdle(keepIdle map[any]bool, target idleTarge
 }
 
 func (m *ReferenceManager) CloseIdleConnections() {
+	m.access.Lock()
+	defer m.access.Unlock()
 	outboundManager := service.FromContext[adapter.OutboundManager](m.ctx)
 	transportManager := service.FromContext[adapter.DNSTransportManager](m.ctx)
 	for _, outbound := range outboundManager.Outbounds() {
@@ -355,4 +361,19 @@ func (m *ReferenceManager) CloseIdleConnections() {
 			keeper.CloseIdleConnections()
 		}
 	}
+}
+
+// Reconfigure keeps the existing subscriptions and changes the graph they
+// inspect. Drop object keys from the previous policy so retired resources can drain.
+func (m *ReferenceManager) Reconfigure(ctx context.Context, o option.Options) {
+	next := NewReferenceManager(ctx, m.logger, o)
+	m.access.Lock()
+	m.ctx = ctx
+	m.rules = next.rules
+	m.dnsRules = next.dnsRules
+	m.staticOutbounds = next.staticOutbounds
+	m.staticTransports = next.staticTransports
+	m.keepIdle = nil
+	m.unreferencedTransports = nil
+	m.access.Unlock()
 }

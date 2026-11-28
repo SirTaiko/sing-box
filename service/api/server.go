@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"net/http"
+	"net/netip"
 
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/daemon"
 	"github.com/sagernet/sing-box/log"
@@ -17,6 +19,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
+	"github.com/sagernet/sing/service"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c" //nolint:staticcheck
@@ -65,12 +68,31 @@ func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		return nil
 	}
 	ctx := scope.Context()
+	var runtime adapter.RuntimeConfig
+	if s.Tag() == "mvpn-api" && s.options.Secret != "" && s.options.Listen != nil && s.options.Listen.Build(netip.Addr{}).IsLoopback() {
+		runtime = service.FromContext[adapter.RuntimeConfig](ctx)
+		if runtime != nil {
+			ctx = runtime.ServiceContext(ctx)
+		}
+	}
 	startedService := daemon.NewAttachedService(ctx)
 	scope.Add(func() error {
 		startedService.Close()
 		return nil
 	})
 	grpcServer := daemon.NewServer(startedService, s.options.Secret)
+	if runtime != nil {
+		daemon.RegisterRuntimeConfigServer(grpcServer, &runtimeConfig{host: runtime})
+		if manager := service.PtrFromContext[trafficcontrol.Manager](ctx); manager != nil {
+			daemon.RegisterRouteTrafficServer(grpcServer, &routeTrafficService{manager: manager})
+		}
+	}
+	if s.options.Secret != "" {
+		daemon.RegisterDNSLookupServer(grpcServer, &dnsLookup{
+			router:     service.FromContext[adapter.DNSRouter](ctx),
+			transports: service.FromContext[adapter.DNSTransportManager](ctx),
+		})
+	}
 	scope.Add(func() error {
 		grpcServer.Stop()
 		return nil

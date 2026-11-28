@@ -9,10 +9,11 @@ type SelectorOutboundOptions struct {
 }
 
 type URLTestOutboundOptions struct {
-	Outbounds                 []string           `json:"outbounds" reference:"outbound"`
-	URL                       string             `json:"url,omitempty"`
-	Interval                  badoption.Duration `json:"interval,omitempty"`
-	Tolerance                 uint16             `json:"tolerance,omitempty"`
-	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+	ProbeDomainResolvers      map[string]DomainResolveOptions `json:"probe_domain_resolvers,omitempty"`
+	Outbounds                 []string                        `json:"outbounds" reference:"outbound"`
+	URL                       string                          `json:"url,omitempty"`
+	Interval                  badoption.Duration              `json:"interval,omitempty"`
+	Tolerance                 uint16                          `json:"tolerance,omitempty"`
+	IdleTimeout               badoption.Duration              `json:"idle_timeout,omitempty"`
+	InterruptExistConnections bool                            `json:"interrupt_exist_connections,omitempty"`
 }

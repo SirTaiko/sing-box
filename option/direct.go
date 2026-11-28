@@ -22,6 +22,16 @@ type _DirectOutboundOptions struct {
 	OverridePort uint16 `json:"override_port,omitempty" schema:"omit"`
 	// Deprecated: removed
 	ProxyProtocol uint8 `json:"proxy_protocol,omitempty" schema:"omit"`
+	// Zapret enables original zapret2 engine ownership for this outbound.
+	// Without this field the outbound keeps the ordinary direct path.
+	Zapret *DirectZapretOptions `json:"zapret,omitempty"`
+}
+
+// DirectZapretOptions selects the profile of the original zapret2 engine
+// managed for one direct outbound. The profile path is resolved relative to
+// the sing-box configuration directory.
+type DirectZapretOptions struct {
+	Profile string `json:"profile"`
 }
 
 type DirectOutboundOptions _DirectOutboundOptions

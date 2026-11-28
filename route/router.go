@@ -54,6 +54,10 @@ type Router struct {
 	pauseManager                 pause.Manager
 	trackers                     []adapter.ConnectionTracker
 	platformInterface            adapter.PlatformInterface
+	liveSets                     map[string]*liveRuleSet
+	liveSetsBound                bool
+	hotReload                    bool
+	newSets                      []adapter.RuleSet
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.RouteOptions, dnsOptions option.DNSOptions) *Router {
@@ -79,6 +83,12 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 }
 
 func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) error {
+	return r.initialize(rules, ruleSets, func(tag string, options option.RuleSet) (adapter.RuleSet, error) {
+		return R.NewRuleSet(r.ctx, r.logger, tag, options)
+	})
+}
+
+func (r *Router) initialize(rules []option.Rule, ruleSets []option.RuleSet, makeSet func(string, option.RuleSet) (adapter.RuleSet, error)) error {
 	for i, options := range rules {
 		err := R.ValidateNoNestedRuleActions(options)
 		if err != nil {
@@ -95,7 +105,7 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 			if _, exists := r.ruleSetMap[tag]; exists {
 				return E.New("duplicate rule-set tag: ", tag)
 			}
-			ruleSet, err := R.NewRuleSet(r.ctx, r.logger, tag, options)
+			ruleSet, err := makeSet(tag, options)
 			if err != nil {
 				return E.Cause(err, "parse rule-set[", i, "]")
 			}
@@ -139,7 +149,17 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
 	case adapter.StartStateInitialize:
 		for _, ruleSet := range r.ruleSets {
-			scope.Add(ruleSet.Close)
+			if asset := r.liveSets[ruleSet.Name()]; asset != nil {
+				if !r.liveSetsBound {
+					asset.users.Add(1)
+					scope.Add(asset.release)
+				}
+			} else {
+				scope.Add(ruleSet.Close)
+			}
+		}
+		if r.liveSets != nil {
+			r.liveSetsBound = true
 		}
 		if r.needFindNeighbor {
 			if r.platformInterface != nil && r.platformInterface.UsePlatformNeighborResolver() {
@@ -174,11 +194,15 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		}
 	case adapter.StartStateStart:
 		var startContext *adapter.HTTPStartContext
-		if len(r.ruleSets) > 0 {
+		setsToStart := r.ruleSets
+		if r.liveSets != nil {
+			setsToStart = r.newSets
+		}
+		if len(setsToStart) > 0 {
 			monitor.Start("initialize rule-set")
 			startContext = adapter.NewHTTPStartContext()
 			var ruleSetStartGroup task.Group
-			for i, ruleSet := range r.ruleSets {
+			for i, ruleSet := range setsToStart {
 				ruleSetInPlace := ruleSet
 				ruleSetStartGroup.Append0(func(ctx context.Context) error {
 					err := ruleSetInPlace.StartContext(ctx, startContext)
@@ -206,14 +230,15 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if startContext != nil {
 			startContext.Close()
 		}
-		r.ruleSetUpdater = R.NewRuleSetUpdater(r.ctx, r.ruleSets)
-		if r.ruleSetUpdater != nil {
-			scope.Add(r.ruleSetUpdater.Close)
-		}
+		r.prepareRuleSetUpdaters(r.ctx, scope)
 		r.network.Initialize(r.ruleSets)
 		for _, ruleSet := range r.ruleSets {
-			ruleSet.RegisterCallback(func(adapter.RuleSet) {
+			callback := ruleSet.RegisterCallback(func(adapter.RuleSet) {
 				r.updateRuleSetNeedFindProcess()
+			})
+			scope.Add(func() error {
+				ruleSet.UnregisterCallback(callback)
+				return nil
 			})
 		}
 		r.updateRuleSetNeedFindProcess()
@@ -252,15 +277,15 @@ func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 			}
 		}
 	case adapter.StartStatePostStart:
-		if r.ruleSetUpdater != nil {
-			r.ruleSetUpdater.Start()
-		}
+		r.startRuleSetUpdaters()
 		return nil
 	case adapter.StartStateStarted:
 		for _, ruleSet := range r.ruleSets {
 			ruleSet.Cleanup()
 		}
-		runtime.GC()
+		if !r.hotReload {
+			runtime.GC()
+		}
 	}
 	return nil
 }
@@ -307,4 +332,9 @@ func (r *Router) ResetNetwork() {
 	if r.processSearcher != nil {
 		r.processSearcher.ResetCache()
 	}
+}
+
+// CopyTrackersTo keeps connection accounting on the persistent desktop API.
+func (r *Router) CopyTrackersTo(next *Router) {
+	next.trackers = append(next.trackers, r.trackers...)
 }

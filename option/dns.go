@@ -16,10 +16,12 @@ import (
 )
 
 type RawDNSOptions struct {
-	Servers        []DNSServerOptions `json:"servers,omitempty"`
-	Rules          []DNSRule          `json:"rules,omitempty"`
-	Final          string             `json:"final,omitempty" reference:"dns_server"`
-	ReverseMapping bool               `json:"reverse_mapping,omitempty"`
+	Servers []DNSServerOptions `json:"servers,omitempty"`
+	Rules   []DNSRule          `json:"rules,omitempty"`
+	Final   string             `json:"final,omitempty" reference:"dns_server"`
+	// DirectModeServer replaces explicit resolver selections while Clash mode is Direct.
+	DirectModeServer string `json:"direct_mode_server,omitempty" reference:"dns_server"`
+	ReverseMapping   bool   `json:"reverse_mapping,omitempty"`
 	DNSClientOptions
 }
 

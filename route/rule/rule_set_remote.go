@@ -35,7 +35,6 @@ type RemoteRuleSet struct {
 	ctx            context.Context
 	cancel         context.CancelFunc
 	logger         logger.ContextLogger
-	outbound       adapter.OutboundManager
 	tag            string
 	url            string
 	urlHash        [32]byte
@@ -70,7 +69,6 @@ func NewRemoteRuleSet(ctx context.Context, logger logger.ContextLogger, tag stri
 	ruleSet := &RemoteRuleSet{
 		ctx:            ctx,
 		cancel:         cancel,
-		outbound:       service.FromContext[adapter.OutboundManager](ctx),
 		logger:         logger,
 		tag:            tag,
 		url:            url,
@@ -156,7 +154,13 @@ func (s *RemoteRuleSet) DecRef() {
 	}
 }
 
+func (s *RemoteRuleSet) HasLoadedRules() bool {
+	return len(s.content.Load().rules) != 0
+}
+
 func (s *RemoteRuleSet) Cleanup() {
+	s.access.Lock()
+	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
 		s.content.Store(&ruleSetContent{})
 	}
@@ -223,8 +227,8 @@ func (s *RemoteRuleSet) loadBytes(content []byte) error {
 	return nil
 }
 
-func (s *RemoteRuleSet) updateOnce() {
-	err := s.fetch(s.ctx, false)
+func (s *RemoteRuleSet) updateOnce(ctx context.Context) {
+	err := s.fetch(ctx, false)
 	if err != nil {
 		s.logger.Error("fetch rule-set ", s.tag, ": ", err)
 	} else {

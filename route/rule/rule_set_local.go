@@ -171,7 +171,13 @@ func (s *LocalRuleSet) DecRef() {
 	}
 }
 
+func (s *LocalRuleSet) HasLoadedRules() bool {
+	return len(s.content.Load().rules) != 0
+}
+
 func (s *LocalRuleSet) Cleanup() {
+	s.access.Lock()
+	defer s.access.Unlock()
 	if s.refs.Load() == 0 {
 		s.content.Store(&ruleSetContent{})
 	}

@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/experimental/clashmode"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -24,6 +25,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/task"
+	"github.com/sagernet/sing/common/windnsapi"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
 	"github.com/sagernet/sing/service"
@@ -47,6 +49,9 @@ type Router struct {
 	rawRules              []option.DNSRule
 	rules                 []adapter.DNSRule
 	defaultDomainStrategy C.DomainStrategy
+	directModeTag         string
+	directModeTransport   adapter.DNSTransport
+	clashMode             *clashmode.Manager
 	dnsReverseMapping     *freelru.Cache[netip.Addr, string]
 	dnsECHPublicNames     *freelru.Cache[string, string]
 	platformInterface     adapter.PlatformInterface
@@ -66,6 +71,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 		rawRules:              make([]option.DNSRule, 0, len(options.Rules)),
 		rules:                 make([]adapter.DNSRule, 0, len(options.Rules)),
 		defaultDomainStrategy: C.DomainStrategy(options.Strategy),
+		directModeTag:         options.DirectModeServer,
 	}
 	if options.DNSClientOptions.IndependentCache {
 		deprecated.Report(ctx, deprecated.OptionIndependentDNSCache)
@@ -140,6 +146,18 @@ func (r *Router) Initialize(rules []option.DNSRule) error {
 func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
+	case adapter.StartStateInitialize:
+		if r.directModeTag != "" {
+			r.clashMode = service.PtrFromContext[clashmode.Manager](r.ctx)
+			if r.clashMode == nil {
+				return E.New("direct_mode_server requires a Clash mode manager")
+			}
+			var found bool
+			r.directModeTransport, found = r.transport.Transport(r.directModeTag)
+			if !found {
+				return E.New("direct_mode_server not found: ", r.directModeTag)
+			}
+		}
 	case adapter.StartStateStart:
 		scope.Add(func() error {
 			r.rulesAccess.Lock()
@@ -1266,6 +1284,15 @@ func (r *Router) exchangeLegacy(ctx context.Context, exchangeCtx *dnsExchangeCon
 	}
 }
 
+// Explicit domain_resolver / resolve / service lookups bypass DNS rules. Select
+// the actual transport before reading its cache or creating a network request.
+func (r *Router) explicitTransport(requested adapter.DNSTransport) adapter.DNSTransport {
+	if r.directModeTransport != nil && strings.EqualFold(r.clashMode.Mode(), "Direct") {
+		return r.directModeTransport
+	}
+	return requested
+}
+
 func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapter.DNSQueryOptions) (*mDNS.Msg, error) {
 	exchangeCtx, earlyResponse, err := r.prepareExchange(ctx, message)
 	if exchangeCtx == nil {
@@ -1277,7 +1304,7 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		transport adapter.DNSTransport
 	)
 	if options.Transport != nil {
-		transport = options.Transport
+		transport = r.explicitTransport(options.Transport)
 		response, err = r.client.Exchange(ctx, transport, message, r.finalizeExchangeOptions(options), nil)
 	} else if !exchangeCtx.legacyDNSMode {
 		exchangeResult := r.exchangeWithRules(ctx, exchangeCtx.rules, message, options, true)
@@ -1302,7 +1329,7 @@ func (r *Router) ExchangeAsync(ctx context.Context, message *mDNS.Msg, options a
 	}
 	ctx = exchangeCtx.ctx
 	if options.Transport != nil {
-		transport := options.Transport
+		transport := r.explicitTransport(options.Transport)
 		r.client.ExchangeAsync(ctx, transport, message, r.finalizeExchangeOptions(options), nil, func(response *mDNS.Msg, exchangeErr error) {
 			r.finishExchangeAsync(message, options, transport, response, exchangeErr, callback)
 		})
@@ -1371,7 +1398,7 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 	metadata.NamedDNSResponses = nil
 	metadata.DestinationAddressMatchFromResponse = false
 	if options.Transport != nil {
-		transport := options.Transport
+		transport := r.explicitTransport(options.Transport)
 		if options.Strategy == C.DomainStrategyAsIS {
 			options.Strategy = r.defaultDomainStrategy
 		}
@@ -1458,6 +1485,11 @@ func (r *Router) ClearCache() {
 	r.client.ClearCache()
 	if r.platformInterface != nil {
 		r.platformInterface.ClearDNSCache()
+	} else if C.IsWindows && r.directModeTag != "" {
+		// Mode changes must also clear Windows cached real, FakeIP and negative answers.
+		if err := windnsapi.FlushResolverCache(); err != nil {
+			r.logger.Warn(E.Cause(err, "flush Windows resolver cache"))
+		}
 	}
 	service.FromContext[adapter.NetworkManager](r.ctx).FlushSystemDNSCache()
 	if r.dnsReverseMapping != nil {

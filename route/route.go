@@ -54,7 +54,11 @@ func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata ad
 }
 
 func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := r.routeConnection(ctx, conn, metadata, onClose)
+	r.RouteConnectionWithHandoff(ctx, conn, metadata, onClose, nil)
+}
+
+func (r *Router) RouteConnectionWithHandoff(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, handoff func([]adapter.Outbound)) {
+	err := r.routeConnection(ctx, conn, metadata, onClose, handoff)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
@@ -65,7 +69,7 @@ func (r *Router) RouteConnectionEx(ctx context.Context, conn net.Conn, metadata 
 	}
 }
 
-func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, handoff func([]adapter.Outbound)) error {
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -163,6 +167,9 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
+	if handoff != nil {
+		handoff(chain)
+	}
 	outbound := chain[len(chain)-1]
 	if outboundHandler, isHandler := outbound.(adapter.ConnectionHandler); isHandler {
 		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
@@ -223,7 +230,11 @@ func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, m
 }
 
 func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	err := r.routePacketConnection(ctx, conn, metadata, onClose)
+	r.RoutePacketConnectionWithHandoff(ctx, conn, metadata, onClose, nil)
+}
+
+func (r *Router) RoutePacketConnectionWithHandoff(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, handoff func([]adapter.Outbound)) {
+	err := r.routePacketConnection(ctx, conn, metadata, onClose, handoff)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
 		if E.IsClosedOrCanceled(err) || R.IsRejected(err) {
@@ -234,7 +245,7 @@ func (r *Router) RoutePacketConnectionEx(ctx context.Context, conn N.PacketConn,
 	}
 }
 
-func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
+func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc, handoff func([]adapter.Outbound)) error {
 	//nolint:staticcheck
 	if metadata.InboundDetour != "" {
 		if metadata.LastInbound == metadata.InboundDetour {
@@ -324,6 +335,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	onClose = registerInterrupt(chain, conn, onClose)
+	if handoff != nil {
+		handoff(chain)
+	}
 	outbound := chain[len(chain)-1]
 	if outboundHandler, isHandler := outbound.(adapter.PacketConnectionHandler); isHandler {
 		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
@@ -709,6 +723,42 @@ match:
 		}
 	}
 	return
+}
+
+// TrackedOutboundTag evaluates outbound selection using an established flow's
+// metadata. Sniffing and DNS resolution have already run for this connection.
+// Leave flows with destination rewrites or non-routing actions alone.
+func (r *Router) TrackedOutboundTag(ctx context.Context, metadata adapter.InboundContext) (string, bool) {
+	if metadata.RouteOriginalDestination.IsValid() {
+		return "", false
+	}
+	r.searchProcessInfo(ctx, &metadata)
+	for _, rule := range r.rules {
+		metadata.ResetRuleCache()
+		if !rule.Match(&metadata) {
+			continue
+		}
+		switch action := rule.Action().(type) {
+		case *R.RuleActionRoute:
+			return action.Outbound, true
+		case *R.RuleActionBypass:
+			if action.Outbound != "" {
+				return action.Outbound, true
+			}
+		case *R.RuleActionRouteOptions:
+			if action.OverrideAddress.IsValid() || action.OverridePort != 0 {
+				return "", false
+			}
+		case *R.RuleActionSniff, *R.RuleActionResolve:
+			// The established flow already carries the sniffed or resolved metadata.
+		default:
+			return "", false
+		}
+	}
+	if outbound := r.outbound.Default(); outbound != nil {
+		return outbound.Tag(), true
+	}
+	return "", false
 }
 
 func (r *Router) actionSniff(
